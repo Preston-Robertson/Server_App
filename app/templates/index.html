@@ -373,7 +373,47 @@
             </fieldset>
           </details>
 
-          <div id="form-error" class="form-error" hidden></div>
+<fieldset>
+              <legend>Initial files (optional)</legend>
+              <p class="small" style="margin: 0 0 6px;">
+                Anything you queue here is uploaded to the server right after
+                it's created. Archives (<code>.zip</code>, <code>.tar.gz</code>,
+                <code>.tgz</code>) are extracted server-side. Folders keep
+                their structure. You can also skip this and use the Files tab
+                on the detail panel later.
+              </p>
+              <div class="row" style="gap:6px;">
+                <label class="btn btn-tiny">
+                  + Files
+                  <input type="file" id="init-picker-files" multiple hidden />
+                </label>
+                <label class="btn btn-tiny">
+                  + Folder
+                  <input type="file" id="init-picker-folder" webkitdirectory directory multiple hidden />
+                </label>
+                <label class="btn btn-tiny">
+                  + Archive
+                  <input type="file" id="init-picker-archive"
+                         accept=".zip,.tar,.tgz,.tar.gz,.tar.bz2,.tbz2" hidden />
+                </label>
+                <span style="flex:1"></span>
+                <label class="row" style="margin:0; gap:4px;">
+                  <span class="muted">Area:</span>
+                  <select id="init-upload-area">
+                    <option value="install">install_dir</option>
+                    <option value="world">world_dir</option>
+                  </select>
+                </label>
+                <label class="row" style="margin:0; gap:4px;">
+                  <span class="muted">Save under:</span>
+                  <input id="init-upload-path" size="16" placeholder="(area root)" />
+                </label>
+              </div>
+              <ul id="init-file-list" class="init-file-list"></ul>
+              <p class="small" id="init-file-summary" hidden></p>
+            </fieldset>
+
+            <div id="form-error" class="form-error" hidden></div>
 
           <footer class="modal-footer">
             <button type="button" class="btn btn-ghost" id="modal-cancel">Cancel</button>

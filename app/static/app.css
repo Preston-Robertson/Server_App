@@ -363,6 +363,39 @@ tr:hover td { background: var(--bg-hover); }
 .upload-progress-name       { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, monospace; }
 .upload-progress-status     { font-family: ui-monospace, monospace; }
 
+/* Initial-files list inside the New Server modal. Same visual grammar as
+   the Files-tab upload-progress list, so users learn one pattern. */
+.init-file-list {
+  list-style: none; padding: 0; margin: 6px 0 0;
+  max-height: 180px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 3px;
+}
+.init-file-list:empty { display: none; }
+.init-file-list li {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto;
+  gap: 8px; align-items: center;
+  padding: 4px 8px; border-radius: var(--radius-sm);
+  background: var(--bg); border: 1px solid var(--border);
+  font-size: 12px; font-family: ui-monospace, monospace;
+}
+.init-file-list li.busy    { background: var(--bg-elev-2); }
+.init-file-list li.ok      { background: var(--success-dim); color: #a4e5c1; border-color: transparent; }
+.init-file-list li.err     { background: var(--danger-dim);  color: #ffb0b3; border-color: transparent; }
+.init-file-list .init-kind {
+  color: var(--text-muted); font-size: 10px; text-transform: uppercase;
+  padding: 1px 5px; border-radius: 3px; background: var(--bg-hover);
+}
+.init-file-list li.ok  .init-kind,
+.init-file-list li.err .init-kind { color: inherit; background: rgba(0,0,0,0.2); }
+.init-file-list .init-name   { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.init-file-list .init-status { font-size: 11px; }
+.init-file-list .init-remove {
+  background: transparent; border: none; color: inherit; opacity: 0.5;
+  cursor: pointer; padding: 0 4px; font-size: 16px; line-height: 1;
+}
+.init-file-list .init-remove:hover { opacity: 1; }
+
 /* ---------- Toast (used by future undo/notify features) ---------- */
 .toast {
   position: fixed; bottom: 24px; right: 24px;

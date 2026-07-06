@@ -505,9 +505,28 @@ async function uploadFileList(fileList) {
 async function uploadCollected(items) {
   if (!items.length) return;
 
-  // Single archive + extract mode → route through the extract endpoint.
+  // Single archive + extract mode → route through the extract endpoint,
+  // with progress tracked as a single row.
   if (items.length === 1 && shouldExtract() && isArchiveName(items[0].file.name)) {
-    await uploadSingle(items[0].file, items[0].file.name, { forceArchive: true });
+    showProgress(`Extracting ${items[0].file.name} on server…`);
+    const rowId = addProgressRow(items[0].file.name + " (archive)");
+    try {
+      const r = await uploadOneFile({
+        serverName: CURRENT,
+        file: items[0].file,
+        relPath: items[0].file.name,
+        area: currentUploadArea(),
+        subdir: currentUploadSubdir(),
+        overwrite: shouldOverwrite(),
+        extract: true,
+        forceArchive: true,
+      });
+      setRowResult(rowId, "ok", `${r.files_written || 0} files`);
+      $("#upload-progress-label").textContent = "Done — archive extracted";
+      listFiles();
+    } catch (e) {
+      setRowResult(rowId, "err", e.message);
+    }
     return;
   }
 
@@ -530,42 +549,43 @@ async function uploadCollected(items) {
 
 async function uploadSingle(file, relPath, opts = {}) {
   if (!CURRENT) throw new Error("no server selected");
-  const area = currentUploadArea();
-  const subdir = currentUploadSubdir();
-  const overwrite = shouldOverwrite();
+  return uploadOneFile({
+    serverName: CURRENT,
+    file, relPath,
+    area: currentUploadArea(),
+    subdir: currentUploadSubdir(),
+    overwrite: shouldOverwrite(),
+    extract: shouldExtract(),
+    forceArchive: !!opts.forceArchive,
+    rowId: opts.rowId,
+  });
+}
 
-  const asArchive = opts.forceArchive || (shouldExtract() && isArchiveName(file.name));
+// Server-agnostic upload primitive used by both the Files-tab dropzone AND
+// the New-Server modal's "initial files" flow. Takes an explicit serverName
+// so it doesn't depend on the CURRENT global.
+async function uploadOneFile({ serverName, file, relPath, area, subdir,
+                                overwrite, extract, forceArchive, rowId }) {
+  if (!serverName) throw new Error("uploadOneFile: serverName is required");
+  const asArchive = forceArchive || (extract && isArchiveName(file.name));
 
   const fd = new FormData();
   fd.append("file", file);
-  fd.append("area", area);
+  fd.append("area", area || "install");
   fd.append("overwrite", overwrite ? "true" : "false");
 
-  let endpoint;
   if (asArchive) {
     if (subdir) fd.append("dest_subdir", subdir);
-    endpoint = `/api/servers/${CURRENT}/files/extract`;
-    showProgress(`Extracting ${file.name} on server…`);
-    const rowId = opts.rowId || addProgressRow(file.name + " (archive)");
-    try {
-      const r = await api(endpoint, { method: "POST", body: fd });
-      setRowResult(rowId, "ok", `${r.files_written || 0} files`);
-      listFiles();
-      return r;
-    } catch (e) {
-      setRowResult(rowId, "err", e.message);
-      throw e;
-    }
+    return await api(`/api/servers/${serverName}/files/extract`, {
+      method: "POST", body: fd,
+    });
   }
 
-  // Regular per-file upload. If the user set "Save under", join it with the
-  // file's relative path so folder-uploads land as <subdir>/<mods/foo.jar>.
   const dest = subdir ? `${subdir.replace(/\/$/, "")}/${relPath}` : relPath;
   fd.append("path", dest);
-  endpoint = `/api/servers/${CURRENT}/files`;
-
-  const r = await api(endpoint, { method: "POST", body: fd });
-  return r;
+  return await api(`/api/servers/${serverName}/files`, {
+    method: "POST", body: fd,
+  });
 }
 
 function showProgress(label) {
@@ -660,6 +680,10 @@ const TYPE_DEFAULTS = {
 
 let prevTypeDefaults = null;
 
+// Files queued in the modal for upload right after server creation.
+// Each entry: { file, relPath, kind: 'file' | 'folder' | 'archive' }
+let initFiles = [];
+
 function openNewServerModal() {
   const modal = $("#modal-backdrop");
   const form = $("#new-server-form");
@@ -667,11 +691,77 @@ function openNewServerModal() {
   $("#form-error").hidden = true;
   $("#f-auto-start").checked = true;
   prevTypeDefaults = null;
+  initFiles = [];
+  renderInitFileList();
   applyTypeDefaults($("#f-type").value);
   modal.hidden = false;
   setTimeout(() => $("#f-name").focus(), 30);
 }
 function closeNewServerModal() { $("#modal-backdrop").hidden = true; }
+
+// ---------- initial-files staging inside the New Server modal ----------
+
+function initFilePickers() {
+  $("#init-picker-files")?.addEventListener("change", (ev) => {
+    for (const f of Array.from(ev.target.files || [])) {
+      initFiles.push({ file: f, relPath: f.name, kind: "file" });
+    }
+    ev.target.value = "";
+    renderInitFileList();
+  });
+  $("#init-picker-folder")?.addEventListener("change", (ev) => {
+    for (const f of Array.from(ev.target.files || [])) {
+      initFiles.push({
+        file: f,
+        relPath: f.webkitRelativePath || f.name,
+        kind: "folder",
+      });
+    }
+    ev.target.value = "";
+    renderInitFileList();
+  });
+  $("#init-picker-archive")?.addEventListener("change", (ev) => {
+    const f = ev.target.files[0];
+    if (f) initFiles.push({ file: f, relPath: f.name, kind: "archive" });
+    ev.target.value = "";
+    renderInitFileList();
+  });
+}
+initFilePickers();
+
+function renderInitFileList() {
+  const list = $("#init-file-list");
+  const summary = $("#init-file-summary");
+  if (!list) return;
+  list.innerHTML = "";
+  if (!initFiles.length) {
+    summary.hidden = true;
+    return;
+  }
+  let totalBytes = 0;
+  initFiles.forEach((it, idx) => {
+    totalBytes += it.file.size || 0;
+    const li = document.createElement("li");
+    li.dataset.idx = idx;
+    li.innerHTML = `
+      <span class="init-kind">${it.kind}</span>
+      <span class="init-name" title="${escape(it.relPath)}">${escape(it.relPath)}</span>
+      <span class="init-status muted">${fmtBytes(it.file.size)}</span>
+      <button type="button" class="init-remove" data-init-remove="${idx}" title="Remove">&times;</button>
+    `;
+    list.appendChild(li);
+  });
+  summary.hidden = false;
+  summary.textContent = `${initFiles.length} file(s) queued · ${fmtBytes(totalBytes)} total`;
+}
+
+// One delegated handler for both "×" clicks in the list.
+$("#init-file-list")?.addEventListener("click", (ev) => {
+  const idx = ev.target.dataset.initRemove;
+  if (idx == null) return;
+  initFiles.splice(parseInt(idx, 10), 1);
+  renderInitFileList();
+});
 
 $("#modal-close").onclick = closeNewServerModal;
 $("#modal-cancel").onclick = closeNewServerModal;
@@ -757,12 +847,71 @@ $("#new-server-form").addEventListener("submit", async (ev) => {
 
   try {
     await api("/api/servers", { method: "POST", body: JSON.stringify(sd) });
-    closeNewServerModal();
-    await refreshServers();
-    openServer(sd.name);
   } catch (e) {
-    showFormError(e.message);
+    showFormError("Create failed: " + e.message);
+    return;
   }
+
+  // Server def is on disk. Kick off any queued initial-file uploads before
+  // closing the modal so the user can watch them succeed/fail here rather
+  // than on the detail panel.
+  if (initFiles.length) {
+    const saveBtn = $("#modal-save");
+    saveBtn.disabled = true;
+    saveBtn.textContent = `Uploading 0 / ${initFiles.length}…`;
+
+    const area   = $("#init-upload-area").value || "install";
+    const subdir = ($("#init-upload-path").value || "").trim();
+
+    let ok = 0, err = 0;
+    for (let i = 0; i < initFiles.length; i++) {
+      const it = initFiles[i];
+      const li = $("#init-file-list").querySelector(`li[data-idx="${i}"]`);
+      if (li) { li.className = "busy"; li.querySelector(".init-status").textContent = "uploading…"; }
+      try {
+        const r = await uploadOneFile({
+          serverName: sd.name,
+          file: it.file,
+          relPath: it.relPath,
+          area, subdir,
+          overwrite: false,
+          extract: it.kind === "archive",   // only extract explicit archive picks
+          forceArchive: it.kind === "archive",
+        });
+        if (li) {
+          li.className = "ok";
+          li.querySelector(".init-status").textContent =
+            it.kind === "archive" ? `${r.files_written || 0} files` : "ok";
+        }
+        ok++;
+      } catch (e) {
+        if (li) {
+          li.className = "err";
+          li.querySelector(".init-status").textContent = e.message;
+        }
+        err++;
+      }
+      saveBtn.textContent = `Uploading ${i + 1} / ${initFiles.length}…`;
+    }
+
+    saveBtn.disabled = false;
+    saveBtn.textContent = "Create Server";
+
+    if (err) {
+      // Leave the modal open so the user can see what failed and decide
+      // whether to close manually or retry from the Files tab.
+      showFormError(
+        `Server created, but ${err} upload(s) failed. Fix and use the Files ` +
+        `tab, or click Cancel to close.`
+      );
+      await refreshServers();
+      return;
+    }
+  }
+
+  closeNewServerModal();
+  await refreshServers();
+  openServer(sd.name);
 });
 
 function showFormError(msg) {
