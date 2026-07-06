@@ -11,6 +11,7 @@ import os
 import shutil
 import tarfile
 import time
+import zipfile
 from pathlib import Path
 
 from fastapi import HTTPException, UploadFile
@@ -116,6 +117,161 @@ def delete_path(sd: ServerDef, area: str, rel_path: str) -> None:
         target.unlink()
 
 
+# ---------- archive upload + safe extract ----------
+#
+# Same safety guarantees as restore_backup(): staging dir first, then reject
+# any archive member whose resolved path would escape the target root, then
+# swap files into place. Refuses symlink members outright to avoid the
+# classic "symlink pointing at /etc/shadow that we then overwrite" trick.
+
+_ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2")
+
+
+def _looks_like_archive(name: str) -> bool:
+    n = name.lower()
+    return any(n.endswith(s) for s in _ARCHIVE_SUFFIXES)
+
+
+async def extract_upload(
+    sd: ServerDef,
+    area: str,
+    dest_subdir: str,
+    upload: UploadFile,
+    *,
+    overwrite: bool = False,
+) -> dict:
+    """Stream an uploaded archive to a temp file, then safely extract it.
+
+    dest_subdir is relative to the area root. Existing files are refused
+    unless overwrite=True (in which case the target subdir is emptied first).
+    Returns a small summary suitable for a JSON response.
+    """
+    if not upload.filename or not _looks_like_archive(upload.filename):
+        raise HTTPException(status_code=400, detail=(
+            "archive upload must be one of: " + ", ".join(_ARCHIVE_SUFFIXES)
+        ))
+
+    root = _area_root(sd, area)
+    root.mkdir(parents=True, exist_ok=True)
+    target = _safe_join(root, dest_subdir) if dest_subdir else root
+    target.mkdir(parents=True, exist_ok=True)
+
+    # Buffer the upload to disk first — zipfile/tarfile want a seekable stream.
+    tmp_dir = root.parent / f".{root.name}.extract-{int(time.time())}"
+    tmp_dir.mkdir()
+    tmp_archive = tmp_dir / (upload.filename or "upload.bin")
+    try:
+        with tmp_archive.open("wb") as f:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+
+        staging = tmp_dir / "extracted"
+        staging.mkdir()
+
+        name_lc = upload.filename.lower()
+        if name_lc.endswith(".zip"):
+            entries = _extract_zip_safe(tmp_archive, staging)
+        else:
+            entries = _extract_tar_safe(tmp_archive, staging)
+
+        # Optionally clear the destination subdir before merging in.
+        if overwrite and target != root and target.exists():
+            for child in target.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        elif overwrite and target == root:
+            # Overwriting the area root is refused — too dangerous.
+            raise HTTPException(status_code=400, detail=(
+                "overwrite=true requires a dest_subdir; refusing to wipe the area root"
+            ))
+
+        # Merge staged contents onto target. Directories are created as needed;
+        # files replace existing ones. This is the "unpack into place" step.
+        merged = 0
+        for src_root, dirs, files in os.walk(staging):
+            src_rel = Path(src_root).relative_to(staging)
+            dest_root = target / src_rel
+            dest_root.mkdir(parents=True, exist_ok=True)
+            for fname in files:
+                src_file = Path(src_root) / fname
+                dest_file = dest_root / fname
+                # If the destination already exists and we haven't been asked to
+                # overwrite, keep the existing file and count it as skipped.
+                if dest_file.exists() and not overwrite:
+                    continue
+                if dest_file.exists():
+                    dest_file.unlink()
+                shutil.move(str(src_file), str(dest_file))
+                merged += 1
+
+        return {
+            "ok": True,
+            "archive": upload.filename,
+            "extracted_to": str(target),
+            "entries_in_archive": entries,
+            "files_written": merged,
+        }
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _extract_zip_safe(archive: Path, staging: Path) -> int:
+    """Extract a .zip, rejecting escape attempts and symlink members."""
+    with zipfile.ZipFile(archive) as zf:
+        # Guard: reject any member whose resolved path escapes staging.
+        members = zf.infolist()
+        for m in members:
+            _guard_member_name(m.filename, staging)
+            # ZIP unix mode is in external_attr >> 16. S_IFLNK = 0o120000.
+            unix_mode = (m.external_attr >> 16) & 0xFFFF
+            if unix_mode and (unix_mode & 0o170000) == 0o120000:
+                raise HTTPException(status_code=400, detail=(
+                    f"refusing to extract symlink from zip: {m.filename}"
+                ))
+        zf.extractall(staging)  # guarded above  # noqa: S202
+        return len(members)
+
+
+def _extract_tar_safe(archive: Path, staging: Path) -> int:
+    """Extract .tar/.tar.gz/.tgz/.tar.bz2, rejecting symlinks and escape paths."""
+    with tarfile.open(archive) as tf:
+        members = tf.getmembers()
+        for m in members:
+            _guard_member_name(m.name, staging)
+            if m.issym() or m.islnk():
+                raise HTTPException(status_code=400, detail=(
+                    f"refusing to extract link from tar: {m.name}"
+                ))
+            if m.isdev():
+                raise HTTPException(status_code=400, detail=(
+                    f"refusing device node from tar: {m.name}"
+                ))
+        # Python 3.12+ has a `filter=` argument; use it if present for defense
+        # in depth. Older Pythons rely on the guards above.
+        try:
+            tf.extractall(staging, filter="data")  # type: ignore[arg-type]  # noqa: S202
+        except TypeError:
+            tf.extractall(staging)  # noqa: S202
+        return len(members)
+
+
+def _guard_member_name(name: str, staging: Path) -> None:
+    if not name or name.strip() in ("", "."):
+        return
+    if name.startswith("/") or ".." in Path(name).parts:
+        raise HTTPException(status_code=400, detail=f"unsafe archive entry: {name}")
+    resolved = (staging / name).resolve()
+    try:
+        resolved.relative_to(staging.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"archive entry escapes root: {name}") from None
+
+
 # ---------- backups ----------
 
 def make_backup(sd: ServerDef, backup_root: Path) -> Path:
@@ -196,6 +352,7 @@ def human_bytes(n: int | None) -> str:
 
 __all__ = [
     "save_upload", "open_download", "list_dir", "delete_path",
+    "extract_upload",
     "make_backup", "list_backups", "restore_backup", "human_bytes",
 ]
 

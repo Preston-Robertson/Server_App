@@ -1,25 +1,26 @@
-// Minimal dashboard JS. Token stored in localStorage; sent as Bearer on every /api call.
+// Game Server Manager — dashboard JS.
+// Token in localStorage; sent as Bearer on every /api call.
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
 let TOKEN = localStorage.getItem("gamesrv_token") || "";
 let CURRENT = null;              // currently open server name
-let CURRENT_PAGE = "dashboard";  // dashboard | admin
+let CURRENT_PAGE = "dashboard";
 let SERVERS_TIMER = null;
 let UPDATE_LOG_TIMER = null;
 
-// ---------- auth badge (shown in the top nav) ----------
+// ---------- auth badge ----------
 
 function refreshAuthBadge() {
   const el = $("#auth-badge");
   if (!el) return;
   if (TOKEN) {
     el.textContent = "token loaded";
-    el.className = "muted ok";
+    el.className = "ok";
   } else {
     el.textContent = "no token — set on Admin page";
-    el.className = "muted warn";
+    el.className = "warn";
   }
 }
 
@@ -27,10 +28,10 @@ function refreshAuthBadge() {
 
 function showPage(name) {
   CURRENT_PAGE = name;
-  $$(".page").forEach(p => p.hidden = p.id !== `page-${name}`);
-  $$(".nav").forEach(b => b.classList.toggle("active", b.dataset.page === name));
+  $("#page-dashboard").hidden = name !== "dashboard";
+  $("#page-admin").hidden = name !== "admin";
+  $$(".tab").forEach(b => b.classList.toggle("active", b.dataset.page === name));
 
-  // Enable/disable polling per page.
   clearInterval(SERVERS_TIMER); SERVERS_TIMER = null;
   clearInterval(UPDATE_LOG_TIMER); UPDATE_LOG_TIMER = null;
 
@@ -38,16 +39,13 @@ function showPage(name) {
     refreshServers();
     SERVERS_TIMER = setInterval(refreshServers, 5000);
   } else if (name === "admin") {
-    // Prefill the token box (masked) so the user can see something is saved.
     $("#token").value = TOKEN;
-    // If follow-log is already ticked, resume polling.
     if ($("#follow-update-log").checked) startFollowUpdateLog();
   }
 }
+$$(".tab").forEach(b => b.onclick = () => showPage(b.dataset.page));
 
-$$(".nav").forEach(b => b.onclick = () => showPage(b.dataset.page));
-
-// ---------- API helper ----------
+// ---------- API ----------
 
 async function api(path, opts = {}) {
   const headers = Object.assign(
@@ -79,43 +77,49 @@ function fmtDur(s) {
   if (m) return `${m}m`;
   return `${s}s`;
 }
-function fmtTime(ts) {
-  if (!ts) return "-";
-  return new Date(ts * 1000).toLocaleString();
+function fmtTime(ts) { return ts ? new Date(ts * 1000).toLocaleString() : "-"; }
+
+// Map systemd ActiveState to a chip class + friendly label.
+function stateChip(active, sub) {
+  const s = (active || "unknown").toLowerCase();
+  if (s === "active")     return { cls: "chip-ok",    label: `● ${sub || "running"}` };
+  if (s === "activating") return { cls: "chip-warn",  label: `◐ ${sub || "starting"}` };
+  if (s === "deactivating") return { cls: "chip-warn", label: `◑ ${sub || "stopping"}` };
+  if (s === "failed")     return { cls: "chip-err",   label: `✕ failed` };
+  if (s === "inactive")   return { cls: "chip-muted", label: `○ stopped` };
+  return { cls: "chip-muted", label: s };
 }
 
 // ========================================================================
-// ADMIN PAGE
+// ADMIN
 // ========================================================================
 
 $("#save-token").onclick = () => {
   TOKEN = $("#token").value.trim();
   localStorage.setItem("gamesrv_token", TOKEN);
   refreshAuthBadge();
-  $("#token-status").textContent = "saved";
-  $("#token-status").className = "muted ok";
+  setTokenStatus("saved", "ok");
 };
-
 $("#clear-token").onclick = () => {
   TOKEN = "";
   localStorage.removeItem("gamesrv_token");
   $("#token").value = "";
   refreshAuthBadge();
-  $("#token-status").textContent = "cleared";
-  $("#token-status").className = "muted";
+  setTokenStatus("cleared", "");
 };
-
 $("#test-token").onclick = async () => {
   try {
-    // Any authenticated endpoint will do; /api/servers is the cheapest.
     const rows = await api("/api/servers");
-    $("#token-status").textContent = `ok — ${rows.length} server(s) registered`;
-    $("#token-status").className = "muted ok";
+    setTokenStatus(`ok — ${rows.length} server(s) registered`, "ok");
   } catch (e) {
-    $("#token-status").textContent = "FAIL: " + e.message;
-    $("#token-status").className = "muted err";
+    setTokenStatus("FAIL: " + e.message, "err");
   }
 };
+function setTokenStatus(msg, cls) {
+  const el = $("#token-status");
+  el.textContent = msg;
+  el.className = "muted " + (cls || "");
+}
 
 $("#manager-update").onclick = async () => {
   if (!confirm(
@@ -127,7 +131,6 @@ $("#manager-update").onclick = async () => {
     const r = await api("/api/manager/update", { method: "POST" });
     $("#update-log-out").textContent = "triggered: " + JSON.stringify(r, null, 2) +
       "\n\n(waiting for update.log to populate...)\n";
-    // Auto-follow while an update is in flight so the user actually sees it.
     $("#follow-update-log").checked = true;
     startFollowUpdateLog();
   } catch (e) {
@@ -146,7 +149,6 @@ async function refreshUpdateLog() {
   }
 }
 $("#refresh-update-log").onclick = refreshUpdateLog;
-
 function startFollowUpdateLog() {
   clearInterval(UPDATE_LOG_TIMER);
   refreshUpdateLog();
@@ -160,7 +162,6 @@ $("#follow-update-log").onchange = (ev) => {
 $("#check-health").onclick = async () => {
   const badge = $("#health-status");
   try {
-    // /healthz is unauthenticated so it works even without a token.
     const r = await fetch("/healthz");
     const t = await r.text();
     badge.textContent = r.ok ? `OK (${t.trim()})` : `FAIL: HTTP ${r.status}`;
@@ -172,46 +173,89 @@ $("#check-health").onclick = async () => {
 };
 
 // ========================================================================
-// DASHBOARD PAGE
+// DASHBOARD — server cards
 // ========================================================================
 
 async function refreshServers() {
-  if (!TOKEN) return;  // silently skip — Admin page will nag the user.
+  if (!TOKEN) return;
   try {
     const rows = await api("/api/servers");
-    const tbody = $("#servers tbody");
-    tbody.innerHTML = "";
-    for (const r of rows) {
-      const d = r.def, s = r.status;
-      const tr = document.createElement("tr");
-      tr.dataset.active = s.active;
-      tr.innerHTML = `
-        <td><a href="#" data-open="${d.name}">${d.name}</a></td>
-        <td>${d.type}</td>
-        <td class="state">${s.active}/${s.sub}</td>
-        <td>${d.port}</td>
-        <td>${fmtBytes(s.mem_bytes)} / ${d.memory_mb} MB cap</td>
-        <td>${fmtDur(s.uptime_sec)}</td>
-        <td>
-          <button data-quick="start" data-name="${d.name}">▶</button>
-          <button data-quick="stop" data-name="${d.name}">■</button>
-          <button data-quick="restart" data-name="${d.name}">↻</button>
-        </td>`;
-      tbody.appendChild(tr);
-    }
-  } catch (e) {
-    // Don't spam alerts on background poll — surface via auth badge.
+    renderServerGrid(rows);
     const badge = $("#auth-badge");
-    if (badge) {
-      badge.textContent = "auth error — check Admin page";
-      badge.className = "muted err";
-    }
+    if (badge && badge.classList.contains("err")) { badge.textContent = "token loaded"; badge.className = "ok"; }
+  } catch (e) {
+    const badge = $("#auth-badge");
+    if (badge) { badge.textContent = "auth error — check Admin page"; badge.className = "err"; }
   }
+}
+
+function renderServerGrid(rows) {
+  const grid = $("#server-grid");
+  const empty = $("#server-empty");
+  grid.innerHTML = "";
+  if (!rows.length) { empty.hidden = false; return; }
+  empty.hidden = true;
+
+  for (const r of rows) {
+    const d = r.def, s = r.status;
+    const chip = stateChip(s.active, s.sub);
+
+    // RAM % of the cap.
+    const capBytes = (d.memory_mb || 0) * 1024 * 1024;
+    let pct = 0;
+    let barCls = "";
+    if (capBytes > 0 && s.mem_bytes != null && s.mem_bytes > 0) {
+      pct = Math.min(100, (s.mem_bytes / capBytes) * 100);
+      if (pct > 90) barCls = "err";
+      else if (pct > 75) barCls = "warn";
+    }
+    const ramLabel = s.mem_bytes != null
+      ? `${fmtBytes(s.mem_bytes)} / ${d.memory_mb} MB`
+      : `— / ${d.memory_mb} MB`;
+
+    const card = document.createElement("div");
+    card.className = "server-card" + (CURRENT === d.name ? " selected" : "");
+    card.dataset.name = d.name;
+    card.innerHTML = `
+      <div class="server-card-head">
+        <h3 class="server-card-name" data-open="${d.name}">${escape(d.name)}</h3>
+        <span class="server-card-type">${escape(d.type)}</span>
+      </div>
+      <div class="server-card-chips">
+        <span class="chip ${chip.cls}">${chip.label}</span>
+        <span class="chip">:${d.port}</span>
+        ${s.enabled === "enabled" ? '<span class="chip chip-accent">on boot</span>' : ''}
+        ${s.console_available ? '<span class="chip">console</span>' : ''}
+      </div>
+      <div class="server-card-meta">
+        <div class="ram-bar" title="${ramLabel}">
+          <div class="ram-bar-fill ${barCls}" style="width:${pct.toFixed(1)}%"></div>
+        </div>
+        <div class="row">
+          <span>RAM ${ramLabel}</span>
+          <span>Uptime ${fmtDur(s.uptime_sec)}</span>
+        </div>
+      </div>
+      <div class="server-card-actions">
+        <button class="btn btn-tiny btn-success" data-quick="start"   data-name="${d.name}">▶ Start</button>
+        <button class="btn btn-tiny btn-danger"  data-quick="stop"    data-name="${d.name}">■ Stop</button>
+        <button class="btn btn-tiny"             data-quick="restart" data-name="${d.name}">↻</button>
+        <button class="btn btn-tiny btn-ghost"   data-open="${d.name}">Open →</button>
+      </div>
+    `;
+    grid.appendChild(card);
+  }
+}
+
+function escape(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
 }
 
 document.addEventListener("click", async (ev) => {
   const t = ev.target;
-  if (t.dataset.open) { ev.preventDefault(); openServer(t.dataset.open); return; }
+  if (t.dataset.open)  { ev.preventDefault(); openServer(t.dataset.open); return; }
   if (t.dataset.quick) {
     try {
       await api(`/api/servers/${t.dataset.name}/action`, {
@@ -223,176 +267,29 @@ document.addEventListener("click", async (ev) => {
 });
 
 $("#refresh").onclick = refreshServers;
-
+$("#detail-close").onclick = () => { CURRENT = null; $("#detail-panel").hidden = true; refreshServers(); };
 $("#new-server").onclick = () => openNewServerModal();
 
-// ---------- New-Server modal ----------
-//
-// Type-aware defaults keep the form usable without the user having to memorize
-// ports and app IDs. If a field's value is empty OR equal to the previous
-// type's default, we overwrite it when the type changes; if the user typed
-// something custom, we leave it alone.
-
-const TYPE_DEFAULTS = {
-  "minecraft-java":  { port: 25565, memory_mb: 4096,  stop_cmd: "stop", java_args: "-XX:+UseG1GC" },
-  "minecraft-forge": { port: 25565, memory_mb: 10240, stop_cmd: "stop", java_args: "-XX:+UseG1GC" },
-  "steamcmd":        { port: 8211,  memory_mb: 16384, stop_cmd: "",     java_args: "",              steam_app_id: 2394010 },
-  "custom":          { port: 27015, memory_mb: 2048,  stop_cmd: "",     java_args: "" },
-};
-
-let prevTypeDefaults = null;   // for detecting "user hasn't customized this field"
-
-function openNewServerModal() {
-  const modal = $("#modal-backdrop");
-  const form = $("#new-server-form");
-  form.reset();
-  $("#form-error").hidden = true;
-  $("#f-auto-start").checked = true;
-  prevTypeDefaults = null;
-  applyTypeDefaults($("#f-type").value);
-  modal.hidden = false;
-  setTimeout(() => $("#f-name").focus(), 30);
-}
-function closeNewServerModal() { $("#modal-backdrop").hidden = true; }
-
-$("#modal-close").onclick = closeNewServerModal;
-$("#modal-cancel").onclick = closeNewServerModal;
-$("#modal-backdrop").addEventListener("click", (ev) => {
-  if (ev.target.id === "modal-backdrop") closeNewServerModal();
-});
-document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape" && !$("#modal-backdrop").hidden) closeNewServerModal();
-});
-
-function applyTypeDefaults(type) {
-  const d = TYPE_DEFAULTS[type] || {};
-
-  // Show/hide type-specific fieldsets.
-  $("#fs-steamcmd").hidden = type !== "steamcmd";
-  $("#fs-forge").hidden    = type !== "minecraft-forge";
-
-  // For each defaulted field: replace value only if empty or unchanged from
-  // the previous type's default (i.e. the user hasn't typed anything custom).
-  const setIfDefault = (id, key, formatter = (v) => v) => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    const cur = el.value;
-    const prev = prevTypeDefaults ? formatter(prevTypeDefaults[key] ?? "") : "";
-    if (cur === "" || cur === prev) el.value = formatter(d[key] ?? "");
-  };
-
-  setIfDefault("f-port", "port", String);
-  setIfDefault("f-memory", "memory_mb", String);
-  setIfDefault("f-stop-cmd", "stop_cmd");
-  setIfDefault("f-java-args", "java_args");
-  if (type === "steamcmd") {
-    setIfDefault("f-steam-app-id", "steam_app_id", String);
-  }
-
-  syncPathsFromName();
-  prevTypeDefaults = d;
-}
-
-$("#f-type").addEventListener("change", (ev) => applyTypeDefaults(ev.target.value));
-
-// Auto-derive install_dir / world_dir from the name unless the user typed a
-// custom value into either box.
-function syncPathsFromName() {
-  const name = ($("#f-name").value || "").trim();
-  const inst = $("#f-install-dir");
-  const world = $("#f-world-dir");
-  const nameFor = (base) => name ? `${base}/${name}` : "";
-
-  // Only rewrite if empty or if it still matches a name-derived path pattern.
-  const looksDerived = (val, base) =>
-    !val || /^\/(srv\/gameservers|opt\/gamesrv\/worlds)\/[a-z0-9-]+$/.test(val);
-
-  if (looksDerived(inst.value, "/srv/gameservers")) {
-    inst.value = nameFor("/srv/gameservers");
-  }
-  if (looksDerived(world.value, "/opt/gamesrv/worlds")) {
-    world.value = nameFor("/opt/gamesrv/worlds");
-  }
-}
-$("#f-name").addEventListener("input", syncPathsFromName);
-
-// Build the ServerDef JSON from the form and POST it.
-$("#new-server-form").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  const errEl = $("#form-error");
-  errEl.hidden = true;
-
-  const type = $("#f-type").value;
-  const sd = {
-    name:               $("#f-name").value.trim(),
-    type:               type,
-    install_dir:        $("#f-install-dir").value.trim(),
-    world_dir:          $("#f-world-dir").value.trim(),
-    port:               parseInt($("#f-port").value, 10),
-    memory_mb:          parseInt($("#f-memory").value, 10),
-    java_args:          $("#f-java-args").value,
-    stop_cmd:           $("#f-stop-cmd").value,
-    auto_start_on_boot: $("#f-auto-start").checked,
-  };
-
-  // Type-specific extras.
-  if (type === "steamcmd") {
-    const appId = parseInt($("#f-steam-app-id").value, 10);
-    if (!appId) { showFormError("steamcmd type needs a Steam App ID"); return; }
-    sd.steam_app_id = appId;
-    const beta = $("#f-steam-beta").value.trim();
-    if (beta) sd.steam_beta = beta;
-  }
-  if (type === "minecraft-forge") {
-    const mcv = $("#f-mc-version").value.trim();
-    const fv  = $("#f-forge-version").value.trim();
-    if (mcv) sd.mc_version = mcv;
-    if (fv)  sd.forge_version = fv;
-  }
-
-  // RCON block (only sent if enabled OR the user filled anything in).
-  const rconEnabled = $("#f-rcon-enabled").checked;
-  const rconPort    = $("#f-rcon-port").value.trim();
-  const rconPwEnv   = $("#f-rcon-pw-env").value.trim();
-  if (rconEnabled || rconPort || rconPwEnv) {
-    sd.rcon = { enabled: rconEnabled };
-    if (rconPort)  sd.rcon.port = parseInt(rconPort, 10);
-    if (rconPwEnv) sd.rcon.password_env = rconPwEnv;
-  }
-
-  try {
-    await api("/api/servers", { method: "POST", body: JSON.stringify(sd) });
-    closeNewServerModal();
-    await refreshServers();
-    // Auto-open the new server so the user can go straight to Install.
-    openServer(sd.name);
-  } catch (e) {
-    showFormError(e.message);
-  }
-});
-
-function showFormError(msg) {
-  const el = $("#form-error");
-  el.textContent = msg;
-  el.hidden = false;
-}
+// ---------- server detail ----------
 
 async function openServer(name) {
   CURRENT = name;
   $("#detail-panel").hidden = false;
   $("#detail-title").textContent = name;
   showTab("control");
+  refreshServers();  // to re-highlight the selected card
+  $("#detail-panel").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function showTab(name) {
-  $$(".tab").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
-  $$(".tab-body").forEach(b => b.hidden = b.dataset.body !== name);
+  $$(".subtab").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  $$(".subtab-body").forEach(b => b.hidden = b.dataset.body !== name);
   if (name === "logs") loadLogs();
   if (name === "files") listFiles();
   if (name === "backups") loadBackups();
   if (name === "def") loadDef();
 }
-$$(".tab").forEach(b => b.onclick = () => showTab(b.dataset.tab));
+$$(".subtab").forEach(b => b.onclick = () => showTab(b.dataset.tab));
 
 // Control tab
 document.addEventListener("click", async (ev) => {
@@ -411,7 +308,7 @@ document.addEventListener("click", async (ev) => {
   } catch (e) { $("#control-out").textContent = "ERROR: " + e.message; }
 });
 
-// Console tab
+// Console
 $("#console-send").onclick = async () => {
   const cmd = $("#console-cmd").value;
   try {
@@ -423,7 +320,7 @@ $("#console-send").onclick = async () => {
   } catch (e) { $("#console-out").textContent = "ERROR: " + e.message; }
 };
 
-// Logs tab
+// Logs
 async function loadLogs() {
   const n = $("#log-lines").value || 200;
   try {
@@ -434,7 +331,7 @@ async function loadLogs() {
 }
 $("#refresh-logs").onclick = loadLogs;
 
-// Files tab
+// Files
 async function listFiles() {
   const area = $("#files-area").value;
   const path = $("#files-path").value || "";
@@ -451,14 +348,16 @@ async function listFiles() {
       const tr = document.createElement("tr");
       const full = (path ? path.replace(/\/$/, "") + "/" : "") + r.name;
       if (r.is_dir) {
-        tr.innerHTML = `<td><a href="#" data-into="${full}">${r.name}/</a></td>
+        tr.innerHTML = `<td><a href="#" data-into="${escape(full)}">${escape(r.name)}/</a></td>
           <td>-</td><td>${fmtTime(r.mtime)}</td>
-          <td><button data-del="${full}">delete</button></td>`;
+          <td><button class="btn btn-tiny btn-danger" data-del="${escape(full)}">delete</button></td>`;
       } else {
-        tr.innerHTML = `<td>${r.name}</td><td>${fmtBytes(r.size)}</td>
+        tr.innerHTML = `<td>${escape(r.name)}</td><td>${fmtBytes(r.size)}</td>
           <td>${fmtTime(r.mtime)}</td>
-          <td><button data-dl="${full}">download</button>
-              <button data-del="${full}">delete</button></td>`;
+          <td>
+            <button class="btn btn-tiny" data-dl="${escape(full)}">download</button>
+            <button class="btn btn-tiny btn-danger" data-del="${escape(full)}">delete</button>
+          </td>`;
       }
       tbody.appendChild(tr);
     }
@@ -488,7 +387,6 @@ document.addEventListener("click", async (ev) => {
   } else if (t.dataset.dl && CURRENT) {
     const area = $("#files-area").value;
     const url = `/api/servers/${CURRENT}/files/download?area=${encodeURIComponent(area)}&path=${encodeURIComponent(t.dataset.dl)}`;
-    // Auth via header is fine, but <a download> tags don't send headers; use blob path.
     try {
       const r = await fetch(url, { headers: { "Authorization": "Bearer " + TOKEN } });
       if (!r.ok) throw new Error("HTTP " + r.status);
@@ -501,21 +399,202 @@ document.addEventListener("click", async (ev) => {
   }
 });
 
-$("#upload-form").onsubmit = async (ev) => {
-  ev.preventDefault();
-  const file = $("#upload-file").files[0];
-  if (!file || !CURRENT) return;
+$("#upload-form")?.addEventListener("submit", () => {}); // legacy, no-op
+
+// ---------- Dropzone / multi-file / folder / archive upload ----------
+//
+// Three ingress points, all handled the same way:
+//   1. drop event (files or a folder)
+//   2. #picker-files (multiple files)
+//   3. #picker-folder (webkitdirectory — files with webkitRelativePath)
+//   4. #picker-archive (single archive; goes to /files/extract if the
+//      "extract archives on the server" toggle is on)
+//
+// The DataTransfer's items expose webkitGetAsEntry() which we walk to
+// preserve folder structure when a directory is dropped. Without that,
+// dropped folders show up as opaque "directory" entries and the upload
+// silently misses their contents.
+
+const ARCHIVE_RE = /\.(zip|tar|tgz|tar\.gz|tbz2|tar\.bz2)$/i;
+
+function isArchiveName(name) { return ARCHIVE_RE.test(String(name || "")); }
+
+function currentUploadArea() { return $("#files-area")?.value || "install"; }
+function currentUploadSubdir() { return ($("#upload-path")?.value || "").trim(); }
+function shouldOverwrite() { return $("#upload-overwrite")?.checked || false; }
+function shouldExtract() { return $("#upload-extract")?.checked !== false; }
+
+function initDropzone() {
+  const zone = $("#dropzone");
+  if (!zone) return;
+
+  // Wire the pickers (input elements INSIDE labels; the label triggers them).
+  $("#picker-files")?.addEventListener("change", (ev) => uploadFileList(ev.target.files));
+  $("#picker-folder")?.addEventListener("change", (ev) => uploadFileList(ev.target.files));
+  $("#picker-archive")?.addEventListener("change", (ev) => {
+    const f = ev.target.files[0];
+    if (f) uploadSingle(f, f.name, { forceArchive: true });
+  });
+  $("#upload-clear")?.addEventListener("click", () => {
+    $("#upload-progress-list").innerHTML = "";
+    $("#upload-progress").hidden = true;
+  });
+
+  // Prevent the browser opening the file when a stray drag lands elsewhere.
+  ["dragover", "drop"].forEach(evt =>
+    document.addEventListener(evt, e => { if (e.target.closest("#dropzone") == null) { e.preventDefault(); } })
+  );
+
+  zone.addEventListener("dragenter", (e) => { e.preventDefault(); zone.classList.add("is-dragover"); });
+  zone.addEventListener("dragover",  (e) => { e.preventDefault(); zone.classList.add("is-dragover"); });
+  zone.addEventListener("dragleave", (e) => {
+    // Only clear if we're leaving the zone entirely, not entering a child.
+    if (!zone.contains(e.relatedTarget)) zone.classList.remove("is-dragover");
+  });
+  zone.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    zone.classList.remove("is-dragover");
+
+    const items = e.dataTransfer && e.dataTransfer.items;
+    if (items && items.length && items[0].webkitGetAsEntry) {
+      // Rich path: walk directory entries so we preserve folder structure.
+      const entries = [];
+      for (let i = 0; i < items.length; i++) {
+        const entry = items[i].webkitGetAsEntry();
+        if (entry) entries.push(entry);
+      }
+      const collected = [];
+      for (const entry of entries) await walkEntry(entry, "", collected);
+      await uploadCollected(collected);
+    } else if (e.dataTransfer.files) {
+      // Fallback: no directory API, treat as flat file list.
+      await uploadFileList(e.dataTransfer.files);
+    }
+  });
+}
+initDropzone();
+
+async function walkEntry(entry, prefix, collected) {
+  if (entry.isFile) {
+    const file = await new Promise((res, rej) => entry.file(res, rej));
+    collected.push({ file, relPath: (prefix ? prefix + "/" : "") + file.name });
+  } else if (entry.isDirectory) {
+    const dirName = entry.name;
+    const reader = entry.createReader();
+    // readEntries() returns in batches; loop until it returns an empty array.
+    while (true) {
+      const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+      if (!batch.length) break;
+      for (const child of batch) {
+        await walkEntry(child, prefix ? `${prefix}/${dirName}` : dirName, collected);
+      }
+    }
+  }
+}
+
+async function uploadFileList(fileList) {
+  const collected = [];
+  for (const f of Array.from(fileList || [])) {
+    // Folder picker exposes webkitRelativePath (e.g. "mods/foo.jar").
+    const rel = f.webkitRelativePath || f.name;
+    collected.push({ file: f, relPath: rel });
+  }
+  await uploadCollected(collected);
+}
+
+async function uploadCollected(items) {
+  if (!items.length) return;
+
+  // Single archive + extract mode → route through the extract endpoint.
+  if (items.length === 1 && shouldExtract() && isArchiveName(items[0].file.name)) {
+    await uploadSingle(items[0].file, items[0].file.name, { forceArchive: true });
+    return;
+  }
+
+  showProgress(`Uploading ${items.length} file(s)…`);
+  let ok = 0, err = 0;
+  for (const it of items) {
+    const rowId = addProgressRow(it.relPath);
+    try {
+      await uploadSingle(it.file, it.relPath, { rowId });
+      setRowResult(rowId, "ok", "uploaded");
+      ok++;
+    } catch (e) {
+      setRowResult(rowId, "err", e.message);
+      err++;
+    }
+  }
+  $("#upload-progress-label").textContent = `Done — ${ok} uploaded, ${err} failed`;
+  listFiles();
+}
+
+async function uploadSingle(file, relPath, opts = {}) {
+  if (!CURRENT) throw new Error("no server selected");
+  const area = currentUploadArea();
+  const subdir = currentUploadSubdir();
+  const overwrite = shouldOverwrite();
+
+  const asArchive = opts.forceArchive || (shouldExtract() && isArchiveName(file.name));
+
   const fd = new FormData();
   fd.append("file", file);
-  fd.append("area", $("#files-area").value);
-  fd.append("path", $("#upload-path").value || file.name);
-  fd.append("overwrite", $("#upload-overwrite").checked ? "true" : "false");
-  try {
-    const r = await api(`/api/servers/${CURRENT}/files`, { method: "POST", body: fd });
-    $("#files-out").textContent = JSON.stringify(r, null, 2);
-    listFiles();
-  } catch (e) { $("#files-out").textContent = "ERROR: " + e.message; }
-};
+  fd.append("area", area);
+  fd.append("overwrite", overwrite ? "true" : "false");
+
+  let endpoint;
+  if (asArchive) {
+    if (subdir) fd.append("dest_subdir", subdir);
+    endpoint = `/api/servers/${CURRENT}/files/extract`;
+    showProgress(`Extracting ${file.name} on server…`);
+    const rowId = opts.rowId || addProgressRow(file.name + " (archive)");
+    try {
+      const r = await api(endpoint, { method: "POST", body: fd });
+      setRowResult(rowId, "ok", `${r.files_written || 0} files`);
+      listFiles();
+      return r;
+    } catch (e) {
+      setRowResult(rowId, "err", e.message);
+      throw e;
+    }
+  }
+
+  // Regular per-file upload. If the user set "Save under", join it with the
+  // file's relative path so folder-uploads land as <subdir>/<mods/foo.jar>.
+  const dest = subdir ? `${subdir.replace(/\/$/, "")}/${relPath}` : relPath;
+  fd.append("path", dest);
+  endpoint = `/api/servers/${CURRENT}/files`;
+
+  const r = await api(endpoint, { method: "POST", body: fd });
+  return r;
+}
+
+function showProgress(label) {
+  $("#upload-progress").hidden = false;
+  $("#upload-progress-label").textContent = label;
+}
+
+let _progressSeq = 0;
+function addProgressRow(name) {
+  const list = $("#upload-progress-list");
+  const id = "up-" + (++_progressSeq);
+  const li = document.createElement("li");
+  li.id = id;
+  li.className = "busy";
+  li.innerHTML = `
+    <span class="upload-progress-name" title="${escape(name)}">${escape(name)}</span>
+    <span class="upload-progress-status">…</span>
+    <span></span>
+  `;
+  list.appendChild(li);
+  list.scrollTop = list.scrollHeight;
+  return id;
+}
+function setRowResult(id, cls, msg) {
+  const li = document.getElementById(id);
+  if (!li) return;
+  li.className = cls;
+  li.querySelector(".upload-progress-status").textContent = msg;
+}
 
 // Backups
 async function loadBackups() {
@@ -525,8 +604,8 @@ async function loadBackups() {
     tbody.innerHTML = "";
     for (const r of rows) {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${r.name}</td><td>${fmtBytes(r.size)}</td><td>${fmtTime(r.mtime)}</td>
-        <td><button data-restore="${r.name}">restore</button></td>`;
+      tr.innerHTML = `<td>${escape(r.name)}</td><td>${fmtBytes(r.size)}</td><td>${fmtTime(r.mtime)}</td>
+        <td><button class="btn btn-tiny" data-restore="${escape(r.name)}">restore</button></td>`;
       tbody.appendChild(tr);
     }
   } catch (e) { $("#backups-out").textContent = "ERROR: " + e.message; }
@@ -552,7 +631,7 @@ document.addEventListener("click", async (ev) => {
   } catch (e) { $("#backups-out").textContent = "ERROR: " + e.message; }
 });
 
-// Definition tab
+// Definition
 async function loadDef() {
   try {
     const r = await api(`/api/servers/${CURRENT}`);
@@ -569,9 +648,132 @@ $("#def-save").onclick = async () => {
 };
 
 // ========================================================================
-// INITIAL LOAD
+// NEW SERVER MODAL
+// ========================================================================
+
+const TYPE_DEFAULTS = {
+  "minecraft-java":  { port: 25565, memory_mb: 4096,  stop_cmd: "stop", java_args: "-XX:+UseG1GC" },
+  "minecraft-forge": { port: 25565, memory_mb: 10240, stop_cmd: "stop", java_args: "-XX:+UseG1GC" },
+  "steamcmd":        { port: 8211,  memory_mb: 16384, stop_cmd: "",     java_args: "",              steam_app_id: 2394010 },
+  "custom":          { port: 27015, memory_mb: 2048,  stop_cmd: "",     java_args: "" },
+};
+
+let prevTypeDefaults = null;
+
+function openNewServerModal() {
+  const modal = $("#modal-backdrop");
+  const form = $("#new-server-form");
+  form.reset();
+  $("#form-error").hidden = true;
+  $("#f-auto-start").checked = true;
+  prevTypeDefaults = null;
+  applyTypeDefaults($("#f-type").value);
+  modal.hidden = false;
+  setTimeout(() => $("#f-name").focus(), 30);
+}
+function closeNewServerModal() { $("#modal-backdrop").hidden = true; }
+
+$("#modal-close").onclick = closeNewServerModal;
+$("#modal-cancel").onclick = closeNewServerModal;
+$("#modal-backdrop").addEventListener("click", (ev) => {
+  if (ev.target.id === "modal-backdrop") closeNewServerModal();
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && !$("#modal-backdrop").hidden) closeNewServerModal();
+});
+
+function applyTypeDefaults(type) {
+  const d = TYPE_DEFAULTS[type] || {};
+  $("#fs-steamcmd").hidden = type !== "steamcmd";
+  $("#fs-forge").hidden    = type !== "minecraft-forge";
+
+  const setIfDefault = (id, key, formatter = (v) => v) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const cur = el.value;
+    const prev = prevTypeDefaults ? formatter(prevTypeDefaults[key] ?? "") : "";
+    if (cur === "" || cur === prev) el.value = formatter(d[key] ?? "");
+  };
+  setIfDefault("f-port", "port", String);
+  setIfDefault("f-memory", "memory_mb", String);
+  setIfDefault("f-stop-cmd", "stop_cmd");
+  setIfDefault("f-java-args", "java_args");
+  if (type === "steamcmd") setIfDefault("f-steam-app-id", "steam_app_id", String);
+
+  syncPathsFromName();
+  prevTypeDefaults = d;
+}
+$("#f-type").addEventListener("change", (ev) => applyTypeDefaults(ev.target.value));
+
+function syncPathsFromName() {
+  const name = ($("#f-name").value || "").trim();
+  const inst = $("#f-install-dir");
+  const world = $("#f-world-dir");
+  const nameFor = (base) => name ? `${base}/${name}` : "";
+  const looksDerived = (val) =>
+    !val || /^\/(srv\/gameservers|opt\/gamesrv\/worlds)\/[a-z0-9-]+$/.test(val);
+  if (looksDerived(inst.value))  inst.value  = nameFor("/srv/gameservers");
+  if (looksDerived(world.value)) world.value = nameFor("/opt/gamesrv/worlds");
+}
+$("#f-name").addEventListener("input", syncPathsFromName);
+
+$("#new-server-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  $("#form-error").hidden = true;
+
+  const type = $("#f-type").value;
+  const sd = {
+    name:               $("#f-name").value.trim(),
+    type:               type,
+    install_dir:        $("#f-install-dir").value.trim(),
+    world_dir:          $("#f-world-dir").value.trim(),
+    port:               parseInt($("#f-port").value, 10),
+    memory_mb:          parseInt($("#f-memory").value, 10),
+    java_args:          $("#f-java-args").value,
+    stop_cmd:           $("#f-stop-cmd").value,
+    auto_start_on_boot: $("#f-auto-start").checked,
+  };
+  if (type === "steamcmd") {
+    const appId = parseInt($("#f-steam-app-id").value, 10);
+    if (!appId) { showFormError("steamcmd type needs a Steam App ID"); return; }
+    sd.steam_app_id = appId;
+    const beta = $("#f-steam-beta").value.trim();
+    if (beta) sd.steam_beta = beta;
+  }
+  if (type === "minecraft-forge") {
+    const mcv = $("#f-mc-version").value.trim();
+    const fv  = $("#f-forge-version").value.trim();
+    if (mcv) sd.mc_version = mcv;
+    if (fv)  sd.forge_version = fv;
+  }
+  const rconEnabled = $("#f-rcon-enabled").checked;
+  const rconPort    = $("#f-rcon-port").value.trim();
+  const rconPwEnv   = $("#f-rcon-pw-env").value.trim();
+  if (rconEnabled || rconPort || rconPwEnv) {
+    sd.rcon = { enabled: rconEnabled };
+    if (rconPort)  sd.rcon.port = parseInt(rconPort, 10);
+    if (rconPwEnv) sd.rcon.password_env = rconPwEnv;
+  }
+
+  try {
+    await api("/api/servers", { method: "POST", body: JSON.stringify(sd) });
+    closeNewServerModal();
+    await refreshServers();
+    openServer(sd.name);
+  } catch (e) {
+    showFormError(e.message);
+  }
+});
+
+function showFormError(msg) {
+  const el = $("#form-error");
+  el.textContent = msg;
+  el.hidden = false;
+}
+
+// ========================================================================
+// INIT
 // ========================================================================
 
 refreshAuthBadge();
-// If the user has no token yet, land on Admin so they can paste one.
 showPage(TOKEN ? "dashboard" : "admin");

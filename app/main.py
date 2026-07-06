@@ -200,6 +200,23 @@ async def api_files_upload(
     return {"ok": True, "saved": str(saved), "bytes": saved.stat().st_size}
 
 
+@app.post("/api/servers/{name}/files/extract", dependencies=[Depends(require_token)])
+async def api_files_extract(
+    name: str,
+    file: UploadFile,
+    area: str = Form("install"),
+    dest_subdir: str = Form(""),
+    overwrite: bool = Form(False),
+) -> dict:
+    """Upload a .zip / .tar.gz / .tgz / .tar / .tar.bz2 archive and extract it
+    into the requested area (optionally into a subdirectory). One HTTP round
+    trip beats N uploads for large trees like a whole Forge server or a
+    world backup exported from another host.
+    """
+    sd = registry.load_def(name)
+    return await uploads.extract_upload(sd, area, dest_subdir, file, overwrite=overwrite)
+
+
 @app.get("/api/servers/{name}/files/download", dependencies=[Depends(require_token)])
 def api_files_download(name: str, area: str = "install", path: str = "") -> FileResponse:
     sd = registry.load_def(name)
