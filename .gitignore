@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Env / secrets — NEVER commit
+.env
+*.env
+!*.env.example
+/etc-gamesrv.env
+
+# Runtime data (should live outside repo in prod, but ignore locally too)
+/servers/*.yml
+!/servers/*.example.yml
+/logs/
+/backups/
+/tmp/
+/uploads/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build/rollback state
+.update-rollback
+requirements.lock.bak

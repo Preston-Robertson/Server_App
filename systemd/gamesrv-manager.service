@@ -1,0 +1,25 @@
+# /etc/systemd/system/gamesrv-manager.service
+# The FastAPI manager. Runs as unprivileged `gamesrv`. Env from /etc/gamesrv.env.
+[Unit]
+Description=Game Server Manager (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gamesrv
+Group=gamesrv
+EnvironmentFile=/etc/gamesrv.env
+WorkingDirectory=/opt/gamesrv
+ExecStart=/opt/gamesrv/run_manager.sh
+Restart=on-failure
+RestartSec=5
+
+# Hardening — Preston runs this LAN-only behind UFW, but defense in depth.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

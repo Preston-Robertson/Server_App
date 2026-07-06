@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Game Server Manager</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header>
+    <h1>Game Server Manager</h1>
+    <div id="token-bar">
+      <label>Token: <input id="token" type="password" placeholder="paste bearer token" size="40" /></label>
+      <button id="save-token">Save</button>
+      <span id="token-status"></span>
+      <button id="manager-update">Update Manager (from GitHub)</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="servers-panel">
+      <h2>Servers</h2>
+      <div class="toolbar">
+        <button id="refresh">Refresh</button>
+        <button id="new-server">+ New Server</button>
+      </div>
+      <table id="servers">
+        <thead>
+          <tr><th>Name</th><th>Type</th><th>State</th><th>Port</th><th>RAM</th><th>Uptime</th><th>Actions</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section id="detail-panel" hidden>
+      <h2 id="detail-title"></h2>
+      <div class="tabs">
+        <button class="tab" data-tab="control">Control</button>
+        <button class="tab" data-tab="console">Console</button>
+        <button class="tab" data-tab="logs">Logs</button>
+        <button class="tab" data-tab="files">Files</button>
+        <button class="tab" data-tab="backups">Backups</button>
+        <button class="tab" data-tab="def">Definition</button>
+      </div>
+
+      <div class="tab-body" data-body="control">
+        <button data-action="start">Start</button>
+        <button data-action="stop">Stop</button>
+        <button data-action="restart">Restart</button>
+        <button data-action="enable">Enable on Boot</button>
+        <button data-action="disable">Disable on Boot</button>
+        <hr />
+        <button data-action="install">Install / Reprovision</button>
+        <button data-action="update-type">Update Game Software</button>
+        <pre id="control-out"></pre>
+      </div>
+
+      <div class="tab-body" data-body="console" hidden>
+        <p>Sends a command to the running server via its tmux session.</p>
+        <input id="console-cmd" placeholder="e.g. say hello  |  whitelist add Steve" size="60" />
+        <button id="console-send">Send</button>
+        <pre id="console-out"></pre>
+      </div>
+
+      <div class="tab-body" data-body="logs" hidden>
+        <button id="refresh-logs">Refresh</button>
+        <label>Lines: <input id="log-lines" type="number" value="200" min="1" max="2000" /></label>
+        <pre id="logs-out"></pre>
+      </div>
+
+      <div class="tab-body" data-body="files" hidden>
+        <p>
+          <strong>Area:</strong>
+          <select id="files-area">
+            <option value="install">install_dir (binaries, config, mods)</option>
+            <option value="world">world_dir (saves — on TrueNAS)</option>
+          </select>
+          <strong>Path:</strong> <input id="files-path" placeholder="(root)" size="30" />
+          <button id="files-list-btn">List</button>
+        </p>
+        <table id="files-table">
+          <thead><tr><th>Name</th><th>Size</th><th>Modified</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <hr />
+        <h3>Upload</h3>
+        <form id="upload-form">
+          <input type="file" id="upload-file" required />
+          <label>Save as (relative to area, blank = original filename):
+            <input id="upload-path" size="40" placeholder="e.g. server.jar or mods/foo.jar" />
+          </label>
+          <label><input type="checkbox" id="upload-overwrite" /> overwrite</label>
+          <button type="submit">Upload</button>
+        </form>
+        <pre id="files-out"></pre>
+      </div>
+
+      <div class="tab-body" data-body="backups" hidden>
+        <button id="backup-now">Back up world_dir now</button>
+        <button id="backups-refresh">Refresh</button>
+        <table id="backups-table">
+          <thead><tr><th>File</th><th>Size</th><th>Created</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <pre id="backups-out"></pre>
+      </div>
+
+      <div class="tab-body" data-body="def" hidden>
+        <p>Edit the raw definition (YAML fields as JSON). Save writes to <code>servers/&lt;name&gt;.yml</code>.</p>
+        <textarea id="def-json" rows="20" cols="80"></textarea>
+        <br /><button id="def-save">Save Definition</button>
+        <pre id="def-out"></pre>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

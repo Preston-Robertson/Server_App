@@ -1,0 +1,20 @@
+/* /etc/polkit-1/rules.d/49-gamesrv.rules
+ *
+ * Lets the unprivileged `gamesrv` user run systemctl start/stop/restart/enable/disable
+ * for gamesrv@*.service ONLY. No blanket root. Reload polkit after installing:
+ *   sudo systemctl restart polkit
+ */
+polkit.addRule(function(action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units") return;
+    if (subject.user !== "gamesrv") return;
+
+    var unit = action.lookup("unit") || "";
+    var verb = action.lookup("verb") || "";
+
+    var allowedUnits = /^gamesrv@[A-Za-z0-9._-]+\.service$/;
+    var allowedVerbs = ["start", "stop", "restart", "reload", "enable", "disable"];
+
+    if (allowedUnits.test(unit) && allowedVerbs.indexOf(verb) >= 0) {
+        return polkit.Result.YES;
+    }
+});
