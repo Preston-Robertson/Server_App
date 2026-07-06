@@ -224,26 +224,158 @@ document.addEventListener("click", async (ev) => {
 
 $("#refresh").onclick = refreshServers;
 
-$("#new-server").onclick = async () => {
-  const example = {
-    name: "myserver",
-    type: "minecraft-java",
-    install_dir: "/srv/gameservers/myserver",
-    world_dir: "/opt/gamesrv/worlds/myserver",
-    port: 25565,
-    memory_mb: 4096,
-    java_args: "-XX:+UseG1GC",
-    stop_cmd: "stop",
-    auto_start_on_boot: true,
-  };
-  const raw = prompt("Paste server definition JSON:", JSON.stringify(example, null, 2));
-  if (!raw) return;
-  try {
-    const sd = JSON.parse(raw);
-    await api("/api/servers", { method: "POST", body: JSON.stringify(sd) });
-    refreshServers();
-  } catch (e) { alert(e.message); }
+$("#new-server").onclick = () => openNewServerModal();
+
+// ---------- New-Server modal ----------
+//
+// Type-aware defaults keep the form usable without the user having to memorize
+// ports and app IDs. If a field's value is empty OR equal to the previous
+// type's default, we overwrite it when the type changes; if the user typed
+// something custom, we leave it alone.
+
+const TYPE_DEFAULTS = {
+  "minecraft-java":  { port: 25565, memory_mb: 4096,  stop_cmd: "stop", java_args: "-XX:+UseG1GC" },
+  "minecraft-forge": { port: 25565, memory_mb: 10240, stop_cmd: "stop", java_args: "-XX:+UseG1GC" },
+  "steamcmd":        { port: 8211,  memory_mb: 16384, stop_cmd: "",     java_args: "",              steam_app_id: 2394010 },
+  "custom":          { port: 27015, memory_mb: 2048,  stop_cmd: "",     java_args: "" },
 };
+
+let prevTypeDefaults = null;   // for detecting "user hasn't customized this field"
+
+function openNewServerModal() {
+  const modal = $("#modal-backdrop");
+  const form = $("#new-server-form");
+  form.reset();
+  $("#form-error").hidden = true;
+  $("#f-auto-start").checked = true;
+  prevTypeDefaults = null;
+  applyTypeDefaults($("#f-type").value);
+  modal.hidden = false;
+  setTimeout(() => $("#f-name").focus(), 30);
+}
+function closeNewServerModal() { $("#modal-backdrop").hidden = true; }
+
+$("#modal-close").onclick = closeNewServerModal;
+$("#modal-cancel").onclick = closeNewServerModal;
+$("#modal-backdrop").addEventListener("click", (ev) => {
+  if (ev.target.id === "modal-backdrop") closeNewServerModal();
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && !$("#modal-backdrop").hidden) closeNewServerModal();
+});
+
+function applyTypeDefaults(type) {
+  const d = TYPE_DEFAULTS[type] || {};
+
+  // Show/hide type-specific fieldsets.
+  $("#fs-steamcmd").hidden = type !== "steamcmd";
+  $("#fs-forge").hidden    = type !== "minecraft-forge";
+
+  // For each defaulted field: replace value only if empty or unchanged from
+  // the previous type's default (i.e. the user hasn't typed anything custom).
+  const setIfDefault = (id, key, formatter = (v) => v) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const cur = el.value;
+    const prev = prevTypeDefaults ? formatter(prevTypeDefaults[key] ?? "") : "";
+    if (cur === "" || cur === prev) el.value = formatter(d[key] ?? "");
+  };
+
+  setIfDefault("f-port", "port", String);
+  setIfDefault("f-memory", "memory_mb", String);
+  setIfDefault("f-stop-cmd", "stop_cmd");
+  setIfDefault("f-java-args", "java_args");
+  if (type === "steamcmd") {
+    setIfDefault("f-steam-app-id", "steam_app_id", String);
+  }
+
+  syncPathsFromName();
+  prevTypeDefaults = d;
+}
+
+$("#f-type").addEventListener("change", (ev) => applyTypeDefaults(ev.target.value));
+
+// Auto-derive install_dir / world_dir from the name unless the user typed a
+// custom value into either box.
+function syncPathsFromName() {
+  const name = ($("#f-name").value || "").trim();
+  const inst = $("#f-install-dir");
+  const world = $("#f-world-dir");
+  const nameFor = (base) => name ? `${base}/${name}` : "";
+
+  // Only rewrite if empty or if it still matches a name-derived path pattern.
+  const looksDerived = (val, base) =>
+    !val || /^\/(srv\/gameservers|opt\/gamesrv\/worlds)\/[a-z0-9-]+$/.test(val);
+
+  if (looksDerived(inst.value, "/srv/gameservers")) {
+    inst.value = nameFor("/srv/gameservers");
+  }
+  if (looksDerived(world.value, "/opt/gamesrv/worlds")) {
+    world.value = nameFor("/opt/gamesrv/worlds");
+  }
+}
+$("#f-name").addEventListener("input", syncPathsFromName);
+
+// Build the ServerDef JSON from the form and POST it.
+$("#new-server-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const errEl = $("#form-error");
+  errEl.hidden = true;
+
+  const type = $("#f-type").value;
+  const sd = {
+    name:               $("#f-name").value.trim(),
+    type:               type,
+    install_dir:        $("#f-install-dir").value.trim(),
+    world_dir:          $("#f-world-dir").value.trim(),
+    port:               parseInt($("#f-port").value, 10),
+    memory_mb:          parseInt($("#f-memory").value, 10),
+    java_args:          $("#f-java-args").value,
+    stop_cmd:           $("#f-stop-cmd").value,
+    auto_start_on_boot: $("#f-auto-start").checked,
+  };
+
+  // Type-specific extras.
+  if (type === "steamcmd") {
+    const appId = parseInt($("#f-steam-app-id").value, 10);
+    if (!appId) { showFormError("steamcmd type needs a Steam App ID"); return; }
+    sd.steam_app_id = appId;
+    const beta = $("#f-steam-beta").value.trim();
+    if (beta) sd.steam_beta = beta;
+  }
+  if (type === "minecraft-forge") {
+    const mcv = $("#f-mc-version").value.trim();
+    const fv  = $("#f-forge-version").value.trim();
+    if (mcv) sd.mc_version = mcv;
+    if (fv)  sd.forge_version = fv;
+  }
+
+  // RCON block (only sent if enabled OR the user filled anything in).
+  const rconEnabled = $("#f-rcon-enabled").checked;
+  const rconPort    = $("#f-rcon-port").value.trim();
+  const rconPwEnv   = $("#f-rcon-pw-env").value.trim();
+  if (rconEnabled || rconPort || rconPwEnv) {
+    sd.rcon = { enabled: rconEnabled };
+    if (rconPort)  sd.rcon.port = parseInt(rconPort, 10);
+    if (rconPwEnv) sd.rcon.password_env = rconPwEnv;
+  }
+
+  try {
+    await api("/api/servers", { method: "POST", body: JSON.stringify(sd) });
+    closeNewServerModal();
+    await refreshServers();
+    // Auto-open the new server so the user can go straight to Install.
+    openServer(sd.name);
+  } catch (e) {
+    showFormError(e.message);
+  }
+});
+
+function showFormError(msg) {
+  const el = $("#form-error");
+  el.textContent = msg;
+  el.hidden = false;
+}
 
 async function openServer(name) {
   CURRENT = name;

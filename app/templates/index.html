@@ -163,6 +163,144 @@
         </div>
       </section>
     </div>
+
+    <!-- ============================== NEW SERVER MODAL ============================== -->
+    <div id="modal-backdrop" class="modal-backdrop" hidden>
+      <div class="modal" role="dialog" aria-labelledby="modal-title">
+        <header class="modal-header">
+          <h2 id="modal-title">New Server</h2>
+          <button id="modal-close" class="modal-close" title="Close">&times;</button>
+        </header>
+
+        <form id="new-server-form" class="modal-body">
+          <div class="form-row">
+            <label>
+              <span>Type</span>
+              <select name="type" id="f-type" required>
+                <option value="minecraft-java">Minecraft — Vanilla / Paper / Purpur</option>
+                <option value="minecraft-forge">Minecraft — Forge (modded, 1.17+)</option>
+                <option value="steamcmd">SteamCMD (Palworld, Valheim, ARK, …)</option>
+                <option value="custom">Custom (bring your own start.sh)</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="form-row">
+            <label>
+              <span>Name <em>(lowercase letters, digits, dashes)</em></span>
+              <input name="name" id="f-name" required pattern="[a-z][a-z0-9-]{1,31}"
+                     placeholder="e.g. minecraft-smp or palworld" />
+            </label>
+          </div>
+
+          <div class="form-row two-col">
+            <label>
+              <span>Port</span>
+              <input name="port" id="f-port" type="number" min="1" max="65535" required />
+            </label>
+            <label>
+              <span>Memory (MB)</span>
+              <input name="memory_mb" id="f-memory" type="number" min="512" step="256" required />
+            </label>
+          </div>
+
+          <!-- SteamCMD-only fields -->
+          <fieldset id="fs-steamcmd" hidden>
+            <legend>SteamCMD</legend>
+            <div class="form-row two-col">
+              <label>
+                <span>Steam App ID <em>(2394010 = Palworld, 896660 = Valheim)</em></span>
+                <input name="steam_app_id" id="f-steam-app-id" type="number" min="1" />
+              </label>
+              <label>
+                <span>Beta branch <em>(optional)</em></span>
+                <input name="steam_beta" id="f-steam-beta" placeholder="(leave blank for stable)" />
+              </label>
+            </div>
+          </fieldset>
+
+          <!-- Forge-only fields -->
+          <fieldset id="fs-forge" hidden>
+            <legend>Minecraft (Forge)</legend>
+            <div class="form-row two-col">
+              <label>
+                <span>MC Version <em>(triggers Java-version sanity check)</em></span>
+                <input name="mc_version" id="f-mc-version" placeholder="e.g. 1.20.1" />
+              </label>
+              <label>
+                <span>Forge Version <em>(informational)</em></span>
+                <input name="forge_version" id="f-forge-version" placeholder="e.g. 47.3.0" />
+              </label>
+            </div>
+          </fieldset>
+
+          <details class="advanced">
+            <summary>Advanced (paths, launcher args, RCON)</summary>
+
+            <div class="form-row">
+              <label>
+                <span>Install dir <em>(binaries / mods / config)</em></span>
+                <input name="install_dir" id="f-install-dir" />
+              </label>
+            </div>
+            <div class="form-row">
+              <label>
+                <span>World dir <em>(saves — put this on the TrueNAS bind mount)</em></span>
+                <input name="world_dir" id="f-world-dir" />
+              </label>
+            </div>
+
+            <div class="form-row two-col">
+              <label>
+                <span>Java args <em>(minecraft-* only, appended after -Xms/-Xmx)</em></span>
+                <input name="java_args" id="f-java-args" placeholder="-XX:+UseG1GC" />
+              </label>
+              <label>
+                <span>Stop command <em>(sent to console for graceful shutdown)</em></span>
+                <input name="stop_cmd" id="f-stop-cmd" placeholder="stop" />
+              </label>
+            </div>
+
+            <div class="form-row">
+              <label class="inline">
+                <input name="auto_start_on_boot" id="f-auto-start" type="checkbox" checked />
+                <span>Auto-start on boot (enable systemd unit)</span>
+              </label>
+            </div>
+
+            <fieldset>
+              <legend>RCON (optional; prefer the tmux console)</legend>
+              <div class="form-row three-col">
+                <label class="inline">
+                  <input name="rcon_enabled" id="f-rcon-enabled" type="checkbox" />
+                  <span>Enable RCON</span>
+                </label>
+                <label>
+                  <span>RCON port</span>
+                  <input name="rcon_port" id="f-rcon-port" type="number" min="1" max="65535" placeholder="25575" />
+                </label>
+                <label>
+                  <span>Password env var name</span>
+                  <input name="rcon_password_env" id="f-rcon-pw-env" placeholder="MC_SMP_RCON_PW" />
+                </label>
+              </div>
+              <p class="muted small">
+                Never put the RCON password itself here. Put it in
+                <code>/etc/gamesrv.env</code> as, e.g., <code>MC_SMP_RCON_PW=...</code>,
+                and reference the variable name above.
+              </p>
+            </fieldset>
+          </details>
+
+          <div id="form-error" class="form-error" hidden></div>
+
+          <footer class="modal-footer">
+            <button type="button" id="modal-cancel">Cancel</button>
+            <button type="submit" id="modal-save">Create Server</button>
+          </footer>
+        </form>
+      </div>
+    </div>
   </main>
 
   <script src="/static/app.js"></script>
