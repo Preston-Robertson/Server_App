@@ -41,6 +41,9 @@ header h1 { margin: 0; font-size: 18px; }
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 6px 0; }
 
 main { padding: 16px 20px; }
+/* Author-styled `display: grid` below beats the UA `display: none` that the
+   HTML `hidden` attribute would otherwise apply. Force `hidden` to win. */
+[hidden] { display: none !important; }
 #page-dashboard { display: grid; grid-template-columns: 1fr 2fr; gap: 20px; }
 #page-admin { display: grid; grid-template-columns: 1fr; gap: 16px; max-width: 900px; }
 @media (max-width: 900px) { #page-dashboard { grid-template-columns: 1fr; } }
