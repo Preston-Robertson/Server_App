@@ -70,10 +70,15 @@ DEFAULT_BRANCH="$(git -C "$APP_DIR" remote show origin 2>/dev/null | sed -n 's/.
 log "default branch: $DEFAULT_BRANCH"
 
 # --- stash local edits so pull doesn't fail on dirty tree ---
+# IMPORTANT: no `-u` here. Stashing untracked files with -u causes git to
+# try to REMOVE untracked directories after saving them, which fails on
+# bind-mount targets like worlds/ ("Device or resource busy"). We only
+# stash *tracked* changes; anything untracked (worlds mount, logs, etc.)
+# stays put and won't interfere with `git pull --ff-only`.
 STASH=""
 if ! git -C "$APP_DIR" diff --quiet || ! git -C "$APP_DIR" diff --cached --quiet; then
-  log "stashing local edits..."
-  git -C "$APP_DIR" stash push -u -m "pre-update-$(date +%s)" || die "stash failed"
+  log "stashing local edits to tracked files..."
+  git -C "$APP_DIR" stash push -m "pre-update-$(date +%s)" || die "stash failed"
   STASH="1"
 fi
 
