@@ -4,22 +4,50 @@ const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
 let TOKEN = localStorage.getItem("gamesrv_token") || "";
-let CURRENT = null; // currently open server name
+let CURRENT = null;              // currently open server name
+let CURRENT_PAGE = "dashboard";  // dashboard | admin
+let SERVERS_TIMER = null;
+let UPDATE_LOG_TIMER = null;
 
-function setTokenStatus(msg, ok) {
-  const el = $("#token-status");
-  el.textContent = msg;
-  el.style.color = ok ? "var(--ok)" : "var(--muted)";
+// ---------- auth badge (shown in the top nav) ----------
+
+function refreshAuthBadge() {
+  const el = $("#auth-badge");
+  if (!el) return;
+  if (TOKEN) {
+    el.textContent = "token loaded";
+    el.className = "muted ok";
+  } else {
+    el.textContent = "no token — set on Admin page";
+    el.className = "muted warn";
+  }
 }
 
-if (TOKEN) { $("#token").value = TOKEN; setTokenStatus("token loaded", true); }
+// ---------- page switching ----------
 
-$("#save-token").onclick = () => {
-  TOKEN = $("#token").value.trim();
-  localStorage.setItem("gamesrv_token", TOKEN);
-  setTokenStatus("token saved", true);
-  refreshServers();
-};
+function showPage(name) {
+  CURRENT_PAGE = name;
+  $$(".page").forEach(p => p.hidden = p.id !== `page-${name}`);
+  $$(".nav").forEach(b => b.classList.toggle("active", b.dataset.page === name));
+
+  // Enable/disable polling per page.
+  clearInterval(SERVERS_TIMER); SERVERS_TIMER = null;
+  clearInterval(UPDATE_LOG_TIMER); UPDATE_LOG_TIMER = null;
+
+  if (name === "dashboard") {
+    refreshServers();
+    SERVERS_TIMER = setInterval(refreshServers, 5000);
+  } else if (name === "admin") {
+    // Prefill the token box (masked) so the user can see something is saved.
+    $("#token").value = TOKEN;
+    // If follow-log is already ticked, resume polling.
+    if ($("#follow-update-log").checked) startFollowUpdateLog();
+  }
+}
+
+$$(".nav").forEach(b => b.onclick = () => showPage(b.dataset.page));
+
+// ---------- API helper ----------
 
 async function api(path, opts = {}) {
   const headers = Object.assign(
@@ -56,9 +84,99 @@ function fmtTime(ts) {
   return new Date(ts * 1000).toLocaleString();
 }
 
-// ---------- servers list ----------
+// ========================================================================
+// ADMIN PAGE
+// ========================================================================
+
+$("#save-token").onclick = () => {
+  TOKEN = $("#token").value.trim();
+  localStorage.setItem("gamesrv_token", TOKEN);
+  refreshAuthBadge();
+  $("#token-status").textContent = "saved";
+  $("#token-status").className = "muted ok";
+};
+
+$("#clear-token").onclick = () => {
+  TOKEN = "";
+  localStorage.removeItem("gamesrv_token");
+  $("#token").value = "";
+  refreshAuthBadge();
+  $("#token-status").textContent = "cleared";
+  $("#token-status").className = "muted";
+};
+
+$("#test-token").onclick = async () => {
+  try {
+    // Any authenticated endpoint will do; /api/servers is the cheapest.
+    const rows = await api("/api/servers");
+    $("#token-status").textContent = `ok — ${rows.length} server(s) registered`;
+    $("#token-status").className = "muted ok";
+  } catch (e) {
+    $("#token-status").textContent = "FAIL: " + e.message;
+    $("#token-status").className = "muted err";
+  }
+};
+
+$("#manager-update").onclick = async () => {
+  if (!confirm(
+    "Pull the latest commit from GitHub and restart the manager?\n\n" +
+    "The UI may drop for ~10s. On failure the manager auto-rolls back " +
+    "to the previous commit."
+  )) return;
+  try {
+    const r = await api("/api/manager/update", { method: "POST" });
+    $("#update-log-out").textContent = "triggered: " + JSON.stringify(r, null, 2) +
+      "\n\n(waiting for update.log to populate...)\n";
+    // Auto-follow while an update is in flight so the user actually sees it.
+    $("#follow-update-log").checked = true;
+    startFollowUpdateLog();
+  } catch (e) {
+    alert("Trigger failed: " + e.message);
+  }
+};
+
+async function refreshUpdateLog() {
+  try {
+    const txt = await api("/api/manager/update/log?lines=400");
+    const pre = $("#update-log-out");
+    pre.textContent = txt || "(update.log is empty)";
+    pre.scrollTop = pre.scrollHeight;
+  } catch (e) {
+    $("#update-log-out").textContent = "ERROR: " + e.message;
+  }
+}
+$("#refresh-update-log").onclick = refreshUpdateLog;
+
+function startFollowUpdateLog() {
+  clearInterval(UPDATE_LOG_TIMER);
+  refreshUpdateLog();
+  UPDATE_LOG_TIMER = setInterval(refreshUpdateLog, 3000);
+}
+$("#follow-update-log").onchange = (ev) => {
+  if (ev.target.checked) startFollowUpdateLog();
+  else clearInterval(UPDATE_LOG_TIMER);
+};
+
+$("#check-health").onclick = async () => {
+  const badge = $("#health-status");
+  try {
+    // /healthz is unauthenticated so it works even without a token.
+    const r = await fetch("/healthz");
+    const t = await r.text();
+    badge.textContent = r.ok ? `OK (${t.trim()})` : `FAIL: HTTP ${r.status}`;
+    badge.className = r.ok ? "muted ok" : "muted err";
+  } catch (e) {
+    badge.textContent = "FAIL: " + e.message;
+    badge.className = "muted err";
+  }
+};
+
+// ========================================================================
+// DASHBOARD PAGE
+// ========================================================================
 
 async function refreshServers() {
+  if (!TOKEN) return;  // silently skip — Admin page will nag the user.
   try {
     const rows = await api("/api/servers");
     const tbody = $("#servers tbody");
@@ -82,7 +200,12 @@ async function refreshServers() {
       tbody.appendChild(tr);
     }
   } catch (e) {
-    alert("List failed: " + e.message);
+    // Don't spam alerts on background poll — surface via auth badge.
+    const badge = $("#auth-badge");
+    if (badge) {
+      badge.textContent = "auth error — check Admin page";
+      badge.className = "muted err";
+    }
   }
 }
 
@@ -100,8 +223,6 @@ document.addEventListener("click", async (ev) => {
 });
 
 $("#refresh").onclick = refreshServers;
-
-// ---------- new server (uses a simple prompt for MVP) ----------
 
 $("#new-server").onclick = async () => {
   const example = {
@@ -123,8 +244,6 @@ $("#new-server").onclick = async () => {
     refreshServers();
   } catch (e) { alert(e.message); }
 };
-
-// ---------- detail panel ----------
 
 async function openServer(name) {
   CURRENT = name;
@@ -237,7 +356,7 @@ document.addEventListener("click", async (ev) => {
   } else if (t.dataset.dl && CURRENT) {
     const area = $("#files-area").value;
     const url = `/api/servers/${CURRENT}/files/download?area=${encodeURIComponent(area)}&path=${encodeURIComponent(t.dataset.dl)}`;
-    // Auth via header is fine, but download tags don't send headers; use blob path.
+    // Auth via header is fine, but <a download> tags don't send headers; use blob path.
     try {
       const r = await fetch(url, { headers: { "Authorization": "Bearer " + TOKEN } });
       if (!r.ok) throw new Error("HTTP " + r.status);
@@ -317,15 +436,10 @@ $("#def-save").onclick = async () => {
   } catch (e) { $("#def-out").textContent = "ERROR: " + e.message; }
 };
 
-// Manager self-update
-$("#manager-update").onclick = async () => {
-  if (!confirm("Pull latest from GitHub and restart the manager? The UI may drop for ~10s.")) return;
-  try {
-    const r = await api("/api/manager/update", { method: "POST" });
-    alert("Triggered. Check the Logs tail: " + JSON.stringify(r));
-  } catch (e) { alert(e.message); }
-};
+// ========================================================================
+// INITIAL LOAD
+// ========================================================================
 
-// initial load
-refreshServers();
-setInterval(refreshServers, 5000);
+refreshAuthBadge();
+// If the user has no token yet, land on Admin so they can paste one.
+showPage(TOKEN ? "dashboard" : "admin");

@@ -1,8 +1,8 @@
 # Game Server Manager
 
 A FastAPI-based dashboard + API for hosting and managing multiple game servers
-(Minecraft Java, Palworld / SteamCMD games, and custom `.sh`-launched servers)
-inside a single Debian 12 unprivileged LXC on Proxmox.
+(Minecraft Java, **Minecraft Forge (modded)**, Palworld / SteamCMD games, and
+custom `.sh`-launched servers) inside a single Debian 12 unprivileged LXC on Proxmox.
 
 Built to the plan in `docs/PLAN.md` — mirrors the Bot Manager LXC pattern
 (systemd, venv, UFW LAN-lock, token auth, host-mount → bind-mount NFS for
@@ -79,9 +79,24 @@ Paste the token into the header, click **Save**. You're in.
 
 ## How to use the dashboard
 
-The main page lists every registered server with its state, port, memory usage,
-uptime, and quick ▶ ■ ↻ buttons for start/stop/restart. Click a server's name
-to open its detail panel, which has six tabs:
+The header has two pages:
+
+- **Dashboard** — lists every registered server with its state, port, memory
+  usage, uptime, and quick ▶ ■ ↻ buttons. Click a server's name to open the
+  detail panel (six tabs, see below).
+- **Admin** — where the bearer token lives and where the manager self-update
+  is triggered. On first load with no token stored, the app lands here
+  automatically.
+
+### Admin page
+
+| Section | What it does |
+|---|---|
+| **Authentication** | Paste `GAMESRV_TOKEN`, **Save**, **Test** (calls `/api/servers` to prove it works), **Forget token** to wipe it from `localStorage`. |
+| **Manager Self-Update** | **Update Manager from GitHub** triggers `update.sh` (see §Updating the manager itself). The **follow** checkbox auto-refreshes `logs/update.log` every 3s so you can watch the pull → pip install → restart → health-check → (rollback on failure) sequence live. |
+| **Manager Health** | Hits the unauthenticated `/healthz` endpoint — handy if the token itself is misbehaving. |
+
+### Dashboard — server detail tabs
 
 | Tab | What it does |
 |---|---|
@@ -92,12 +107,16 @@ to open its detail panel, which has six tabs:
 | **Backups** | Snapshot `world_dir` to a `.tgz` tarball under `worlds/_backups/<server>/`. Restore requires the server to be stopped first (safety). |
 | **Definition** | The raw server YAML/JSON. Edit and save to change ports, memory cap, java args, etc. Re-run **Install** after changing anything the launcher uses. |
 
-Top-right button **Update Manager (from GitHub)** triggers `update.sh`
-(described below).
-
 ---
 
 ## Adding your first server — Minecraft
+
+> **Modded (Forge) server?** Use `type: minecraft-forge` instead — the shape
+> is different (Forge boots via `run.sh` + `user_jvm_args.txt`, not
+> `java -jar server.jar`). See
+> [docs/ADDING_SERVERS.md §6](docs/ADDING_SERVERS.md#6-modded-minecraft-forge-specifics)
+> and [servers/minecraft-forge-smp.example.yml](servers/minecraft-forge-smp.example.yml).
+> The steps below cover **vanilla / Paper / Purpur** only.
 
 1. **Create the definition.** In the dashboard click **+ New Server** and paste
    (edit values as needed):
@@ -225,7 +244,8 @@ process tar entries that would escape it.
 
 ## Updating the manager itself
 
-Click **Update Manager (from GitHub)** in the header, or run `sudo bash /opt/gamesrv/update.sh`.
+Go to the **Admin** page → **Update Manager from GitHub** (tick **follow** to
+watch the log tail live). Or from the LXC shell: `sudo bash /opt/gamesrv/update.sh`.
 
 What that does (per plan §6):
 

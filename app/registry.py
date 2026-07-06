@@ -32,7 +32,7 @@ class BackupCfg(BaseModel):
 
 class ServerDef(BaseModel):
     name: str
-    type: str  # minecraft-java | steamcmd | custom
+    type: str  # minecraft-java | minecraft-forge | steamcmd | custom
     install_dir: str
     world_dir: str
     port: int
@@ -44,6 +44,9 @@ class ServerDef(BaseModel):
     # steamcmd-specific
     steam_app_id: int | None = None
     steam_beta: str | None = None
+    # minecraft-forge-specific (informational; surfaced on the dashboard)
+    mc_version: str | None = None       # e.g. "1.20.1"
+    forge_version: str | None = None    # e.g. "47.3.0"
     # generic
     extra_env: dict[str, str] = Field(default_factory=dict)
     rcon: RconCfg = Field(default_factory=RconCfg)
@@ -59,7 +62,7 @@ class ServerDef(BaseModel):
     @field_validator("type")
     @classmethod
     def _valid_type(cls, v: str) -> str:
-        if v not in {"minecraft-java", "steamcmd", "custom"}:
+        if v not in {"minecraft-java", "minecraft-forge", "steamcmd", "custom"}:
             raise ValueError(f"unknown type: {v}")
         return v
 

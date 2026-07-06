@@ -19,7 +19,16 @@ not expose port 8765 to the internet. If you need remote access, put it
 behind Tailscale/WireGuard or the reverse proxy described in the parent repo's
 `docs/TODO.md` P1.
 
-## 2. Dashboard tabs
+## 2. Pages and tabs
+
+The UI has two top-level pages selected from the nav in the header:
+
+- **Dashboard** — servers list + per-server detail (six tabs, below).
+- **Admin** — bearer token management, manager self-update (with a live
+  log follower), and a one-click `/healthz` probe. Load the app with no
+  token stored and you land here automatically.
+
+### Dashboard tabs
 
 ### Control
 Buttons map 1:1 to `systemctl` verbs against `gamesrv@<name>.service`.
@@ -123,7 +132,23 @@ sudo systemctl edit gamesrv@palworld
   and `stop.sh` (sends `say ...` + `stop` to the tmux session, waits up to 60s).
 - Symlinks `install_dir/world` → `world_dir`.
 - Does NOT auto-download `server.jar`. Upload it via the Files tab so you
-  pick the flavor (Vanilla, Paper, Fabric, Forge, Purpur…).
+  pick the flavor (Vanilla, Paper, Purpur, …).
+- **Do NOT use this type for modern Forge (1.17+).** Use `minecraft-forge`.
+
+### `minecraft-forge`
+- For modded Forge on 1.17+ (yes, 1.20.1). Launches Forge's own `run.sh`
+  inside tmux (foreground) and writes `-Xms` / `-Xmx` into
+  `user_jvm_args.txt` (Forge reads that file, not any `-Xmx` on argv).
+- Symlinks `install_dir/world` → `world_dir`.
+- Refuses to auto-accept Mojang's EULA — edit `install_dir/eula.txt` to
+  `eula=true` before starting.
+- Optional `mc_version` field enables a Java-version sanity check:
+  1.20.x needs Java 17, 1.21.x needs Java 21. Handler warns loudly on a
+  mismatch (Forge 1.20.1 will not run on Java 21).
+- No auto-download of Forge itself — upload the installer’s output tree
+  (`mods/`, `config/`, `libraries/`, `run.sh`, `user_jvm_args.txt`) via
+  the Files tab or SFTP. **Update Game Software** just regenerates the
+  launcher + `user_jvm_args.txt`; mod/Forge updates are always manual.
 
 ### `steamcmd`
 - Requires `steam_app_id`. Runs

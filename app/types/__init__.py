@@ -11,12 +11,14 @@ from __future__ import annotations
 from ..registry import ServerDef
 from .base import TypeHandler
 from .minecraft_java import MinecraftJavaHandler
+from .minecraft_forge import MinecraftForgeHandler
 from .steamcmd import SteamCmdHandler
 from .custom import CustomHandler
 
 
 _HANDLERS: dict[str, type[TypeHandler]] = {
     "minecraft-java": MinecraftJavaHandler,
+    "minecraft-forge": MinecraftForgeHandler,
     "steamcmd": SteamCmdHandler,
     "custom": CustomHandler,
 }

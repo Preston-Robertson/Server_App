@@ -1,0 +1,37 @@
+# Example: Minecraft Forge server (modded).
+# Copy to servers/minecraft-forge-smp.yml and edit values.
+#
+# Deployment (per docs/ADDING_SERVERS.md):
+#   1. Upload the Forge server tree into install_dir via the Files tab or SFTP:
+#         mods/, config/, libraries/, defaultconfigs/, run.sh, user_jvm_args.txt,
+#         server.properties, whitelist.json (optional), ops.json (optional)
+#      Do NOT put world/ in install_dir — put it in world_dir (TrueNAS bind mount).
+#   2. Make sure eula.txt contains `eula=true` (you accept Mojang's EULA).
+#   3. In the dashboard: Control tab -> Install. This regenerates start.sh, stop.sh,
+#      and user_jvm_args.txt so -Xms/-Xmx match memory_mb below.
+#   4. Control -> Start.
+#
+# The handler runs `./run.sh nogui` inside tmux so the Console tab and graceful
+# stop (`say`, then `stop`, then wait) work — critical for modded packs with
+# custom dimensions (Deeper Darker, etc.), where a hard kill can corrupt saves.
+#
+# Java version: 1.20.x needs Java 17 (NOT 21). 1.21.x needs Java 21. The
+# handler warns loudly if mc_version and the system java disagree.
+name: minecraft-forge-smp
+type: minecraft-forge
+install_dir: /srv/gameservers/minecraft-forge-smp
+world_dir: /opt/gamesrv/worlds/minecraft-forge-smp
+port: 25565
+memory_mb: 10240                 # matches -Xms/-Xmx written into user_jvm_args.txt
+java_args: "-XX:+UseG1GC"        # optional; appended after -Xms/-Xmx in user_jvm_args.txt
+stop_cmd: "stop"                 # sent to the tmux console for a clean shutdown
+auto_start_on_boot: true
+mc_version: "1.20.1"             # informational; triggers Java-17 sanity check
+forge_version: ""                # optional, e.g. "47.3.0" — surfaced on the dashboard
+extra_env: {}
+rcon:
+  enabled: false                 # prefer the tmux console; keep RCON off unless needed
+  port: 25575
+  password_env: MC_FORGE_RCON_PW # NEVER inline; put the value in /etc/gamesrv.env
+backup:
+  enabled: true
