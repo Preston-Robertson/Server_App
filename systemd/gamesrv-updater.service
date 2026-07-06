@@ -1,0 +1,32 @@
+# /etc/systemd/system/gamesrv-updater.service
+# Oneshot that runs the self-update. Triggered by the manager via
+#   systemctl start --no-block gamesrv-updater.service
+# (permitted for the unprivileged 'gamesrv' user by the polkit rule
+# scripts/49-gamesrv.rules).
+#
+# Runs as root so it can:
+#   - restart gamesrv-manager.service at the end,
+#   - install requirements into the venv without sudo tricks,
+#   - operate on /opt/gamesrv/.git regardless of who cloned the repo.
+#
+# Being its OWN service means it lives in its own cgroup, so the manager
+# restarting itself at the end does NOT kill this process. Output goes to
+# both the systemd journal AND /opt/gamesrv/logs/update.log (via `tee`
+# inside update.sh) so the dashboard's "Refresh log" button keeps working.
+[Unit]
+Description=Game Server Manager — self-update runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/gamesrv
+EnvironmentFile=-/etc/gamesrv.env
+ExecStart=/bin/bash /opt/gamesrv/update.sh
+# Timeout guard — an update should never take >20 minutes.
+TimeoutStartSec=1200
+# Do NOT set Restart= — this is a oneshot, not a service we want to bounce.
+
+[Install]
+# Nothing enables this at boot; it exists to be started on demand.

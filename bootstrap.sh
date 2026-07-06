@@ -31,8 +31,18 @@ fi
 
 echo "== 2. dirs =="
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$APP_DIR" "$APP_DIR/logs" "$APP_DIR/servers" "$WORLDS_ROOT" "$INSTALL_ROOT"
-# App files themselves stay owned by whoever cloned the repo, but writeable dirs are gamesrv.
-chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR/logs" "$APP_DIR/servers" "$WORLDS_ROOT" "$INSTALL_ROOT"
+# Whole repo tree needs to be gamesrv-owned so `git fetch/pull` (from either
+# the updater oneshot or a manual `sudo -u gamesrv git` invocation) can write
+# to .git/. If you cloned the repo as root, this is where the ownership gets
+# fixed. Safe to re-run.
+if [[ -d "$APP_DIR/.git" ]]; then
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
+  # Newer git refuses to touch a repo it thinks is "dubious ownership".
+  git config --system --add safe.directory "$APP_DIR" 2>/dev/null || true
+else
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR/logs" "$APP_DIR/servers"
+fi
+chown -R "$SERVICE_USER:$SERVICE_USER" "$WORLDS_ROOT" "$INSTALL_ROOT"
 
 echo "== 3. system packages =="
 # Palworld/steamcmd needs i386 libs. Accept steam license non-interactively.
@@ -65,7 +75,8 @@ chmod +x "$APP_DIR/run_manager.sh" "$APP_DIR/update.sh" "$APP_DIR/bootstrap.sh" 
 
 echo "== 5. systemd units =="
 install -m 0644 "$APP_DIR/systemd/gamesrv-manager.service" /etc/systemd/system/gamesrv-manager.service
-install -m 0644 "$APP_DIR/systemd/gamesrv@.service" /etc/systemd/system/gamesrv@.service
+install -m 0644 "$APP_DIR/systemd/gamesrv@.service"          /etc/systemd/system/gamesrv@.service
+install -m 0644 "$APP_DIR/systemd/gamesrv-updater.service"   /etc/systemd/system/gamesrv-updater.service
 systemctl daemon-reload
 
 echo "== 6. polkit =="

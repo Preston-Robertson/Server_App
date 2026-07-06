@@ -245,7 +245,27 @@ process tar entries that would escape it.
 ## Updating the manager itself
 
 Go to the **Admin** page → **Update Manager from GitHub** (tick **follow** to
-watch the log tail live). Or from the LXC shell: `sudo bash /opt/gamesrv/update.sh`.
+watch the log tail live). Under the hood, that hits
+`POST /api/manager/update`, which calls
+`systemctl start --no-block gamesrv-updater.service` — a dedicated systemd
+oneshot unit that runs `update.sh` **as root, in its own cgroup**. That
+matters, because the manager restarts itself at the end of the update; if
+`update.sh` shared a cgroup with the manager, systemd would kill it mid-run.
+
+You can also trigger the same oneshot manually:
+```bash
+sudo systemctl start gamesrv-updater.service
+journalctl -u gamesrv-updater.service -f
+```
+or run the script directly for debugging:
+```bash
+sudo bash /opt/gamesrv/update.sh
+```
+
+If the button returns `polkit may not permit this`, the polkit rule from
+[scripts/49-gamesrv.rules](scripts/49-gamesrv.rules) isn't installed for
+`gamesrv-updater.service`. Re-run `sudo bash bootstrap.sh` — it drops the
+current rule and restarts polkit.
 
 What that does (per plan §6):
 
@@ -277,6 +297,7 @@ sudo -u gamesrv git -C /opt/gamesrv remote set-url origin \
 |---|---|
 | `401 Missing/invalid bearer token` in the UI | Paste `GAMESRV_TOKEN` from `/etc/gamesrv.env` and click Save. |
 | `systemctl start gamesrv@<name>` says "not authorized" as `gamesrv` | Polkit rule not installed. Re-run `sudo bash bootstrap.sh`. |
+| **Update Manager button "runs" but nothing changes / update.log stays empty** | Almost always a permission issue in the update path. Check `systemctl status gamesrv-updater.service` and `journalctl -u gamesrv-updater.service -n 100`. Common causes: (a) `gamesrv-updater.service` never installed → re-run `sudo bash bootstrap.sh`; (b) polkit rule doesn't include the updater unit → same fix; (c) `/opt/gamesrv/.git` owned by root → bootstrap now chowns it to `gamesrv`, re-run bootstrap; (d) remote is a private repo without a PAT → set `GAMESRV_GITHUB_TOKEN` in `/etc/gamesrv.env` and update the remote URL. |
 | `ModuleNotFoundError: fastapi` on manager start | `run_manager.sh` is running the wrong Python. The launcher must call `.venv/bin/python`. Bootstrap fixes this; if you edited `run_manager.sh`, revert to the version in the repo. |
 | Minecraft won't start, log says `You need to agree to the EULA` | See step 5 of the Minecraft add-server section. |
 | Palworld install fails with "Missing lib32gcc" | `sudo dpkg --add-architecture i386 && sudo apt update && sudo apt install lib32gcc-s1 steamcmd`. |

@@ -1,8 +1,13 @@
 /* /etc/polkit-1/rules.d/49-gamesrv.rules
  *
- * Lets the unprivileged `gamesrv` user run systemctl start/stop/restart/enable/disable
- * for gamesrv@*.service ONLY. No blanket root. Reload polkit after installing:
- *   sudo systemctl restart polkit
+ * Grants the unprivileged `gamesrv` user narrowly-scoped systemctl access:
+ *   - start/stop/restart/reload/enable/disable  gamesrv@<any>.service
+ *     (per-game servers spawned by the manager)
+ *   - start                                     gamesrv-updater.service
+ *     (self-update oneshot; runs as root, kicked off by the web UI)
+ *
+ * Reload polkit after installing:  sudo systemctl restart polkit
+ * The bootstrap script does this for you.
  */
 polkit.addRule(function(action, subject) {
     if (action.id !== "org.freedesktop.systemd1.manage-units") return;
@@ -11,10 +16,16 @@ polkit.addRule(function(action, subject) {
     var unit = action.lookup("unit") || "";
     var verb = action.lookup("verb") || "";
 
-    var allowedUnits = /^gamesrv@[A-Za-z0-9._-]+\.service$/;
-    var allowedVerbs = ["start", "stop", "restart", "reload", "enable", "disable"];
+    // 1. Per-game-server units (template instances).
+    var gameUnits = /^gamesrv@[A-Za-z0-9._-]+\.service$/;
+    var gameVerbs = ["start", "stop", "restart", "reload", "enable", "disable"];
+    if (gameUnits.test(unit) && gameVerbs.indexOf(verb) >= 0) {
+        return polkit.Result.YES;
+    }
 
-    if (allowedUnits.test(unit) && allowedVerbs.indexOf(verb) >= 0) {
+    // 2. Self-update oneshot — only 'start'. The oneshot is what actually
+    //    restarts gamesrv-manager at the end.
+    if (unit === "gamesrv-updater.service" && verb === "start") {
         return polkit.Result.YES;
     }
 });
