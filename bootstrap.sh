@@ -39,6 +39,11 @@ if [[ -d "$APP_DIR/.git" ]]; then
   chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
   # Newer git refuses to touch a repo it thinks is "dubious ownership".
   git config --system --add safe.directory "$APP_DIR" 2>/dev/null || true
+  # Some filesystems (or a bootstrap `chmod +x` on tree-recorded 100644 files)
+  # cause git to see spurious executable-bit "modifications" that then block
+  # `git pull --ff-only`. Disable file-mode tracking on this repo so those
+  # never dirty the working tree.
+  sudo -u "$SERVICE_USER" git -C "$APP_DIR" config core.fileMode false || true
 else
   chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR/logs" "$APP_DIR/servers"
 fi
