@@ -45,9 +45,10 @@ fi
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
 # Launch inside tmux in the FOREGROUND so systemd sees the process.
-# `new-session -A -d` would detach; we want systemd to track this PID.
-exec tmux new-session -s "$SESSION" -n mc \\
-  "java -Xms{xms}M -Xmx{xmx}M {extra_args} -jar $JAR nogui"
+# tmux (without -d) needs a PTY, which systemd doesn't provide. script(1)
+# allocates one and forwards the child's exit code, keeping systemd's
+# process tracking honest.
+exec script -qefc "tmux new-session -s '$SESSION' -n mc 'java -Xms{xms}M -Xmx{xmx}M {extra_args} -jar $JAR nogui'" /dev/null
 """
 
 

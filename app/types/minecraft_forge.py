@@ -65,8 +65,14 @@ fi
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
-# Foreground tmux so systemd tracks the PID.
-exec tmux new-session -s "$SESSION" -n forge "./run.sh nogui"
+# Foreground tmux so systemd tracks the PID. tmux new-session (without -d)
+# needs a PTY, which systemd doesn't give us. script(1) from util-linux
+# allocates one for us and forwards the exit code of the wrapped command.
+#   -q  quiet (no "Script started, output log file ...")
+#   -e  exit with the child's exit code
+#   -f  flush after each write
+#   -c  command
+exec script -qefc "tmux new-session -s '$SESSION' -n forge './run.sh nogui'" /dev/null
 """
 
 
