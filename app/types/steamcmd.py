@@ -34,9 +34,12 @@ fi
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
-# Foreground tmux so systemd tracks PID (see minecraft_forge.py for why the
-# script(1) wrapper is needed — systemd doesn't allocate a PTY).
-exec script -qefc "tmux new-session -s '$SESSION' -n game '$BIN'" /dev/null
+# Start tmux DETACHED and block until session ends. See
+# minecraft_forge.py for why (no PTY under systemd).
+tmux new-session -d -s "$SESSION" -n game "$BIN"
+while tmux has-session -t "$SESSION" 2>/dev/null; do
+  sleep 1
+done
 """
 
 

@@ -44,11 +44,12 @@ fi
 # Kill any stale detached session with the same name.
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
-# Launch inside tmux in the FOREGROUND so systemd sees the process.
-# tmux (without -d) needs a PTY, which systemd doesn't provide. script(1)
-# allocates one and forwards the child's exit code, keeping systemd's
-# process tracking honest.
-exec script -qefc "tmux new-session -s '$SESSION' -n mc 'java -Xms{xms}M -Xmx{xmx}M {extra_args} -jar $JAR nogui'" /dev/null
+# Start tmux DETACHED (no PTY needed under systemd), then block until the
+# session ends. See minecraft_forge.py for the design rationale.
+tmux new-session -d -s "$SESSION" -n mc "java -Xms{xms}M -Xmx{xmx}M {extra_args} -jar $JAR nogui"
+while tmux has-session -t "$SESSION" 2>/dev/null; do
+  sleep 1
+done
 """
 
 
