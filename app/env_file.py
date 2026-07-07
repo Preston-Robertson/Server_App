@@ -123,21 +123,64 @@ def env_file_writable(path: Path) -> tuple[bool, str]:
     """Return (writable, reason). Prefers atomic-replace via sibling tempfile;
     falls back to in-place rewrite when only the file is writable (typical for
     /etc/gamesrv.env, mode 660 root:gamesrv).
+
+    The check is empirical: we actually try to touch a sibling tempfile
+    (probe for the atomic-replace path) and open the file for append (probe
+    for in-place). Doing this rather than trusting `os.access(..., os.W_OK)`
+    alone catches read-only bind mounts — e.g. systemd `ProtectSystem=full`
+    over `/etc` — which would otherwise report a misleading permission hint.
     """
     if not path.exists():
         return False, f"{path} does not exist"
+
     parent = path.parent
-    parent_writable = os.access(parent, os.W_OK)
-    file_writable = os.access(path, os.W_OK)
+    parent_writable, parent_err = _probe_write(parent, is_dir=True)
+    file_writable,   file_err   = _probe_write(path,   is_dir=False)
+
     if parent_writable:
         return True, "atomic replace via sibling tempfile"
     if file_writable:
         return True, "in-place rewrite (parent dir not writable — non-atomic!)"
-    return False, (
-        f"neither {path} nor {parent} is writable by the manager user. "
-        f"On the LXC: `sudo chgrp gamesrv {path} && sudo chmod 660 {path}` "
-        "so the manager can edit it."
-    )
+
+    # Read-only filesystem is the systemd-hardening case (ProtectSystem=full
+    # over /etc). Say so explicitly — chmod won't fix it.
+    combined = (parent_err + " " + file_err).lower()
+    lines = []
+    if "read-only file system" in combined:
+        lines.append(
+            f"The manager sees {parent} as READ-ONLY. That's systemd's "
+            "ProtectSystem= hardening on gamesrv-manager.service. The unit "
+            "needs `ReadWritePaths=" f"{path}` — re-run "
+            "`sudo bash /opt/gamesrv/bootstrap.sh` (or manually: edit the "
+            "unit, `daemon-reload`, `restart gamesrv-manager`)."
+        )
+    else:
+        lines.append(
+            f"Neither {path} nor {parent} is writable by the manager user. "
+            f"On the LXC: `sudo chgrp gamesrv {path} && sudo chmod 660 {path}` "
+            "so the manager can edit it."
+        )
+    lines.append(f"parent probe: {parent_err}")
+    lines.append(f"file probe:   {file_err}")
+    return False, "\n".join(lines)
+
+
+def _probe_write(target: Path, *, is_dir: bool) -> tuple[bool, str]:
+    """Actually try to write. Returns (ok, error-or-'ok'-string). For a dir,
+    creates + deletes a temp file. For a file, opens it in append mode with
+    no bytes written (real permission test that doesn't change contents)."""
+    try:
+        if is_dir:
+            with tempfile.NamedTemporaryFile(
+                    dir=str(target), prefix=".writeprobe-", delete=True) as f:
+                f.write(b"x")
+                f.flush()
+            return True, "ok"
+        with open(target, "ab"):
+            pass
+        return True, "ok"
+    except OSError as e:
+        return False, f"{type(e).__name__}: {e.strerror or e}"
 
 
 # ---------- read ----------

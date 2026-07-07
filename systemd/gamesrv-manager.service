@@ -22,6 +22,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
+# ProtectSystem=full mounts /etc read-only for us. Punch a hole for the
+# one file the Admin env editor needs to write to.
+ReadWritePaths=/etc/gamesrv.env
 
 [Install]
 WantedBy=multi-user.target
