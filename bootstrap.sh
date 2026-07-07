@@ -26,7 +26,16 @@ fi
 
 echo "== 1. user =="
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
-  useradd --system --create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+  # Shell must be a real shell (not nologin) so tmux can exec commands
+  # inside sessions. gamesrv has no password and no SSH keys, so the
+  # anti-interactive-login benefit of nologin is negligible; the tmux
+  # breakage is not. See: journalctl "Attempted login by UNKNOWN".
+  useradd --system --create-home --shell /bin/bash "$SERVICE_USER"
+fi
+# Idempotent: if the account was created earlier with nologin, fix it now.
+current_shell="$(getent passwd "$SERVICE_USER" | cut -d: -f7)"
+if [[ "$current_shell" != "/bin/bash" ]]; then
+  usermod --shell /bin/bash "$SERVICE_USER"
 fi
 # Add gamesrv to systemd-journal so it can read `journalctl -u gamesrv@*` for
 # the per-server Logs and Console tabs. Without this the manager can invoke
