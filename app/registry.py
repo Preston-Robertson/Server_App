@@ -30,6 +30,26 @@ class BackupCfg(BaseModel):
     target: str | None = None  # defaults to world_dir
 
 
+class GitSourceCfg(BaseModel):
+    """Optional git remote to sync server files from.
+
+    Designed to work with GitHub today AND self-hosted Gitea/Forgejo/GitLab
+    later — every field is generic to a git URL. Auth for private repos:
+    put the PAT in /etc/gamesrv.env under some name and reference it via
+    token_env (never inline the value).
+    """
+    url: str = ""                       # https://github.com/user/repo(.git)  |  git@host:user/repo
+    ref: str = ""                       # branch/tag/commit; blank = default branch
+    subdir: str = ""                    # if the server files aren't at repo root
+    world_subdir: str = ""              # extracted into world_dir instead of install_dir
+    token_env: str = ""                 # env var name for HTTPS PAT (empty = public/SSH)
+    exclude: list[str] = Field(default_factory=list)   # extra path patterns to skip when syncing
+    # Populated by the sync operation — read-only from the user's POV.
+    deployed_sha: str = ""
+    deployed_ref: str = ""
+    deployed_at: str = ""               # ISO timestamp
+
+
 class ServerDef(BaseModel):
     name: str
     type: str  # minecraft-java | minecraft-forge | steamcmd | custom
@@ -51,6 +71,7 @@ class ServerDef(BaseModel):
     extra_env: dict[str, str] = Field(default_factory=dict)
     rcon: RconCfg = Field(default_factory=RconCfg)
     backup: BackupCfg = Field(default_factory=BackupCfg)
+    git_source: GitSourceCfg = Field(default_factory=GitSourceCfg)
 
     @field_validator("name")
     @classmethod

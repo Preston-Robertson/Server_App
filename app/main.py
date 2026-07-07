@@ -35,7 +35,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from . import control, registry, uploads, updater
+from . import control, registry, uploads, updater, git_source
 from .auth import require_token
 from .config import settings
 from .types import handler_for
@@ -229,6 +229,56 @@ def api_files_delete(name: str, area: str = "install", path: str = "") -> dict:
     sd = registry.load_def(name)
     uploads.delete_path(sd, area, path)
     return {"ok": True}
+
+
+# ---------- git source ----------
+
+class GitSyncBody(BaseModel):
+    dry_run: bool = False
+
+
+@app.post("/api/servers/{name}/git/sync", dependencies=[Depends(require_token)])
+def api_git_sync(name: str, body: GitSyncBody | None = None) -> dict:
+    """Clone (first time) or fetch + fast-forward the configured git source,
+    then rsync the tree into install_dir (and world_dir if world_subdir is
+    set). On success, records deployed_sha/ref/at back into the server def.
+    """
+    sd = registry.load_def(name)
+    if not sd.git_source.url:
+        raise HTTPException(status_code=400, detail="server has no git_source.url configured")
+    try:
+        r = git_source.sync(sd, dry_run=bool(body and body.dry_run))
+    except git_source.GitError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:  # unexpected — surface class name so we don't leak paths/tokens
+        raise HTTPException(status_code=500, detail=f"git sync failed: {e.__class__.__name__}") from e
+
+    if not (body and body.dry_run):
+        sd.git_source.deployed_sha = r.get("sha", "")
+        sd.git_source.deployed_ref = r.get("ref", "")
+        sd.git_source.deployed_at = r.get("deployed_at", "")
+        registry.save_def(sd)
+    return r
+
+
+@app.get("/api/servers/{name}/git/status", dependencies=[Depends(require_token)])
+def api_git_status(name: str) -> dict:
+    """Cheap probe of the remote HEAD for the configured ref. Uses
+    `git ls-remote` — no clone, no fetch. Used by the UI to show
+    'update available' hints on the Git tab."""
+    sd = registry.load_def(name)
+    if not sd.git_source.url:
+        return {"ok": False, "error": "no git_source configured"}
+    try:
+        return git_source.remote_head(sd)
+    except git_source.GitError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/servers/{name}/git/clear-cache", dependencies=[Depends(require_token)])
+def api_git_clear_cache(name: str) -> dict:
+    sd = registry.load_def(name)
+    return git_source.clear_cache(sd)
 
 
 # ---------- backups ----------

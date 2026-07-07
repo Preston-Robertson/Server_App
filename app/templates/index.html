@@ -47,6 +47,7 @@
             <button class="subtab" data-tab="console">Console</button>
             <button class="subtab" data-tab="logs">Logs</button>
             <button class="subtab" data-tab="files">Files</button>
+            <button class="subtab" data-tab="git">Git</button>
             <button class="subtab" data-tab="backups">Backups</button>
             <button class="subtab" data-tab="def">Definition</button>
           </div>
@@ -64,13 +65,51 @@
               <button class="btn btn-primary" data-action="install">Install / Reprovision</button>
               <button class="btn"             data-action="update-type">Update Game Software</button>
             </div>
+
+            <hr />
+            <h3 style="margin: 6px 0;">Performance</h3>
+            <div id="perf-grid" class="perf-grid">
+              <div class="perf-stat">
+                <div class="perf-stat-label">State</div>
+                <div class="perf-stat-value" id="perf-state">-</div>
+              </div>
+              <div class="perf-stat">
+                <div class="perf-stat-label">Uptime</div>
+                <div class="perf-stat-value" id="perf-uptime">-</div>
+              </div>
+              <div class="perf-stat">
+                <div class="perf-stat-label">RAM</div>
+                <div class="perf-stat-value" id="perf-ram">-</div>
+                <svg class="sparkline" id="spark-ram" viewBox="0 0 100 30" preserveAspectRatio="none"></svg>
+              </div>
+              <div class="perf-stat">
+                <div class="perf-stat-label">CPU</div>
+                <div class="perf-stat-value" id="perf-cpu">-</div>
+                <svg class="sparkline" id="spark-cpu" viewBox="0 0 100 30" preserveAspectRatio="none"></svg>
+              </div>
+            </div>
+            <p class="small muted">Sparklines cover the last ~2.5&nbsp;min (30 samples @ 5&nbsp;s poll). Data is in-memory; refresh the page and it starts over.</p>
+
             <pre id="control-out"></pre>
           </div>
 
           <div class="subtab-body" data-body="console" hidden>
-            <p class="muted">Sends one command to the running server via its tmux session (Minecraft: <code>say hi</code>, <code>whitelist add Steve</code>, <code>op Steve</code>).</p>
+            <p class="muted">
+              Sends one command to the running server via its tmux session
+              (Minecraft: <code>say hi</code>, <code>whitelist add Steve</code>,
+              <code>op Steve</code>). Recent server output is shown above.
+            </p>
             <div class="row">
-              <input id="console-cmd" placeholder="e.g. say hello" size="60" />
+              <button class="btn btn-tiny" id="console-refresh">Refresh output</button>
+              <label class="row" style="margin:0;">
+                <input type="checkbox" id="console-follow" checked />
+                <span>follow (auto-refresh)</span>
+              </label>
+              <label>Lines: <input id="console-lines" type="number" value="120" min="10" max="1000" style="width:80px" /></label>
+            </div>
+            <pre id="console-log-out" class="log-view"></pre>
+            <div class="row">
+              <input id="console-cmd" placeholder="e.g. say hello  |  whitelist add Steve" style="flex:1" />
               <button class="btn btn-primary" id="console-send">Send</button>
             </div>
             <pre id="console-out"></pre>
@@ -79,9 +118,13 @@
           <div class="subtab-body" data-body="logs" hidden>
             <div class="row">
               <button class="btn" id="refresh-logs">Refresh</button>
+              <label class="row" style="margin:0;">
+                <input type="checkbox" id="logs-follow" />
+                <span>follow (auto-refresh)</span>
+              </label>
               <label>Lines: <input id="log-lines" type="number" value="200" min="1" max="2000" style="width:80px" /></label>
             </div>
-            <pre id="logs-out"></pre>
+            <pre id="logs-out" class="log-view"></pre>
           </div>
 
           <div class="subtab-body" data-body="files" hidden>
@@ -155,6 +198,76 @@
             </div>
 
             <pre id="files-out"></pre>
+          </div>
+
+          <div class="subtab-body" data-body="git" hidden>
+            <p class="muted">
+              Optional. Point this server at a git repo (GitHub today,
+              self-hosted Gitea/Forgejo/GitLab tomorrow) so its files can be
+              pulled and versioned instead of hand-uploaded. The <code>.git</code>
+              cache lives at <code>&lt;install_dir&gt;.gitsrc/</code> — the game
+              never sees it. Private repos: put a PAT in
+              <code>/etc/gamesrv.env</code> under any name, put that name in
+              the <em>token env var</em> field below.
+            </p>
+
+            <form id="git-form" class="form-row" style="gap:10px;">
+              <div class="form-row">
+                <label>
+                  <span>Repo URL <em>(https://... or git@host:user/repo)</em></span>
+                  <input id="g-url" placeholder="https://github.com/you/your-server" />
+                </label>
+              </div>
+              <div class="form-row two-col">
+                <label>
+                  <span>Ref <em>(branch/tag/commit; blank = default branch)</em></span>
+                  <input id="g-ref" placeholder="main" />
+                </label>
+                <label>
+                  <span>Token env var name <em>(private repos only)</em></span>
+                  <input id="g-token-env" placeholder="MC_FORGE_GIT_PAT" />
+                </label>
+              </div>
+              <div class="form-row two-col">
+                <label>
+                  <span>Subdir in repo <em>(blank = repo root)</em></span>
+                  <input id="g-subdir" placeholder="e.g. server/" />
+                </label>
+                <label>
+                  <span>World subdir <em>(copied to world_dir instead of install_dir)</em></span>
+                  <input id="g-world-subdir" placeholder="world" />
+                </label>
+              </div>
+              <div class="form-row">
+                <label>
+                  <span>Extra excludes <em>(comma-separated glob patterns)</em></span>
+                  <input id="g-exclude" placeholder="e.g. logs, *.log, world" />
+                </label>
+              </div>
+              <div class="row">
+                <button type="button" class="btn btn-primary" id="git-save">Save Git Source</button>
+                <button type="button" class="btn"             id="git-status">Check remote</button>
+                <button type="button" class="btn btn-success" id="git-sync">Pull &amp; deploy</button>
+                <button type="button" class="btn btn-ghost"   id="git-dry-run">Dry run</button>
+                <button type="button" class="btn btn-danger"  id="git-clear">Clear cache</button>
+              </div>
+            </form>
+
+            <div id="git-info" class="widget" style="margin-top: 10px;" hidden>
+              <div class="widget-header">
+                <h2>Deployed</h2>
+              </div>
+              <div class="widget-body">
+                <div class="row" style="gap: 14px;">
+                  <span>Ref: <strong id="git-info-ref">-</strong></span>
+                  <span>SHA: <code id="git-info-sha">-</code></span>
+                  <span>At: <span id="git-info-at" class="muted">-</span></span>
+                  <span id="git-info-update"></span>
+                </div>
+              </div>
+            </div>
+
+            <pre id="git-out"></pre>
           </div>
 
           <div class="subtab-body" data-body="backups" hidden>
@@ -372,6 +485,43 @@
               </p>
             </fieldset>
           </details>
+
+            <fieldset>
+              <legend>Git source (optional)</legend>
+              <p class="small" style="margin: 0 0 6px;">
+                If your server files live in a git repo (GitHub or a future
+                self-hosted Gitea/Forgejo), point this at it and click
+                <strong>Create Server</strong> — a shallow clone runs
+                automatically after the def is saved. You can also configure
+                or re-sync this later from the server's <em>Git</em> tab.
+              </p>
+              <div class="form-row">
+                <label>
+                  <span>Repo URL <em>(https://... or git@host:user/repo — blank to skip)</em></span>
+                  <input name="git_url" id="f-git-url" placeholder="https://github.com/you/your-server" />
+                </label>
+              </div>
+              <div class="form-row three-col">
+                <label>
+                  <span>Ref</span>
+                  <input name="git_ref" id="f-git-ref" placeholder="main" />
+                </label>
+                <label>
+                  <span>Subdir in repo</span>
+                  <input name="git_subdir" id="f-git-subdir" placeholder="(root)" />
+                </label>
+                <label>
+                  <span>Token env var name</span>
+                  <input name="git_token_env" id="f-git-token-env" placeholder="MC_FORGE_GIT_PAT" />
+                </label>
+              </div>
+              <div class="form-row">
+                <label>
+                  <span>World subdir <em>(copied into world_dir; e.g. <code>world</code>)</em></span>
+                  <input name="git_world_subdir" id="f-git-world-subdir" placeholder="(none)" />
+                </label>
+              </div>
+            </fieldset>
 
 <fieldset>
               <legend>Initial files (optional)</legend>

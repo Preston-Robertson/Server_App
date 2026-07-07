@@ -181,12 +181,102 @@ async function refreshServers() {
   try {
     const rows = await api("/api/servers");
     renderServerGrid(rows);
+    updatePerfHistory(rows);
     const badge = $("#auth-badge");
     if (badge && badge.classList.contains("err")) { badge.textContent = "token loaded"; badge.className = "ok"; }
   } catch (e) {
     const badge = $("#auth-badge");
     if (badge) { badge.textContent = "auth error — check Admin page"; badge.className = "err"; }
   }
+}
+
+// ---------- Perf history + sparklines ----------
+//
+// Per-server ring buffer keyed by name. Each entry:
+//   { t_ms, active, mem_bytes, cpu_usec, uptime_sec, mem_pct, cpu_pct }
+// CPU% = 100 * (Δcpu_usec / 1000 / Δt_ms). systemd reports cpu_usec in
+// nanoseconds (property CPUUsageNSec), which control.py forwards as-is.
+
+const PERF_HISTORY = new Map();
+const PERF_MAX = 30;   // ~2.5 min at 5s poll interval
+
+function updatePerfHistory(rows) {
+  const now = Date.now();
+  for (const r of rows) {
+    const name = r.def.name;
+    const capBytes = (r.def.memory_mb || 0) * 1024 * 1024;
+    const mem = r.status.mem_bytes;
+    const memPct = (capBytes > 0 && mem != null && mem > 0)
+      ? Math.min(100, (mem / capBytes) * 100) : null;
+
+    const buf = PERF_HISTORY.get(name) || [];
+    let cpuPct = null;
+    const prev = buf[buf.length - 1];
+    if (prev && r.status.cpu_usec != null && prev.cpu_usec != null
+        && r.status.cpu_usec >= prev.cpu_usec) {
+      const dNs = r.status.cpu_usec - prev.cpu_usec;      // nanoseconds
+      const dMs = now - prev.t_ms;
+      if (dMs > 0) {
+        // 100 * (delta CPU seconds / delta wall seconds); ns / 1e6 = ms.
+        cpuPct = Math.max(0, Math.min(999, (dNs / 1e6 / dMs) * 100));
+      }
+    }
+    buf.push({
+      t_ms: now,
+      active: r.status.active,
+      mem_bytes: mem, cpu_usec: r.status.cpu_usec,
+      uptime_sec: r.status.uptime_sec,
+      mem_pct: memPct, cpu_pct: cpuPct,
+    });
+    while (buf.length > PERF_MAX) buf.shift();
+    PERF_HISTORY.set(name, buf);
+  }
+
+  // If the perf panel is open for a server, redraw.
+  if (CURRENT && !$("#detail-panel").hidden && !$('.subtab-body[data-body="control"]').hidden) {
+    renderPerfPanel(CURRENT);
+  }
+}
+
+function renderPerfPanel(name) {
+  const buf = PERF_HISTORY.get(name) || [];
+  const latest = buf[buf.length - 1] || null;
+
+  $("#perf-state").textContent = latest ? (latest.active || "-") : "-";
+  $("#perf-uptime").textContent = latest ? fmtDur(latest.uptime_sec) : "-";
+  $("#perf-ram").textContent = latest && latest.mem_bytes != null
+    ? `${fmtBytes(latest.mem_bytes)} (${latest.mem_pct != null ? latest.mem_pct.toFixed(0) + "%" : "-"})`
+    : "-";
+  $("#perf-cpu").textContent = latest && latest.cpu_pct != null
+    ? `${latest.cpu_pct.toFixed(0)}%`
+    : (buf.length < 2 ? "(collecting…)" : "-");
+
+  drawSpark($("#spark-ram"), buf.map(x => x.mem_pct), 100);
+  drawSpark($("#spark-cpu"), buf.map(x => x.cpu_pct),
+    // CPU can exceed 100% on multi-core boxes. Auto-scale to the max seen.
+    Math.max(100, ...buf.map(x => x.cpu_pct || 0)));
+}
+
+function drawSpark(svg, series, ymax) {
+  if (!svg) return;
+  const w = 100, h = 30;
+  const pts = series.filter(v => v != null);
+  if (pts.length < 2) { svg.innerHTML = ""; return; }
+  const step = w / (PERF_MAX - 1);
+  const pad = PERF_MAX - series.length;
+  const coords = series.map((v, i) => {
+    if (v == null) return null;
+    const x = (i + pad) * step;
+    const y = h - (v / ymax) * h;
+    return [x, Math.max(1, Math.min(h - 1, y))];
+  }).filter(Boolean);
+  const line = coords.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  const first = coords[0], last = coords[coords.length - 1];
+  const fillPath = `${first[0].toFixed(1)},${h} L ${line} L ${last[0].toFixed(1)},${h} Z`;
+  const cur = pts[pts.length - 1];
+  const cls = cur > 90 ? "err" : cur > 75 ? "warn" : "";
+  svg.setAttribute("class", "sparkline " + cls);
+  svg.innerHTML = `<path class="fill" d="M ${fillPath}"/><polyline points="${line}"/>`;
 }
 
 function renderServerGrid(rows) {
@@ -284,10 +374,24 @@ async function openServer(name) {
 function showTab(name) {
   $$(".subtab").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
   $$(".subtab-body").forEach(b => b.hidden = b.dataset.body !== name);
-  if (name === "logs") loadLogs();
+
+  // Kill followers on tab switch — we restart them below only for the
+  // tab that owns them.
+  clearInterval(LOGS_TIMER); LOGS_TIMER = null;
+  clearInterval(CONSOLE_TIMER); CONSOLE_TIMER = null;
+
+  if (name === "logs") {
+    loadLogs();
+    if ($("#logs-follow")?.checked) LOGS_TIMER = setInterval(loadLogs, 2000);
+  }
+  if (name === "console") {
+    loadConsoleLog();
+    if ($("#console-follow")?.checked) CONSOLE_TIMER = setInterval(loadConsoleLog, 2000);
+  }
   if (name === "files") listFiles();
   if (name === "backups") loadBackups();
   if (name === "def") loadDef();
+  if (name === "git") loadGit();
 }
 $$(".subtab").forEach(b => b.onclick = () => showTab(b.dataset.tab));
 
@@ -317,19 +421,55 @@ $("#console-send").onclick = async () => {
     });
     $("#console-out").textContent = "sent: " + JSON.stringify(r);
     $("#console-cmd").value = "";
+    // Quick refresh so the server's reply lands in the pane above.
+    setTimeout(loadConsoleLog, 400);
   } catch (e) { $("#console-out").textContent = "ERROR: " + e.message; }
 };
 
-// Logs
+// Send on Enter as well as via the button.
+$("#console-cmd")?.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") { ev.preventDefault(); $("#console-send").click(); }
+});
+
+// Logs — one-shot refresh + optional follow.
+let LOGS_TIMER = null;
 async function loadLogs() {
   const n = $("#log-lines").value || 200;
   try {
     const txt = await api(`/api/servers/${CURRENT}/logs?lines=${encodeURIComponent(n)}`);
-    $("#logs-out").textContent = txt;
-    $("#logs-out").scrollTop = $("#logs-out").scrollHeight;
+    const el = $("#logs-out");
+    // Preserve scroll-at-bottom "tail" behavior.
+    const wasAtBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+    el.textContent = txt;
+    if (wasAtBottom) el.scrollTop = el.scrollHeight;
   } catch (e) { $("#logs-out").textContent = "ERROR: " + e.message; }
 }
 $("#refresh-logs").onclick = loadLogs;
+$("#logs-follow").addEventListener("change", (ev) => {
+  clearInterval(LOGS_TIMER); LOGS_TIMER = null;
+  if (ev.target.checked) LOGS_TIMER = setInterval(loadLogs, 2000);
+});
+
+// Console — same log source as the Logs tab, refreshed above the input so
+// you can see the server's response to a command in real time.
+let CONSOLE_TIMER = null;
+async function loadConsoleLog() {
+  const n = $("#console-lines").value || 120;
+  try {
+    const txt = await api(`/api/servers/${CURRENT}/logs?lines=${encodeURIComponent(n)}`);
+    const el = $("#console-log-out");
+    const wasAtBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+    el.textContent = txt;
+    if (wasAtBottom) el.scrollTop = el.scrollHeight;
+  } catch (e) {
+    $("#console-log-out").textContent = "ERROR: " + e.message;
+  }
+}
+$("#console-refresh")?.addEventListener("click", loadConsoleLog);
+$("#console-follow")?.addEventListener("change", (ev) => {
+  clearInterval(CONSOLE_TIMER); CONSOLE_TIMER = null;
+  if (ev.target.checked) CONSOLE_TIMER = setInterval(loadConsoleLog, 2000);
+});
 
 // Files
 async function listFiles() {
@@ -668,6 +808,136 @@ $("#def-save").onclick = async () => {
 };
 
 // ========================================================================
+// GIT SOURCE TAB
+// ========================================================================
+
+// Populate the Git tab from the loaded server def. Called when the tab is
+// opened AND after every save so the fields reflect what's on disk.
+async function loadGit() {
+  try {
+    const r = await api(`/api/servers/${CURRENT}`);
+    const g = r.def.git_source || {};
+    $("#g-url").value          = g.url || "";
+    $("#g-ref").value          = g.ref || "";
+    $("#g-subdir").value       = g.subdir || "";
+    $("#g-world-subdir").value = g.world_subdir || "";
+    $("#g-token-env").value    = g.token_env || "";
+    $("#g-exclude").value      = (g.exclude || []).join(", ");
+    renderGitInfo(g, null);
+  } catch (e) {
+    $("#git-out").textContent = "ERROR: " + e.message;
+  }
+}
+
+function renderGitInfo(gitCfg, statusResp) {
+  const box = $("#git-info");
+  if (!gitCfg || !gitCfg.url) { box.hidden = true; return; }
+  box.hidden = false;
+  $("#git-info-ref").textContent = gitCfg.deployed_ref || "(never deployed)";
+  $("#git-info-sha").textContent = (gitCfg.deployed_sha || "").slice(0, 12) || "-";
+  $("#git-info-at").textContent  = gitCfg.deployed_at || "-";
+  const upd = $("#git-info-update");
+  if (statusResp?.ok && statusResp.update_available) {
+    upd.innerHTML = `<span class="chip chip-warn">update available → ${statusResp.remote_short_sha}</span>`;
+  } else if (statusResp?.ok) {
+    upd.innerHTML = `<span class="chip chip-ok">up to date</span>`;
+  } else if (statusResp && !statusResp.ok) {
+    upd.innerHTML = `<span class="chip chip-err">${escape(statusResp.error || "remote check failed")}</span>`;
+  } else {
+    upd.innerHTML = "";
+  }
+}
+
+// Build the git_source object from the tab's inputs.
+function collectGitSource() {
+  const excl = $("#g-exclude").value
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+  return {
+    url:          $("#g-url").value.trim(),
+    ref:          $("#g-ref").value.trim(),
+    subdir:       $("#g-subdir").value.trim(),
+    world_subdir: $("#g-world-subdir").value.trim(),
+    token_env:    $("#g-token-env").value.trim(),
+    exclude:      excl,
+  };
+}
+
+// Save git_source into the server def without touching the rest of it.
+async function saveGitSource() {
+  const r = await api(`/api/servers/${CURRENT}`);
+  const sd = r.def;
+  const g = collectGitSource();
+  // Preserve deployed_* fields when re-saving.
+  const prev = sd.git_source || {};
+  sd.git_source = {
+    ...g,
+    deployed_sha: prev.deployed_sha || "",
+    deployed_ref: prev.deployed_ref || "",
+    deployed_at:  prev.deployed_at  || "",
+  };
+  await api("/api/servers", { method: "POST", body: JSON.stringify(sd) });
+}
+
+$("#git-save")?.addEventListener("click", async () => {
+  try {
+    await saveGitSource();
+    $("#git-out").textContent = "git_source saved.";
+    await loadGit();
+    refreshServers();
+  } catch (e) { $("#git-out").textContent = "ERROR: " + e.message; }
+});
+
+$("#git-status")?.addEventListener("click", async () => {
+  try {
+    // Save first so the endpoint uses what the user just typed.
+    await saveGitSource();
+    const s = await api(`/api/servers/${CURRENT}/git/status`);
+    $("#git-out").textContent = JSON.stringify(s, null, 2);
+    const rr = await api(`/api/servers/${CURRENT}`);
+    renderGitInfo(rr.def.git_source || {}, s);
+  } catch (e) { $("#git-out").textContent = "ERROR: " + e.message; }
+});
+
+$("#git-sync")?.addEventListener("click", async () => {
+  if (!confirm(
+    "Pull the latest ref and rsync the tree into install_dir?\n\n" +
+    "This overwrites any files in install_dir that also exist in the repo. " +
+    "Manually-uploaded files not present in the repo are preserved."
+  )) return;
+  try {
+    await saveGitSource();
+    $("#git-out").textContent = "syncing…";
+    const r = await api(`/api/servers/${CURRENT}/git/sync`, {
+      method: "POST", body: JSON.stringify({ dry_run: false }),
+    });
+    $("#git-out").textContent = JSON.stringify(r, null, 2);
+    await loadGit();
+    refreshServers();
+  } catch (e) { $("#git-out").textContent = "ERROR: " + e.message; }
+});
+
+$("#git-dry-run")?.addEventListener("click", async () => {
+  try {
+    await saveGitSource();
+    $("#git-out").textContent = "dry-running…";
+    const r = await api(`/api/servers/${CURRENT}/git/sync`, {
+      method: "POST", body: JSON.stringify({ dry_run: true }),
+    });
+    $("#git-out").textContent = JSON.stringify(r, null, 2);
+  } catch (e) { $("#git-out").textContent = "ERROR: " + e.message; }
+});
+
+$("#git-clear")?.addEventListener("click", async () => {
+  if (!confirm("Delete the .gitsrc cache dir? Next sync will do a full clone.")) return;
+  try {
+    const r = await api(`/api/servers/${CURRENT}/git/clear-cache`, { method: "POST" });
+    $("#git-out").textContent = JSON.stringify(r, null, 2);
+  } catch (e) { $("#git-out").textContent = "ERROR: " + e.message; }
+});
+
+// ========================================================================
 // NEW SERVER MODAL
 // ========================================================================
 
@@ -845,11 +1115,53 @@ $("#new-server-form").addEventListener("submit", async (ev) => {
     if (rconPwEnv) sd.rcon.password_env = rconPwEnv;
   }
 
+  // git_source (optional). Only added if a URL was supplied.
+  const gitUrl = $("#f-git-url").value.trim();
+  if (gitUrl) {
+    sd.git_source = {
+      url:          gitUrl,
+      ref:          $("#f-git-ref").value.trim(),
+      subdir:       $("#f-git-subdir").value.trim(),
+      world_subdir: $("#f-git-world-subdir").value.trim(),
+      token_env:    $("#f-git-token-env").value.trim(),
+      exclude:      [],
+    };
+  }
+
   try {
     await api("/api/servers", { method: "POST", body: JSON.stringify(sd) });
   } catch (e) {
     showFormError("Create failed: " + e.message);
     return;
+  }
+
+  // If a git_source URL was provided, do the initial pull BEFORE running
+  // any queued file uploads — so the file uploads land on top of the repo
+  // tree (user's manual additions win over repo defaults).
+  if (gitUrl) {
+    const saveBtn = $("#modal-save");
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Cloning from git…";
+    try {
+      const r = await api(`/api/servers/${sd.name}/git/sync`, {
+        method: "POST", body: JSON.stringify({ dry_run: false }),
+      });
+      showFormError(""); $("#form-error").hidden = true;
+      // Keep going — but leave a small breadcrumb in the file-summary line
+      const summary = $("#init-file-summary");
+      summary.hidden = false;
+      summary.textContent = `git: pulled ${r.short_sha} from ${r.ref}` +
+        (r.world_updated ? " (+ world_subdir)" : "");
+    } catch (e) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Create Server";
+      showFormError(
+        `Server created, but the initial git sync failed:\n${e.message}\n\n` +
+        `Fix the git_source on the server's Git tab, or Cancel to close.`
+      );
+      await refreshServers();
+      return;
+    }
   }
 
   // Server def is on disk. Kick off any queued initial-file uploads before
