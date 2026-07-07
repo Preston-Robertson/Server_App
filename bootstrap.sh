@@ -28,6 +28,14 @@ echo "== 1. user =="
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
   useradd --system --create-home --shell /usr/sbin/nologin "$SERVICE_USER"
 fi
+# Add gamesrv to systemd-journal so it can read `journalctl -u gamesrv@*` for
+# the per-server Logs and Console tabs. Without this the manager can invoke
+# journalctl but gets back an empty result / "not seeing messages" hint,
+# which the UI surfaces as "no output". Idempotent — usermod -aG doesn't
+# duplicate existing memberships. Takes effect at next service start.
+if getent group systemd-journal >/dev/null 2>&1; then
+  usermod -aG systemd-journal "$SERVICE_USER"
+fi
 
 echo "== 2. dirs =="
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0755 "$APP_DIR" "$APP_DIR/logs" "$APP_DIR/servers" "$WORLDS_ROOT" "$INSTALL_ROOT"

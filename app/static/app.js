@@ -152,8 +152,11 @@ async function refreshUpdateLog() {
   try {
     const txt = await api("/api/manager/update/log?lines=400");
     const pre = $("#update-log-out");
+    // Preserve scroll-at-bottom "tail" behaviour so scrolling up to inspect
+    // an earlier run doesn't get yanked back down by the follow-timer.
+    const wasAtBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
     pre.textContent = txt || "(update.log is empty)";
-    pre.scrollTop = pre.scrollHeight;
+    if (wasAtBottom) pre.scrollTop = pre.scrollHeight;
   } catch (e) {
     $("#update-log-out").textContent = "ERROR: " + e.message;
   }
@@ -278,18 +281,91 @@ async function loadEnvEditor() {
       form.appendChild(fs);
     }
 
-    if (r.extras && r.extras.length) {
-      const fs = document.createElement("fieldset");
-      fs.className = "env-section";
-      fs.innerHTML = `<legend>Extras (per-server secrets etc.)</legend>`;
-      for (const k of r.extras) fs.appendChild(renderEnvRow(k, /*extra=*/true));
-      form.appendChild(fs);
-    }
+    // Always render an Extras fieldset (with existing rows if any) plus an
+    // "Add key" input at the bottom so new per-server PATs / RCON passwords
+    // can be created from the UI, not just edited.
+    const fs = document.createElement("fieldset");
+    fs.className = "env-section";
+    fs.innerHTML = `<legend>Extras (per-server secrets etc.)</legend>`;
+    for (const k of (r.extras || [])) fs.appendChild(renderEnvRow(k, /*extra=*/true));
+    fs.appendChild(renderAddKeyRow());
+    form.appendChild(fs);
   } catch (e) {
     $("#env-status").textContent = "LOAD FAIL: " + e.message;
     $("#env-status").className = "muted err";
   }
 }
+
+// A row of one input + Add button. Typing a name and clicking Add creates
+// a new blank Extras row in the current form (secret if the name ends with
+// _PW/_PASSWORD/_TOKEN/_PAT/_SECRET/_KEY). The row is NOT saved to disk
+// until the user hits Save / Save & Restart.
+function renderAddKeyRow() {
+  const row = document.createElement("div");
+  row.className = "env-row";
+  row.innerHTML = `
+    <label>
+      <div><strong>Add key</strong></div>
+      <div class="muted" style="font-size:11px;">
+        UPPERCASE_WITH_UNDERSCORES. Must match one of:
+        <code>MC_*</code>, <code>PALWORLD_*</code>, <code>VALHEIM_*</code>,
+        <code>ARK_*</code>, <code>GAMESRV_*</code>, <code>SERVER_*</code>.
+      </div>
+    </label>
+    <div class="env-value-group">
+      <input id="env-add-key" placeholder="e.g. MC_MODDED_DPR_GIT_PAT" autocomplete="off"
+             style="text-transform: uppercase;" />
+      <button type="button" class="btn btn-tiny" id="env-add-btn">Add</button>
+    </div>
+    <p class="env-help" id="env-add-help"></p>
+  `;
+  // Wire the button after the DOM is attached — event delegation below
+  // hooks the click as long as the id exists in the current form.
+  return row;
+}
+
+// Delegated Add handler (survives re-renders).
+const _EXTRA_KEY_PATTERNS = [
+  /^MC_[A-Z0-9_]+$/,
+  /^PALWORLD_[A-Z0-9_]+$/,
+  /^VALHEIM_[A-Z0-9_]+$/,
+  /^ARK_[A-Z0-9_]+$/,
+  /^GAMESRV_[A-Z0-9_]+$/,
+  /^SERVER_[A-Z0-9_]+$/,
+];
+const _SECRET_SUFFIXES = ["_PW", "_PASSWORD", "_TOKEN", "_PAT", "_SECRET", "_KEY"];
+
+document.addEventListener("click", (ev) => {
+  if (ev.target.id !== "env-add-btn") return;
+  const input = document.getElementById("env-add-key");
+  const help  = document.getElementById("env-add-help");
+  const name  = (input.value || "").trim().toUpperCase();
+  help.textContent = "";
+  if (!name) return;
+  if (!_EXTRA_KEY_PATTERNS.some(p => p.test(name))) {
+    help.textContent = `"${name}" doesn't match any writable pattern — the server would reject it.`;
+    help.style.color = "var(--danger)";
+    return;
+  }
+  // Refuse if it already exists somewhere in the form.
+  if (document.querySelector(`.env-row[data-name="${CSS.escape(name)}"]`)) {
+    help.textContent = `${name} is already in the form. Edit that row instead.`;
+    help.style.color = "var(--warn)";
+    return;
+  }
+  const isSecret = _SECRET_SUFFIXES.some(s => name.endsWith(s));
+  const row = renderEnvRow({
+    name, value: "", is_secret: isSecret, writable: true,
+  }, /*extra=*/true);
+  // Insert the new row ABOVE the Add-key row so the Add-key row stays last.
+  const addRow = input.closest(".env-row");
+  addRow.parentNode.insertBefore(row, addRow);
+  input.value = "";
+  help.textContent = `${name} added — paste the value and click Save.`;
+  help.style.color = "var(--success)";
+  // Focus the new row's input for immediate typing.
+  row.querySelector("input")?.focus();
+});
 
 function renderEnvRow(k, extra) {
   const row = document.createElement("div");
@@ -339,7 +415,9 @@ document.addEventListener("click", (ev) => {
 
 $("#env-reload")?.addEventListener("click", loadEnvEditor);
 
-$("#env-save")?.addEventListener("click", async () => {
+// Actual save call. Returns the API response so the caller can chain
+// (e.g. Save & Restart). Sets the visible status line either way.
+async function saveEnvOnce() {
   const rows = $$(".env-row");
   const updates = {};
   for (const row of rows) {
@@ -348,20 +426,82 @@ $("#env-save")?.addEventListener("click", async () => {
     // For secrets: blank means "keep current" — server-side logic handles it.
     updates[row.dataset.name] = input.value;
   }
+  const r = await api("/api/manager/env", {
+    method: "POST", body: JSON.stringify({ updates }),
+  });
+  const parts = [];
+  if (r.changed?.length) parts.push(`saved: ${r.changed.join(", ")}`);
+  if (r.unchanged_secrets?.length) parts.push(`kept secrets: ${r.unchanged_secrets.join(", ")}`);
+  if (r.rejected?.length) parts.push(`REJECTED: ${r.rejected.join(", ")}`);
+  if (!parts.length) parts.push("no changes");
+  $("#env-status").textContent = parts.join(" · ");
+  $("#env-status").className = "muted ok";
+  return r;
+}
+
+$("#env-save")?.addEventListener("click", async () => {
   try {
-    const r = await api("/api/manager/env", {
-      method: "POST", body: JSON.stringify({ updates }),
-    });
-    const parts = [];
-    if (r.changed?.length) parts.push(`saved: ${r.changed.join(", ")}`);
-    if (r.unchanged_secrets?.length) parts.push(`kept secrets: ${r.unchanged_secrets.join(", ")}`);
-    if (r.rejected?.length) parts.push(`REJECTED: ${r.rejected.join(", ")}`);
-    if (!parts.length) parts.push("no changes");
-    $("#env-status").textContent = parts.join(" · ") + " · Restart the manager to apply.";
-    $("#env-status").className = "muted ok";
+    const r = await saveEnvOnce();
+    if (r.changed?.length) {
+      $("#env-status").textContent = $("#env-status").textContent +
+        " · click Restart in Manager Self-Update (env only re-reads at startup).";
+    }
     await loadEnvEditor();
   } catch (e) {
     $("#env-status").textContent = "SAVE FAIL: " + e.message;
+    $("#env-status").className = "muted err";
+  }
+});
+
+$("#env-save-and-restart")?.addEventListener("click", async () => {
+  let r;
+  try {
+    r = await saveEnvOnce();
+  } catch (e) {
+    $("#env-status").textContent = "SAVE FAIL: " + e.message;
+    $("#env-status").className = "muted err";
+    return;
+  }
+
+  // If nothing actually changed, don't bounce the manager unnecessarily.
+  if (!r.changed?.length) {
+    $("#env-status").textContent = "no changes — skipped restart";
+    return;
+  }
+
+  if (!confirm(
+    "Save succeeded. Restart the manager now so the new env values take effect?\n\n" +
+    "The UI will drop for ~2 s while systemd bounces the service. " +
+    "Game servers are unaffected — they run under their own units."
+  )) return;
+
+  try {
+    await api("/api/manager/restart", { method: "POST" });
+    $("#env-status").textContent = "restart triggered — waiting for manager…";
+    $("#env-status").className = "muted";
+    // Poll /healthz until it answers again.
+    const deadline = Date.now() + 30_000;
+    const poll = async () => {
+      if (Date.now() > deadline) {
+        $("#env-status").textContent = "TIMEOUT waiting for /healthz — check journal";
+        $("#env-status").className = "muted err";
+        return;
+      }
+      try {
+        const hr = await fetch("/healthz");
+        if (hr.ok) {
+          $("#env-status").textContent = "manager restarted — new env is live";
+          $("#env-status").className = "muted ok";
+          await loadEnvEditor();
+          await loadRuntimeInfo();
+          return;
+        }
+      } catch (_e) { /* keep polling */ }
+      setTimeout(poll, 500);
+    };
+    setTimeout(poll, 1000);
+  } catch (e) {
+    $("#env-status").textContent = "RESTART FAIL: " + e.message;
     $("#env-status").className = "muted err";
   }
 });

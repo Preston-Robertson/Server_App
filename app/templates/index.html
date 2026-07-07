@@ -374,7 +374,7 @@
             </label>
           </div>
           <p class="muted" style="font-size:12px;">Log file: <code>/opt/gamesrv/logs/update.log</code></p>
-          <pre id="update-log-out">(no data yet — click Refresh log)</pre>
+          <pre id="update-log-out" class="log-view">(no data yet — click Refresh log)</pre>
         </div>
       </article>
 
@@ -395,9 +395,17 @@
           <form id="env-form"></form>
           <div class="row" style="margin-top: 12px;">
             <button class="btn btn-primary" id="env-save">Save Environment</button>
+            <button class="btn btn-success" id="env-save-and-restart">Save &amp; Restart</button>
             <button class="btn" id="env-reload">Reload from disk</button>
             <span id="env-status" class="muted"></span>
           </div>
+          <p class="small muted" style="margin: 6px 0 0;">
+            <strong>Save Environment</strong> writes the file only. Env vars
+            are re-read at process start, so anything you change (a new
+            <code>MC_*_GIT_PAT</code>, a rotated <code>GAMESRV_TOKEN</code>)
+            only takes effect after a restart. Use <strong>Save &amp;
+            Restart</strong> to do both in one shot.
+          </p>
         </div>
       </article>
 

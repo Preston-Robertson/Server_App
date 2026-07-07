@@ -124,6 +124,20 @@ def status(sd: ServerDef) -> ServerStatus:
 
 def tail_logs(sd: ServerDef, lines: int = 200) -> str:
     r = _run(["journalctl", "-u", _unit(sd.name), "-n", str(int(lines)), "--no-pager", "-o", "short-iso"])
+    out = (r.stdout or "") + (r.stderr or "")
+    # journalctl prints a "not seeing messages" hint when the caller lacks
+    # systemd-journal group membership. Elevate that to an actionable error
+    # instead of returning what looks like a working-but-empty tail.
+    if ("systemd-journal" in out and "not seeing messages" in out) or \
+       ("No journal files were opened" in out):
+        return (
+            "PERMISSION: the manager user cannot read the systemd journal.\n"
+            "Fix on the LXC:\n"
+            "  sudo usermod -aG systemd-journal gamesrv\n"
+            "  sudo systemctl restart gamesrv-manager.service\n"
+            "(bootstrap.sh does this automatically on any re-run.)\n\n"
+            "--- raw journalctl output ---\n" + out
+        )
     return r.stdout or r.stderr
 
 
