@@ -73,7 +73,10 @@ def _url_with_token(url: str, token: str) -> str:
     return urlunsplit((parts.scheme, new_netloc, parts.path, parts.query, parts.fragment))
 
 
-def _resolve_token(cfg: GitSourceCfg) -> str:
+def _resolve_token(cfg: GitSourceCfg, override: str | None = None) -> str:
+    """Priority: explicit override (per-request PAT) > cfg.token_env > none."""
+    if override:
+        return override.strip()
     if not cfg.token_env:
         return ""
     val = os.environ.get(cfg.token_env, "").strip()
@@ -85,6 +88,37 @@ def _resolve_token(cfg: GitSourceCfg) -> str:
             f"git_source.token_env={cfg.token_env!r} is not set in the environment"
         )
     return val
+
+
+def _auth_hint(stderr: str, has_token: bool) -> str:
+    """Turn git's cryptic 'terminal prompts disabled' into an actionable message."""
+    stderr_lc = (stderr or "").lower()
+    looks_authy = (
+        "terminal prompts disabled" in stderr_lc
+        or "could not read username" in stderr_lc
+        or "authentication failed" in stderr_lc
+        or "403" in stderr_lc
+    )
+    if not looks_authy:
+        return _tail(stderr)
+    if has_token:
+        return (
+            "Authentication rejected. Double-check the PAT (or the value in "
+            "GAMESRV.env under token_env) — it may be expired, revoked, or "
+            "lack Contents: Read access to this repo.\n\n"
+            + _tail(stderr)
+        )
+    return (
+        "This repository appears to be private and no token was supplied.\n"
+        "Fix: on the Git tab, paste a fine-grained PAT into the "
+        "\"PAT for this sync\" field (Contents: Read only, scoped to this "
+        "repo). It is NOT persisted anywhere — you only need to re-enter "
+        "it when the deployed SHA falls behind.\n"
+        "Alternative: set the PAT in /etc/gamesrv.env under any name "
+        "(e.g. MC_MODDED_DPR_GIT_PAT=...) and put that name in the "
+        "\"Token env var name\" field.\n\n"
+        + _tail(stderr)
+    )
 
 
 # ---------- subprocess wrapper ----------
@@ -168,9 +202,13 @@ def _py_copytree(src: Path, dst: Path, excludes: list[str]) -> None:
 
 # ---------- public API ----------
 
-def sync(sd: ServerDef, *, dry_run: bool = False) -> dict:
+def sync(sd: ServerDef, *, dry_run: bool = False, token: str | None = None) -> dict:
     """Clone-or-fetch, checkout the requested ref, and copy the tree into
     install_dir (and optionally world_dir).
+
+    A per-request `token` overrides cfg.token_env. It is used only for this
+    call and never persisted to disk — the git remote URL is scrubbed after
+    fetch to prevent it landing in .git/config.
 
     Returns a JSON-serialisable dict for the API response. Does NOT mutate
     the on-disk server def — callers who want to record the deployed SHA
@@ -184,18 +222,21 @@ def sync(sd: ServerDef, *, dry_run: bool = False) -> dict:
     world_dir = Path(sd.world_dir).resolve()
 
     steps: list[str] = []
-    token = _resolve_token(cfg)
-    auth_url = _url_with_token(cfg.url, token)
+    resolved_token = _resolve_token(cfg, override=token)
+    has_token = bool(resolved_token)
+    auth_url = _url_with_token(cfg.url, resolved_token)
 
     # -- step 1: clone or fetch --
     if (cache / ".git").exists():
         steps.append(f"cache exists at {cache}, fetching...")
         r = _run_git(["remote", "set-url", "origin", auth_url], cwd=cache)
         if r.returncode != 0:
-            raise GitError(f"git remote set-url failed:\n{_tail(r.stderr)}")
+            raise GitError(f"git remote set-url failed:\n{_auth_hint(r.stderr, has_token)}")
         r = _run_git(["fetch", "--all", "--prune", "--tags"], cwd=cache)
         if r.returncode != 0:
-            raise GitError(f"git fetch failed:\n{_tail(r.stderr)}")
+            # Scrub the token URL out even on failure.
+            _run_git(["remote", "set-url", "origin", cfg.url], cwd=cache)
+            raise GitError(f"git fetch failed:\n{_auth_hint(r.stderr, has_token)}")
     else:
         cache.parent.mkdir(parents=True, exist_ok=True)
         if cache.exists():
@@ -204,11 +245,15 @@ def sync(sd: ServerDef, *, dry_run: bool = False) -> dict:
         steps.append(f"cloning {cfg.url} into {cache}...")
         r = _run_git(["clone", "--no-checkout", auth_url, str(cache)], timeout=1800)
         if r.returncode != 0:
-            raise GitError(f"git clone failed:\n{_tail(r.stderr)}")
+            # Clone leaves a partial dir; sweep it so the next attempt is a
+            # clean clone rather than a "cache exists but no .git" refusal.
+            if cache.exists() and not (cache / ".git").exists():
+                shutil.rmtree(cache, ignore_errors=True)
+            raise GitError(f"git clone failed:\n{_auth_hint(r.stderr, has_token)}")
 
     # After a fetch/clone, scrub the token out of the stored remote URL —
     # git leaves it in `.git/config` otherwise.
-    if token:
+    if resolved_token:
         _run_git(["remote", "set-url", "origin", cfg.url], cwd=cache)
 
     # -- step 2: resolve ref --
@@ -300,18 +345,19 @@ def sync(sd: ServerDef, *, dry_run: bool = False) -> dict:
     }
 
 
-def remote_head(sd: ServerDef) -> dict:
+def remote_head(sd: ServerDef, *, token: str | None = None) -> dict:
     """Ask the remote what its current head is for the configured ref, WITHOUT
     fetching everything. Used by the UI to show 'update available' hints."""
     cfg = sd.git_source
     _validate_url(cfg.url)
-    token = _resolve_token(cfg)
-    auth_url = _url_with_token(cfg.url, token)
+    resolved_token = _resolve_token(cfg, override=token)
+    has_token = bool(resolved_token)
+    auth_url = _url_with_token(cfg.url, resolved_token)
 
     ref = (cfg.ref or "HEAD").strip()
     r = _run_git(["ls-remote", auth_url, ref], timeout=60)
     if r.returncode != 0:
-        return {"ok": False, "error": _tail(r.stderr)}
+        return {"ok": False, "error": _auth_hint(r.stderr, has_token)}
     # ls-remote format: "<sha>\t<refname>". Take the first hit.
     first = (r.stdout.splitlines() or [""])[0].split("\t", 1)
     if not first or not first[0]:

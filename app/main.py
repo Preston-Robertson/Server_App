@@ -35,7 +35,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from . import control, registry, uploads, updater, git_source
+from . import control, registry, uploads, updater, git_source, env_file
 from .auth import require_token
 from .config import settings
 from .types import handler_for
@@ -235,6 +235,7 @@ def api_files_delete(name: str, area: str = "install", path: str = "") -> dict:
 
 class GitSyncBody(BaseModel):
     dry_run: bool = False
+    token: str | None = None   # per-request PAT; never persisted anywhere
 
 
 @app.post("/api/servers/{name}/git/sync", dependencies=[Depends(require_token)])
@@ -242,12 +243,20 @@ def api_git_sync(name: str, body: GitSyncBody | None = None) -> dict:
     """Clone (first time) or fetch + fast-forward the configured git source,
     then rsync the tree into install_dir (and world_dir if world_subdir is
     set). On success, records deployed_sha/ref/at back into the server def.
+
+    Body may include a per-request `token` for private repos — used only for
+    this call and never written to disk. Alternatively, set the PAT in
+    /etc/gamesrv.env under any name and reference it via git_source.token_env.
     """
     sd = registry.load_def(name)
     if not sd.git_source.url:
         raise HTTPException(status_code=400, detail="server has no git_source.url configured")
     try:
-        r = git_source.sync(sd, dry_run=bool(body and body.dry_run))
+        r = git_source.sync(
+            sd,
+            dry_run=bool(body and body.dry_run),
+            token=(body.token if body and body.token else None),
+        )
     except git_source.GitError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:  # unexpected — surface class name so we don't leak paths/tokens
@@ -261,18 +270,31 @@ def api_git_sync(name: str, body: GitSyncBody | None = None) -> dict:
     return r
 
 
-@app.get("/api/servers/{name}/git/status", dependencies=[Depends(require_token)])
-def api_git_status(name: str) -> dict:
+class GitStatusBody(BaseModel):
+    token: str | None = None
+
+
+@app.post("/api/servers/{name}/git/status", dependencies=[Depends(require_token)])
+def api_git_status_post(name: str, body: GitStatusBody | None = None) -> dict:
     """Cheap probe of the remote HEAD for the configured ref. Uses
-    `git ls-remote` — no clone, no fetch. Used by the UI to show
-    'update available' hints on the Git tab."""
+    `git ls-remote` — no clone, no fetch. Body may include a per-request
+    PAT for private repos.
+    """
     sd = registry.load_def(name)
     if not sd.git_source.url:
         return {"ok": False, "error": "no git_source configured"}
     try:
-        return git_source.remote_head(sd)
+        return git_source.remote_head(
+            sd, token=(body.token if body and body.token else None)
+        )
     except git_source.GitError as e:
         return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/servers/{name}/git/status", dependencies=[Depends(require_token)])
+def api_git_status_get(name: str) -> dict:
+    """Convenience GET for the auth-via-env-only case (no per-request token)."""
+    return api_git_status_post(name, None)
 
 
 @app.post("/api/servers/{name}/git/clear-cache", dependencies=[Depends(require_token)])
@@ -320,6 +342,72 @@ def api_manager_update() -> dict:
 @app.get("/api/manager/update/log", response_class=PlainTextResponse, dependencies=[Depends(require_token)])
 def api_manager_update_log(lines: int = 200) -> str:
     return updater.update_log_tail(lines=max(1, min(2000, lines)))
+
+
+@app.post("/api/manager/restart", dependencies=[Depends(require_token)])
+def api_manager_restart() -> dict:
+    """Bounce the manager without pulling code. systemd Restart=always
+    brings it back. Useful after editing /etc/gamesrv.env via the Admin
+    env editor, since env is only read at startup."""
+    return updater.request_restart()
+
+
+@app.get("/api/manager/info", dependencies=[Depends(require_token)])
+def api_manager_info() -> dict:
+    return updater.runtime_info()
+
+
+# ---------- env editor ----------
+
+@app.get("/api/manager/env", dependencies=[Depends(require_token)])
+def api_manager_env() -> dict:
+    """Return the current env-file contents, structured for the UI.
+
+    Secrets ARE included in the JSON — the endpoint is behind the bearer
+    token and served over the LAN-only manager port. If you need stricter
+    handling later, we can redact secret values here and require a separate
+    "reveal" call.
+    """
+    path = env_file.env_file_path()
+    writable, reason = env_file.env_file_writable(path)
+    entries = env_file.list_entries(path)
+    return {
+        "path": str(path),
+        "writable": writable,
+        "writable_reason": reason,
+        "known": [
+            {
+                "name": e.name, "value": e.value,
+                "is_secret": e.is_secret,
+                "label": e.key.label if e.key else e.name,
+                "help": e.key.help if e.key else "",
+                "section": e.key.section if e.key else "Other",
+                "input_type": e.key.input_type if e.key else "text",
+            }
+            for e in entries if e.is_managed
+        ],
+        "extras": [
+            {
+                "name": e.name, "value": e.value,
+                "is_secret": e.is_secret,
+                "writable": e.is_extra_writable,
+            }
+            for e in entries if not e.is_managed
+        ],
+    }
+
+
+class EnvSaveBody(BaseModel):
+    updates: dict[str, str]
+
+
+@app.post("/api/manager/env", dependencies=[Depends(require_token)])
+def api_manager_env_save(body: EnvSaveBody) -> dict:
+    path = env_file.env_file_path()
+    try:
+        return env_file.update_env_file(path, body.updates)
+    except OSError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
 
 
 # ---------- error handler: don't leak stack traces ----------

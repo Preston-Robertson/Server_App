@@ -40,6 +40,11 @@ function showPage(name) {
     SERVERS_TIMER = setInterval(refreshServers, 5000);
   } else if (name === "admin") {
     $("#token").value = TOKEN;
+    if (TOKEN) {
+      // Only load these if we have a token — otherwise the calls 401 loudly.
+      loadRuntimeInfo();
+      loadEnvEditor();
+    }
     if ($("#follow-update-log").checked) startFollowUpdateLog();
   }
 }
@@ -99,6 +104,11 @@ $("#save-token").onclick = () => {
   localStorage.setItem("gamesrv_token", TOKEN);
   refreshAuthBadge();
   setTokenStatus("saved", "ok");
+  // Load runtime + env if we're on the Admin page.
+  if (CURRENT_PAGE === "admin") {
+    loadRuntimeInfo();
+    loadEnvEditor();
+  }
 };
 $("#clear-token").onclick = () => {
   TOKEN = "";
@@ -171,6 +181,190 @@ $("#check-health").onclick = async () => {
     badge.className = "muted err";
   }
 };
+
+// ---------- Runtime widget ----------
+
+async function loadRuntimeInfo() {
+  try {
+    const r = await api("/api/manager/info");
+    $("#rt-repo").textContent   = r.repo_dir || "-";
+    $("#rt-python").textContent = r.python_exe || "-";
+    $("#rt-python-ver").textContent = r.python_ver ? `(${r.python_ver})` : "";
+    $("#rt-branch").textContent = r.git_branch || "-";
+    $("#rt-head").textContent   = r.git_head || "-";
+    $("#rt-last").textContent   = r.git_last || "-";
+    $("#rt-unit").textContent   = r.unit || "-";
+    $("#rt-updater").textContent = r.updater_unit || "-";
+    $("#rt-env").textContent    = r.env_file || "-";
+    $("#runtime-branch").textContent = r.git_branch
+      ? `${r.git_branch} · ${r.git_head || ""}` : "no git";
+    $("#admin-envfile-path").textContent = r.env_file || "/etc/gamesrv.env";
+  } catch (e) {
+    // If we can't reach /api yet (no token), silently skip.
+  }
+}
+$("#runtime-refresh")?.addEventListener("click", loadRuntimeInfo);
+
+// ---------- Restart button ----------
+
+$("#manager-restart")?.addEventListener("click", async () => {
+  if (!confirm(
+    "Restart the manager now?\n\n" +
+    "This bounces the process WITHOUT pulling new code. Useful after " +
+    "editing environment values. Game servers are unaffected — they " +
+    "run under their own systemd units."
+  )) return;
+  try {
+    const r = await api("/api/manager/restart", { method: "POST" });
+    $("#update-log-out").textContent =
+      "restart requested: " + JSON.stringify(r, null, 2) +
+      "\n\n(waiting for the manager to come back...)\n";
+    // Poll /healthz until it answers again.
+    const deadline = Date.now() + 30_000;
+    const poll = async () => {
+      if (Date.now() > deadline) {
+        $("#update-log-out").textContent += "\nTIMEOUT waiting for /healthz.\n";
+        return;
+      }
+      try {
+        const hr = await fetch("/healthz");
+        if (hr.ok) {
+          $("#update-log-out").textContent += "\nmanager is back up.\n";
+          await loadRuntimeInfo();
+          return;
+        }
+      } catch (_e) { /* keep polling */ }
+      setTimeout(poll, 500);
+    };
+    setTimeout(poll, 1000);
+  } catch (e) {
+    alert("Restart trigger failed: " + e.message);
+  }
+});
+
+// ---------- Env editor ----------
+
+let ENV_CACHE = null;   // last /api/manager/env response
+
+async function loadEnvEditor() {
+  try {
+    const r = await api("/api/manager/env");
+    ENV_CACHE = r;
+    $("#env-path-chip").textContent = r.path || "-";
+
+    const warn = $("#env-writable-warn");
+    if (r.writable) {
+      warn.hidden = true;
+    } else {
+      warn.hidden = false;
+      warn.textContent = "Env file is not writable — Save will fail.\n" + (r.writable_reason || "");
+    }
+
+    // Group managed keys by section.
+    const bySection = {};
+    for (const k of r.known || []) {
+      (bySection[k.section] = bySection[k.section] || []).push(k);
+    }
+
+    const form = $("#env-form");
+    form.innerHTML = "";
+    for (const section of Object.keys(bySection)) {
+      const fs = document.createElement("fieldset");
+      fs.className = "env-section";
+      fs.innerHTML = `<legend>${escape(section)}</legend>`;
+      for (const k of bySection[section]) {
+        fs.appendChild(renderEnvRow(k, /*extra=*/false));
+      }
+      form.appendChild(fs);
+    }
+
+    if (r.extras && r.extras.length) {
+      const fs = document.createElement("fieldset");
+      fs.className = "env-section";
+      fs.innerHTML = `<legend>Extras (per-server secrets etc.)</legend>`;
+      for (const k of r.extras) fs.appendChild(renderEnvRow(k, /*extra=*/true));
+      form.appendChild(fs);
+    }
+  } catch (e) {
+    $("#env-status").textContent = "LOAD FAIL: " + e.message;
+    $("#env-status").className = "muted err";
+  }
+}
+
+function renderEnvRow(k, extra) {
+  const row = document.createElement("div");
+  row.className = "env-row" + ((extra && !k.writable) ? " readonly" : "");
+  row.dataset.name = k.name;
+  row.dataset.secret = k.is_secret ? "1" : "0";
+
+  const inputType = k.is_secret ? "password" : (k.input_type || "text");
+  const label = extra ? k.name : (k.label || k.name);
+  const help = extra
+    ? (k.writable ? "" : "read-only — this key isn't managed here")
+    : (k.help || "");
+  const placeholder = k.is_secret
+    ? (k.value ? "(blank = keep current value)" : "(not set)")
+    : "";
+  // For secrets, we DO NOT pre-fill the field. Blank on save means "keep".
+  const initialValue = k.is_secret ? "" : (k.value || "");
+
+  row.innerHTML = `
+    <label>
+      <div><code>${escape(k.name)}</code></div>
+      <div class="muted" style="font-size:11px;">${escape(label)}</div>
+    </label>
+    <div class="env-value-group">
+      <input
+        name="${escape(k.name)}"
+        type="${inputType}"
+        value="${escape(initialValue)}"
+        placeholder="${escape(placeholder)}"
+        autocomplete="off"
+        ${extra && !k.writable ? "disabled" : ""}
+      />
+      ${k.is_secret ? `<button type="button" class="env-reveal" data-env-reveal title="Show / hide">👁</button>` : ""}
+    </div>
+    <p class="env-help">${escape(help)}</p>
+  `;
+  return row;
+}
+
+// Toggle password visibility for secret rows.
+document.addEventListener("click", (ev) => {
+  if (!ev.target.dataset || ev.target.dataset.envReveal === undefined) return;
+  const row = ev.target.closest(".env-row");
+  const input = row.querySelector("input");
+  input.type = input.type === "password" ? "text" : "password";
+});
+
+$("#env-reload")?.addEventListener("click", loadEnvEditor);
+
+$("#env-save")?.addEventListener("click", async () => {
+  const rows = $$(".env-row");
+  const updates = {};
+  for (const row of rows) {
+    const input = row.querySelector("input");
+    if (!input || input.disabled) continue;
+    // For secrets: blank means "keep current" — server-side logic handles it.
+    updates[row.dataset.name] = input.value;
+  }
+  try {
+    const r = await api("/api/manager/env", {
+      method: "POST", body: JSON.stringify({ updates }),
+    });
+    const parts = [];
+    if (r.changed?.length) parts.push(`saved: ${r.changed.join(", ")}`);
+    if (r.unchanged_secrets?.length) parts.push(`kept secrets: ${r.unchanged_secrets.join(", ")}`);
+    if (r.rejected?.length) parts.push(`REJECTED: ${r.rejected.join(", ")}`);
+    if (!parts.length) parts.push("no changes");
+    $("#env-status").textContent = parts.join(" · ") + " · Restart the manager to apply.";
+    $("#env-status").className = "muted ok";
+    await loadEnvEditor();
+  } catch (e) {
+    $("#env-status").textContent = "SAVE FAIL: " + e.message;
+    $("#env-status").className = "muted err";
+  }
+});
 
 // ========================================================================
 // DASHBOARD — server cards
@@ -893,10 +1087,14 @@ $("#git-status")?.addEventListener("click", async () => {
   try {
     // Save first so the endpoint uses what the user just typed.
     await saveGitSource();
-    const s = await api(`/api/servers/${CURRENT}/git/status`);
+    const tok = ($("#g-token").value || "").trim();
+    const s = await api(`/api/servers/${CURRENT}/git/status`, {
+      method: "POST", body: JSON.stringify({ token: tok || null }),
+    });
     $("#git-out").textContent = JSON.stringify(s, null, 2);
     const rr = await api(`/api/servers/${CURRENT}`);
     renderGitInfo(rr.def.git_source || {}, s);
+    // Don't clear the PAT here — the user probably wants to hit "Pull & deploy" next.
   } catch (e) { $("#git-out").textContent = "ERROR: " + e.message; }
 });
 
@@ -908,11 +1106,13 @@ $("#git-sync")?.addEventListener("click", async () => {
   )) return;
   try {
     await saveGitSource();
+    const tok = ($("#g-token").value || "").trim();
     $("#git-out").textContent = "syncing…";
     const r = await api(`/api/servers/${CURRENT}/git/sync`, {
-      method: "POST", body: JSON.stringify({ dry_run: false }),
+      method: "POST", body: JSON.stringify({ dry_run: false, token: tok || null }),
     });
     $("#git-out").textContent = JSON.stringify(r, null, 2);
+    $("#g-token").value = "";   // forget the PAT — never persisted
     await loadGit();
     refreshServers();
   } catch (e) { $("#git-out").textContent = "ERROR: " + e.message; }
@@ -921,9 +1121,10 @@ $("#git-sync")?.addEventListener("click", async () => {
 $("#git-dry-run")?.addEventListener("click", async () => {
   try {
     await saveGitSource();
+    const tok = ($("#g-token").value || "").trim();
     $("#git-out").textContent = "dry-running…";
     const r = await api(`/api/servers/${CURRENT}/git/sync`, {
-      method: "POST", body: JSON.stringify({ dry_run: true }),
+      method: "POST", body: JSON.stringify({ dry_run: true, token: tok || null }),
     });
     $("#git-out").textContent = JSON.stringify(r, null, 2);
   } catch (e) { $("#git-out").textContent = "ERROR: " + e.message; }
@@ -967,7 +1168,13 @@ function openNewServerModal() {
   modal.hidden = false;
   setTimeout(() => $("#f-name").focus(), 30);
 }
-function closeNewServerModal() { $("#modal-backdrop").hidden = true; }
+function closeNewServerModal() {
+  // Explicitly clear the PAT field even though form.reset() would do it on
+  // next open — defense in depth in case the browser autofills it back.
+  const tokenEl = document.getElementById("f-git-token");
+  if (tokenEl) tokenEl.value = "";
+  $("#modal-backdrop").hidden = true;
+}
 
 // ---------- initial-files staging inside the New Server modal ----------
 
@@ -1142,10 +1349,13 @@ $("#new-server-form").addEventListener("submit", async (ev) => {
     const saveBtn = $("#modal-save");
     saveBtn.disabled = true;
     saveBtn.textContent = "Cloning from git…";
+    const initToken = ($("#f-git-token").value || "").trim();
     try {
       const r = await api(`/api/servers/${sd.name}/git/sync`, {
-        method: "POST", body: JSON.stringify({ dry_run: false }),
+        method: "POST",
+        body: JSON.stringify({ dry_run: false, token: initToken || null }),
       });
+      $("#f-git-token").value = "";   // forget the PAT — never persisted
       showFormError(""); $("#form-error").hidden = true;
       // Keep going — but leave a small breadcrumb in the file-summary line
       const summary = $("#init-file-summary");
@@ -1156,8 +1366,9 @@ $("#new-server-form").addEventListener("submit", async (ev) => {
       saveBtn.disabled = false;
       saveBtn.textContent = "Create Server";
       showFormError(
-        `Server created, but the initial git sync failed:\n${e.message}\n\n` +
-        `Fix the git_source on the server's Git tab, or Cancel to close.`
+        `Server created, but the initial git sync failed:\n\n${e.message}\n\n` +
+        `Fix the git_source on the server's Git tab (paste a PAT into ` +
+        `"PAT for this sync" if the repo is private), or Cancel to close.`
       );
       await refreshServers();
       return;

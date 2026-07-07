@@ -90,7 +90,8 @@ systemctl restart polkit || true
 
 echo "== 7. env file =="
 if [[ ! -f /etc/gamesrv.env ]]; then
-  install -o root -g "$SERVICE_USER" -m 0640 "$APP_DIR/.env.example" /etc/gamesrv.env
+  # Mode 660 root:gamesrv so the manager can WRITE it too (Admin env editor).
+  install -o root -g "$SERVICE_USER" -m 0660 "$APP_DIR/.env.example" /etc/gamesrv.env
   # Generate a token so first boot works.
   TOK="$(python3 -c 'import secrets;print(secrets.token_urlsafe(48))')"
   sed -i "s|^GAMESRV_TOKEN=.*|GAMESRV_TOKEN=${TOK}|" /etc/gamesrv.env
@@ -98,7 +99,10 @@ if [[ ! -f /etc/gamesrv.env ]]; then
   echo "  GAMESRV_TOKEN=${TOK}"
   echo "Save that — you'll paste it into the web UI."
 else
-  echo "/etc/gamesrv.env already exists; leaving alone."
+  # Existing env file: nudge the mode to 660 so the Admin editor can save.
+  chgrp "$SERVICE_USER" /etc/gamesrv.env 2>/dev/null || true
+  chmod 0660           /etc/gamesrv.env 2>/dev/null || true
+  echo "/etc/gamesrv.env already exists; mode nudged to 660 root:$SERVICE_USER for editability."
 fi
 
 systemctl enable gamesrv-manager.service

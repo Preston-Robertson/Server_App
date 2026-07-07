@@ -51,6 +51,17 @@ rcon:
 backup:
   enabled: true
   target: ""                         # blank => world_dir
+
+git_source:                          # optional; leave url blank to disable
+  url: ""                            # https://... or git@host:user/repo
+  ref: ""                            # branch/tag/commit; blank = default branch
+  subdir: ""                         # if server files aren't at repo root
+  world_subdir: ""                   # copied into world_dir instead of install_dir
+  token_env: ""                      # env var name in /etc/gamesrv.env (never inline PAT)
+  exclude: []                        # extra glob patterns; defaults already skip .git, logs, worlds
+  deployed_sha: ""                   # written by sync; read by the UI
+  deployed_ref: ""
+  deployed_at: ""
 ```
 
 ## 3. Workflow

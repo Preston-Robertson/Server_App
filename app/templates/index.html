@@ -244,6 +244,13 @@
                   <input id="g-exclude" placeholder="e.g. logs, *.log, world" />
                 </label>
               </div>
+              <div class="form-row">
+                <label>
+                  <span>PAT for this sync <em>(private repos — <strong>NOT saved</strong>, cleared after each use)</em></span>
+                  <input id="g-token" type="password" autocomplete="off"
+                         placeholder="github_pat_... (paste, sync, forget)" />
+                </label>
+              </div>
               <div class="row">
                 <button type="button" class="btn btn-primary" id="git-save">Save Git Source</button>
                 <button type="button" class="btn"             id="git-status">Check remote</button>
@@ -302,12 +309,34 @@
 
       <article class="widget">
         <header class="widget-header">
+          <h2>Runtime</h2>
+          <span class="chip chip-muted" id="runtime-branch">-</span>
+        </header>
+        <div class="widget-body">
+          <dl class="kv" id="runtime-kv">
+            <dt>Repo</dt>          <dd><code id="rt-repo">-</code></dd>
+            <dt>Python</dt>        <dd><code id="rt-python">-</code> <span class="muted" id="rt-python-ver"></span></dd>
+            <dt>Git branch</dt>    <dd><code id="rt-branch">-</code></dd>
+            <dt>Git HEAD</dt>      <dd><code id="rt-head">-</code></dd>
+            <dt>Last commit</dt>   <dd id="rt-last" class="muted">-</dd>
+            <dt>Manager unit</dt>  <dd><code id="rt-unit">-</code></dd>
+            <dt>Updater unit</dt>  <dd><code id="rt-updater">-</code></dd>
+            <dt>Env file</dt>      <dd><code id="rt-env">-</code></dd>
+          </dl>
+          <div class="row" style="margin-top: 10px;">
+            <button class="btn" id="runtime-refresh">Refresh</button>
+          </div>
+        </div>
+      </article>
+
+      <article class="widget">
+        <header class="widget-header">
           <h2>Authentication</h2>
         </header>
         <div class="widget-body">
           <p class="muted">
-            The bearer token lives in <code>/etc/gamesrv.env</code> on the LXC
-            (<code>GAMESRV_TOKEN=...</code>, mode <code>640 root:gamesrv</code>).
+            The bearer token lives in <code id="admin-envfile-path">/etc/gamesrv.env</code>
+            on the LXC (<code>GAMESRV_TOKEN=...</code>, mode <code>660 root:gamesrv</code>).
             Paste it once and this browser will remember it in
             <code>localStorage</code>.
           </p>
@@ -329,13 +358,15 @@
         </header>
         <div class="widget-body">
           <p class="muted">
-            Pulls the latest commit on the repo's default branch, reinstalls
-            pinned Python requirements into the venv, restarts the manager,
-            health-checks <code>/healthz</code>, and automatically rolls back
-            on failure. Full detail in <code>update.sh</code> / <code>README.md</code>.
+            <strong>Update</strong> pulls the latest commit on the repo's default branch,
+            reinstalls pinned Python requirements into the venv, restarts the manager,
+            health-checks <code>/healthz</code>, and auto-rolls back on failure.
+            <strong>Restart</strong> bounces the manager <em>without</em> pulling —
+            handy after editing env values below (env is only read at startup).
           </p>
           <div class="row">
-            <button class="btn btn-primary" id="manager-update">Update Manager from GitHub</button>
+            <button class="btn btn-primary" id="manager-update">Update from GitHub</button>
+            <button class="btn btn-danger"  id="manager-restart">Restart</button>
             <button class="btn" id="refresh-update-log">Refresh log</button>
             <label class="row" style="margin:0;">
               <input type="checkbox" id="follow-update-log" />
@@ -344,6 +375,29 @@
           </div>
           <p class="muted" style="font-size:12px;">Log file: <code>/opt/gamesrv/logs/update.log</code></p>
           <pre id="update-log-out">(no data yet — click Refresh log)</pre>
+        </div>
+      </article>
+
+      <article class="widget">
+        <header class="widget-header">
+          <h2>Environment file</h2>
+          <span class="chip chip-muted" id="env-path-chip">-</span>
+        </header>
+        <div class="widget-body">
+          <p class="muted">
+            Managed keys have proper labels and validation; extra keys already
+            in the file (per-server RCON passwords, git PATs, etc.) show up in
+            their own section. Secrets left blank on save keep their current
+            value — an empty submit won't wipe your token. After saving, hit
+            <strong>Restart</strong> above so the new values take effect.
+          </p>
+          <div id="env-writable-warn" class="form-error" hidden></div>
+          <form id="env-form"></form>
+          <div class="row" style="margin-top: 12px;">
+            <button class="btn btn-primary" id="env-save">Save Environment</button>
+            <button class="btn" id="env-reload">Reload from disk</button>
+            <span id="env-status" class="muted"></span>
+          </div>
         </div>
       </article>
 
@@ -519,6 +573,13 @@
                 <label>
                   <span>World subdir <em>(copied into world_dir; e.g. <code>world</code>)</em></span>
                   <input name="git_world_subdir" id="f-git-world-subdir" placeholder="(none)" />
+                </label>
+              </div>
+              <div class="form-row">
+                <label>
+                  <span>PAT for initial clone <em>(private repos — <strong>NOT saved</strong>)</em></span>
+                  <input name="git_token" id="f-git-token" type="password" autocomplete="off"
+                         placeholder="github_pat_... (paste, clone, forget)" />
                 </label>
               </div>
             </fieldset>

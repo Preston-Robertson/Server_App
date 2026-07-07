@@ -13,6 +13,7 @@ the button, log file doesn't exist yet, tell the user what happened".
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -118,3 +119,56 @@ def _touch_log_marker(msg: str) -> None:
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as f:
         f.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] {msg}\n")
+
+
+# ---------- runtime info (Admin → Runtime widget) ----------
+
+import sys
+from pathlib import Path
+
+
+def _git_call(args: list[str]) -> str:
+    r = subprocess.run(
+        ["git", "-C", str(settings.app_dir), *args],
+        capture_output=True, text=True, timeout=6,
+    )
+    return (r.stdout or "").strip()
+
+
+def runtime_info() -> dict:
+    """Everything the Admin → Runtime widget shows. Cheap enough to call on
+    every page load — a handful of subprocess.run() calls."""
+    repo_dir = Path(settings.app_dir)
+    is_git = (repo_dir / ".git").exists()
+
+    git_branch = git_head = git_last = ""
+    if is_git:
+        git_branch = _git_call(["rev-parse", "--abbrev-ref", "HEAD"]) or "(detached)"
+        git_head   = _git_call(["rev-parse", "--short=12", "HEAD"])
+        git_last   = _git_call(["log", "-1", "--pretty=format:%s (%h, %ar)"])
+
+    return {
+        "repo_dir":    str(repo_dir),
+        "is_git":      is_git,
+        "git_branch":  git_branch,
+        "git_head":    git_head,
+        "git_last":    git_last,
+        "python_exe":  sys.executable,
+        "python_ver":  sys.version.split()[0],
+        "unit":        "gamesrv-manager.service",
+        "updater_unit": UPDATER_UNIT,
+        "env_file":    os.environ.get("GAMESRV_ENV_FILE", "/etc/gamesrv.env"),
+    }
+
+
+# ---------- restart ----------
+
+def request_restart() -> dict:
+    """Ask the manager to exit; systemd (Restart=always on the unit) brings
+    it back with the current code. No git pull, no pip — just bounce."""
+    import threading
+    def _exit_soon():
+        time.sleep(0.6)
+        os._exit(0)  # noqa: SLF001
+    threading.Thread(target=_exit_soon, daemon=True).start()
+    return {"ok": True, "message": "manager will exit in ~0.6s; systemd will restart it"}

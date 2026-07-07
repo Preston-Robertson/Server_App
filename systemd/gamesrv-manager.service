@@ -12,7 +12,9 @@ Group=gamesrv
 EnvironmentFile=/etc/gamesrv.env
 WorkingDirectory=/opt/gamesrv
 ExecStart=/opt/gamesrv/run_manager.sh
-Restart=on-failure
+# Restart=always so the Admin → Restart button (which just calls os._exit(0))
+# actually brings the manager back. Also survives crashes.
+Restart=always
 RestartSec=5
 
 # Hardening — Preston runs this LAN-only behind UFW, but defense in depth.
