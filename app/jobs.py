@@ -10,6 +10,7 @@ mean daemonising steamcmd, which is overkill for a homelab dashboard.
 """
 from __future__ import annotations
 
+import sys
 import threading
 import time
 import traceback
@@ -132,12 +133,23 @@ class _Registry:
                     if not job.progress.phase:
                         job.progress.phase = "complete"
             except Exception as e:
+                # Log the full traceback to stderr so it lands in the
+                # manager's journal (journalctl -u gamesrv-manager). The
+                # job record only keeps the exception summary + last line,
+                # which is not enough to diagnose template errors, missing
+                # attributes, or filesystem permission issues.
+                tb = traceback.format_exc()
+                print(
+                    f"[jobs] {kind} for server={server!r} failed: {type(e).__name__}: {e}\n{tb}",
+                    file=sys.stderr, flush=True,
+                )
                 with self._lock:
                     job.ok = False
                     job.error = f"{type(e).__name__}: {e}"
                     job.tail.append("ERROR: " + job.error)
-                    last = traceback.format_exc().splitlines()[-1:]
-                    for line in last:
+                    # Keep the last few tb lines so the dashboard shows
+                    # enough context without polling the journal.
+                    for line in tb.splitlines()[-6:]:
                         job.tail.append(line)
             finally:
                 with self._lock:
