@@ -170,17 +170,40 @@ def probe_mc_slp(host: str, port: int, timeout: float = PROBE_TIMEOUT_SEC) -> Op
 
 # ---------- probe strategy per server type -----------------------------
 
+# Must stay in sync with wake_proxy.WAKE_INTERNAL_OFFSET. Kept as a local
+# copy so watchdog stays independent of the wake_proxy import graph.
+_WAKE_INTERNAL_OFFSET = 10000
+
+
 def _probe_for(sd) -> Optional[ProbeResult]:
     """Dispatch to the correct probe. Returns None if the server type has
     no supported probe strategy (custom type, unknown steamcmd game)."""
     host = "127.0.0.1"
+    # When wake-on-demand is on, the manager's wake-proxy owns the public
+    # port and the game process binds ``sd.port + WAKE_INTERNAL_OFFSET``.
+    # Probing the public port for Minecraft would hit the wake-proxy's own
+    # SLP responder — which always answers "0/20 players, server is asleep"
+    # — so the watchdog would think the server is empty forever and stop
+    # it out from under the currently-connected players. Probe the game's
+    # real internal port instead.
+    #
+    # For Steam UDP wake, the wake-proxy transparently relays 27015/UDP
+    # (A2S) through to the game once it's running, so A2S on 27015 still
+    # works correctly and doesn't need remapping.
     if sd.type == "steamcmd":
         if not sd.steam_app_id:
             return None
         query_port = sd.port if sd.steam_app_id in _SINGLE_PORT_STEAM_APPS else 27015
+        # Single-port Steam games (Satisfactory) share the game socket with
+        # A2S — remap to the internal port when wake is on.
+        if getattr(sd, "wake_on_demand", False) and sd.steam_app_id in _SINGLE_PORT_STEAM_APPS:
+            query_port = sd.port + _WAKE_INTERNAL_OFFSET
         return probe_a2s(host, query_port)
     if sd.type in ("minecraft-java", "minecraft-forge"):
-        return probe_mc_slp(host, sd.port)
+        port = sd.port
+        if getattr(sd, "wake_on_demand", False):
+            port = sd.port + _WAKE_INTERNAL_OFFSET
+        return probe_mc_slp(host, port)
     return None
 
 

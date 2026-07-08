@@ -1382,19 +1382,56 @@ $("#logs-follow").addEventListener("change", (ev) => {
   if (ev.target.checked) LOGS_TIMER = setInterval(loadLogs, 2000);
 });
 
-// Console — same log source as the Logs tab, refreshed above the input so
-// you can see the server's response to a command in real time.
+// Console — prefer the game process's own log (Minecraft's logs/latest.log
+// via /game-log) so operators see real events like "Player X joined the
+// game", chat, and mod init lines. Falls back to the manager journal for
+// server types where no game log path is defined server-side. Cached per
+// server to avoid re-probing /game-log every 2s tick.
 let CONSOLE_TIMER = null;
+const CONSOLE_SOURCE = new Map();   // name -> "game-log" | "logs"
+
 async function loadConsoleLog() {
   const n = $("#console-lines").value || 120;
+  const el = $("#console-log-out");
+  const srcLabel = $("#console-source");
+  let source = CONSOLE_SOURCE.get(CURRENT);
+
+  const fetchSource = async (kind) => {
+    const path = kind === "game-log" ? "game-log" : "logs";
+    return api(`/api/servers/${CURRENT}/${path}?lines=${encodeURIComponent(n)}`);
+  };
+
   try {
-    const txt = await api(`/api/servers/${CURRENT}/logs?lines=${encodeURIComponent(n)}`);
-    const el = $("#console-log-out");
+    let txt;
+    if (source === "logs") {
+      txt = await fetchSource("logs");
+    } else {
+      // First try or previously-successful game-log path.
+      try {
+        txt = await fetchSource("game-log");
+        source = "game-log";
+      } catch (e) {
+        // 404 → this server type has no game log. Remember that so we
+        // don't hammer /game-log every 2s.
+        if (String(e.message || e).includes("404")) {
+          source = "logs";
+          txt = await fetchSource("logs");
+        } else {
+          throw e;
+        }
+      }
+      CONSOLE_SOURCE.set(CURRENT, source);
+    }
+    if (srcLabel) {
+      srcLabel.textContent = source === "game-log"
+        ? "source: game log (logs/latest.log)"
+        : "source: systemd journal";
+    }
     const wasAtBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
     el.textContent = txt;
     if (wasAtBottom) el.scrollTop = el.scrollHeight;
   } catch (e) {
-    $("#console-log-out").textContent = "ERROR: " + e.message;
+    el.textContent = "ERROR: " + e.message;
   }
 }
 $("#console-refresh")?.addEventListener("click", loadConsoleLog);

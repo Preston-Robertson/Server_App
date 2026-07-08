@@ -468,6 +468,63 @@ def api_logs(name: str, lines: int = 200) -> str:
     return control.tail_logs(sd, lines=max(1, min(2000, lines)))
 
 
+@app.get("/api/servers/{name}/game-log", response_class=PlainTextResponse, dependencies=[Depends(require_token)])
+def api_game_log(name: str, lines: int = 200) -> str:
+    """Tail the game process's own log file (Minecraft's logs/latest.log).
+
+    The `/logs` endpoint returns the systemd journal, which for tmux-hosted
+    game servers only shows manager/start.sh output — not the game's own
+    stdout with player joins, chat, mod init lines, etc. This endpoint
+    exposes the game log directly so operators can see real events.
+
+    Returns 404 for server types whose log location isn't well-defined
+    (custom, generic steamcmd).
+    """
+    sd = registry.load_def(name)
+    log_path = _game_log_path(sd)
+    if log_path is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no known game log for type {sd.type!r}",
+        )
+    if not log_path.exists():
+        return (
+            f"(game log not created yet: {log_path})\n"
+            "Start the server; the log appears once the game process writes to it."
+        )
+    n = max(1, min(2000, lines))
+    # Efficient tail: seek to a byte offset that's a rough overestimate of
+    # `n` lines (Minecraft lines average ~200 bytes but wildly vary with
+    # stack traces), read forward, keep the last `n`. Avoids loading a
+    # multi-MB log into memory when the operator only asked for 200 lines.
+    approx_bytes = n * 512
+    try:
+        size = log_path.stat().st_size
+        with log_path.open("rb") as f:
+            if size > approx_bytes:
+                f.seek(size - approx_bytes)
+                f.readline()   # discard the (likely partial) leading line
+            data = f.read()
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"read failed: {e}") from e
+    text = data.decode("utf-8", errors="replace")
+    tail = text.splitlines()[-n:]
+    return "\n".join(tail)
+
+
+def _game_log_path(sd) -> Optional[Path]:
+    """Return the path to the game's own log file for this server, if any.
+
+    Kept small on purpose: adding new types is a one-line change here.
+    """
+    if sd.type in ("minecraft-java", "minecraft-forge"):
+        return Path(sd.install_dir) / "logs" / "latest.log"
+    # SteamCMD / custom: many games either don't write a stable log file
+    # or use different names per install. Leaving None means the frontend
+    # falls back to the journal view.
+    return None
+
+
 # ---------- files: upload / download / list / delete ----------
 
 @app.get("/api/servers/{name}/files", dependencies=[Depends(require_token)])
