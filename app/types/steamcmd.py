@@ -1,19 +1,32 @@
-"""SteamCMD-based dedicated servers (Palworld, Valheim, ARK, etc.).
+"""SteamCMD-based dedicated servers (Palworld, Satisfactory, Valheim, ARK, etc.).
 
 We shell out to `steamcmd` to install/update. The user provides steam_app_id
-in the server YAML (Palworld = 2394010). Anonymous login covers most
-free-to-host dedicated servers.
+in the server YAML (Palworld = 2394010, Satisfactory = 1690800). Anonymous
+login covers most free-to-host dedicated servers.
 
 Palworld notes (baked into the default start.sh):
   - Binary lives at Pal/Binaries/Linux/PalServer-Linux-Shipping
   - Also ships a top-level PalServer.sh wrapper — we call that.
   - Save data lives in Pal/Saved — we symlink Saved -> world_dir so the
     NFS bind mount holds saves.
+
+Satisfactory notes:
+  - Binary is FactoryServer.sh (top-level wrapper); single UDP port since
+    Update 8 / 1.0 (game + query on the same port).
+  - Saves live at $HOME/.config/Epic/FactoryGame/Saved on Linux, so the
+    recipe pins HOME to install_dir and symlinks that Saved dir onto
+    world_dir. Drop your existing .sav under world_dir/SaveGames/server/
+    after Install.
 """
 from __future__ import annotations
 
+import os
+import re
+import select
 import shutil
 import subprocess
+import time
+from collections import deque
 
 from .base import TypeHandler
 
@@ -61,18 +74,467 @@ fi
 
 # --- built-in run-command recipes per known app id ---------------------------
 # Extend this dict when adding a new SteamCMD game.
+#   name       — short label (informational)
+#   run        — argv template; {name} and {port} are substituted
+#   saves_rel  — path under install_dir that gets symlinked to world_dir
+#                (None = no symlink; game writes saves inside install_dir)
+#   env        — optional dict of extra env vars written to server.env;
+#                {install_dir} and {world_dir} are substituted. Use this to
+#                pin HOME for games that write saves under $HOME (Satisfactory).
+#   wine       — True for Windows-only servers we run under Wine (Enshrouded).
+#                Also implies steamcmd_platform="windows" so the Windows
+#                depot is downloaded. `run` should be the .exe path — the
+#                handler wraps it in `wine ...` and sets WINEPREFIX.
+#   steamcmd_platform — "linux" (default) or "windows".
 _APP_RECIPES: dict[int, dict] = {
     2394010: {  # Palworld dedicated
         "name": "palworld",
         "run": "./PalServer.sh -port={port} -useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS",
         "saves_rel": "Pal/Saved",
     },
+    1690800: {  # Satisfactory dedicated
+        "name": "satisfactory",
+        "run": "./FactoryServer.sh -Port={port} -log -unattended",
+        # HOME is pinned so Epic/FactoryGame/Saved lands inside install_dir,
+        # which we then symlink to world_dir below.
+        "saves_rel": ".config/Epic/FactoryGame/Saved",
+        "env": {"HOME": "{install_dir}"},
+    },
+    376030: {   # ARK: Survival Evolved dedicated (the ORIGINAL, not Ascended)
+        # Ports: {port}/udp game + 27015/udp query + {port+1}/udp raw. Only
+        # {port} and 27015 need to be open; the raw port is peer-to-peer.
+        # Map is TheIsland by default — override by hand-editing start.sh
+        # (or add a per-server recipe override later).
+        "name": "ark-se",
+        "run": "./ShooterGame/Binaries/Linux/ShooterGameServer TheIsland?SessionName={name}?listen?Port={port}?QueryPort=27015 -server -log",
+        "saves_rel": "ShooterGame/Saved",
+    },
+    2430930: {  # ARK: Survival Ascended dedicated (Unreal 5, MUCH heavier)
+        # Native Linux server support has been patchy across releases; if
+        # steamcmd installs Windows-only files (no ShooterGame/Binaries/Linux)
+        # you'll need to run it under Wine — that's a separate track we'll
+        # add later. Map names use the _WP suffix (World Partition), e.g.
+        # TheIsland_WP, ScorchedEarth_WP, Aberration_WP.
+        "name": "ark-sa",
+        "run": "./ShooterGame/Binaries/Linux/ArkAscendedServer TheIsland_WP?SessionName={name}?listen?Port={port}?QueryPort=27015 -server -log",
+        "saves_rel": "ShooterGame/Saved",
+    },
     896660: {   # Valheim dedicated
         "name": "valheim",
         "run": "./valheim_server.x86_64 -name '{name}' -port {port} -world 'Dedicated' -password 'CHANGE_ME_IN_START_SH' -public 0",
         "saves_rel": ".config/unity3d/IronGate/Valheim",
     },
+    2278520: {  # Enshrouded Dedicated Server (Windows-only binary → Wine)
+        # Enshrouded ships a Windows-only .exe. We install the Windows depot
+        # via steamcmd (+@sSteamCmdForcePlatformType windows) and run it
+        # under Wine. Reads enshrouded_server.json in the install dir for
+        # port + password config (the handler writes/patches it on Install
+        # from ServerDef.passwords + port). Saves land in savegame/ which
+        # we symlink to world_dir. Default game/query ports: 15636 / 15637.
+        "name": "enshrouded",
+        "run": "./enshrouded_server.exe",
+        "saves_rel": "savegame",
+        "wine": True,
+        "steamcmd_platform": "windows",
+    },
 }
+
+
+# --- progress parsing --------------------------------------------------------
+# SteamCMD emits two shapes we care about:
+#
+#   "Update state (0x61) downloading, progress: 45.30 (4746854400 / 10485760000)"
+#     -> phase="downloading", percent=45.30, bytes_done/total
+#
+#   "[ 45%] Downloading update (4634 of 10240 KB)..."
+#     -> percent + phase text (used during the early "checking / verifying"
+#        stages before the numeric Update state lines appear)
+#
+# Success line: "Success! App '2394010' fully installed."
+_PROGRESS_RE = re.compile(
+    r"Update state \(0x[0-9a-fA-F]+\)\s+([^,]+?),\s+progress:\s+([\d.]+)\s+\((\d+)\s*/\s*(\d+)\)"
+)
+_BRACKET_RE = re.compile(r"^\[\s*(\d+)%\]\s*(.+?)\s*$")
+_SUCCESS_RE = re.compile(r"Success!\s+App\s+'(\d+)'\s+fully installed", re.IGNORECASE)
+
+# Timeout for the whole steamcmd invocation. Palworld ~4 GB, Satisfactory
+# ~7 GB, ARK 20+ GB — on a slow connection an hour can be tight, so 2h.
+_STEAMCMD_TIMEOUT_SEC = 60 * 60 * 2
+
+
+def _parse_line(line: str) -> dict | None:
+    """Turn a steamcmd stdout line into a progress event, or None."""
+    m = _PROGRESS_RE.search(line)
+    if m:
+        try:
+            return {
+                "phase": m.group(1).strip(),
+                "percent": float(m.group(2)),
+                "bytes_done": int(m.group(3)),
+                "bytes_total": int(m.group(4)),
+            }
+        except ValueError:
+            return None
+    if _SUCCESS_RE.search(line):
+        return {"phase": "complete", "percent": 100.0}
+    m = _BRACKET_RE.match(line)
+    if m:
+        try:
+            return {
+                "phase": m.group(2).strip(" ."),
+                "percent": float(m.group(1)),
+            }
+        except ValueError:
+            return None
+    return None
+
+
+def _stream_steamcmd(cmd: list[str], on_event) -> tuple[int, str]:
+    """Run steamcmd; stream stdout line-by-line into on_event({...}).
+
+    Handles both \\n-terminated lines and steamcmd's \\r-updated download
+    progress (which would otherwise be one giant line). Returns
+    (returncode, tail_str) where tail_str is the last ~40 lines for logs.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+    assert proc.stdout is not None
+    fd = proc.stdout.fileno()
+    # Non-blocking so we can service \r-only "carriage return" progress
+    # updates without waiting for a full line.
+    try:
+        os.set_blocking(fd, False)
+    except (OSError, AttributeError):
+        pass
+
+    tail: deque[str] = deque(maxlen=40)
+    buf = b""
+    started = time.monotonic()
+
+    def _emit_line(raw: str) -> None:
+        line = raw.rstrip()
+        if not line:
+            return
+        tail.append(line)
+        event = {"line": line}
+        parsed = _parse_line(line)
+        if parsed:
+            event.update(parsed)
+        on_event(event)
+
+    try:
+        while True:
+            try:
+                ready, _, _ = select.select([fd], [], [], 0.5)
+            except (OSError, ValueError):
+                ready = []
+            if ready:
+                try:
+                    chunk = os.read(fd, 4096)
+                except (BlockingIOError, OSError):
+                    chunk = b""
+                if not chunk:
+                    if proc.poll() is not None:
+                        break
+                else:
+                    buf += chunk
+                    parts = re.split(rb"[\r\n]+", buf)
+                    buf = parts[-1]
+                    for raw in parts[:-1]:
+                        _emit_line(raw.decode("utf-8", "replace"))
+            elif proc.poll() is not None:
+                break
+
+            if time.monotonic() - started > _STEAMCMD_TIMEOUT_SEC:
+                proc.kill()
+                raise RuntimeError(
+                    f"steamcmd timed out after {_STEAMCMD_TIMEOUT_SEC // 60} minutes"
+                )
+
+        if buf:
+            _emit_line(buf.decode("utf-8", "replace"))
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+    return proc.returncode, "\n".join(tail)
+
+
+# ---------- per-game password injection --------------------------------------
+
+# Characters that break the game's own parsing when embedded inline. We
+# don't try to escape — we refuse (with a clear message) so the operator
+# picks a saner password.
+_PW_FORBIDDEN_ARK = set('?&"\' ')
+_PW_FORBIDDEN_VALHEIM = set('"\' ')
+
+
+def _apply_ark_passwords(run_cmd: str, server_pw: str, admin_pw: str) -> tuple[str, str]:
+    """Append ?ServerPassword=... / ?ServerAdminPassword=... to ARK's URL.
+
+    ARK's launch string is ``<Map>?<key1=val1>?<key2=val2> -server -log``.
+    We insert our password params just before the first `` -``-prefixed
+    switch (safe because our recipe never uses `` -`` inside the URL).
+    """
+    parts: list[str] = []
+    for label, val, key in (
+        ("server_password", server_pw, "ServerPassword"),
+        ("admin_password", admin_pw, "ServerAdminPassword"),
+    ):
+        if not val:
+            continue
+        if any(c in _PW_FORBIDDEN_ARK for c in val):
+            return run_cmd, (
+                f"WARNING: ARK {label} contains forbidden chars "
+                f"(any of `{''.join(sorted(_PW_FORBIDDEN_ARK))}`); skipped injection."
+            )
+        parts.append(f"?{key}={val}")
+    if not parts:
+        return run_cmd, ""
+    insertion = "".join(parts)
+    # Split at first " -" (start of a launch switch).
+    idx = run_cmd.find(" -")
+    if idx < 0:
+        new_cmd = run_cmd + insertion
+    else:
+        new_cmd = run_cmd[:idx] + insertion + run_cmd[idx:]
+    return new_cmd, f"ARK: injected {len(parts)} password param(s) into launch URL"
+
+
+def _apply_valheim_passwords(run_cmd: str, server_pw: str) -> tuple[str, str]:
+    """Replace the recipe's placeholder password with the real one.
+
+    Valheim has no separate admin password (admins are steamID64 lines in
+    adminlist.txt); we only touch the server-join password here.
+    """
+    if not server_pw:
+        return run_cmd, ""
+    if any(c in _PW_FORBIDDEN_VALHEIM for c in server_pw):
+        return run_cmd, (
+            "WARNING: Valheim password contains spaces or quotes; skipped injection. "
+            "Pick a password without those characters."
+        )
+    # Recipe's placeholder is literal 'CHANGE_ME_IN_START_SH'.
+    if "CHANGE_ME_IN_START_SH" not in run_cmd:
+        return run_cmd, "NOTE: Valheim recipe placeholder not found; leaving run_cmd alone."
+    return (
+        run_cmd.replace("CHANGE_ME_IN_START_SH", server_pw),
+        "Valheim: injected server password into -password arg",
+    )
+
+
+# Palworld config editing — the game reads a single monolithic
+# OptionSettings=(K=V,K=V,...) line inside
+# Pal/Saved/Config/LinuxServer/PalWorldSettings.ini.
+_PALWORLD_KV_RE = re.compile(r'([A-Za-z]+)=("(?:[^"\\]|\\.)*")')
+
+
+# Offset applied by wake-on-demand: the game process binds public_port +
+# this, and the wake proxy owns the public port. Kept in sync with
+# app/wake_proxy.py WAKE_INTERNAL_OFFSET.
+_WAKE_INTERNAL_OFFSET = 10000
+
+
+def _effective_game_port(sd) -> int:
+    """Port the game process actually binds.
+
+    - Without wake-on-demand: the operator-facing `sd.port` (unchanged).
+    - With wake-on-demand: sd.port + 10000, so the wake proxy can own the
+      public port and relay traffic.
+    """
+    if getattr(sd, "wake_on_demand", False):
+        return sd.port + _WAKE_INTERNAL_OFFSET
+    return sd.port
+
+
+def _apply_palworld_passwords(install_dir, server_pw: str, admin_pw: str) -> str:
+    """Copy DefaultPalWorldSettings.ini if needed and set the passwords."""
+    default_ini = install_dir / "DefaultPalWorldSettings.ini"
+    target_ini = install_dir / "Pal" / "Saved" / "Config" / "LinuxServer" / "PalWorldSettings.ini"
+
+    if target_ini.exists():
+        text = target_ini.read_text(encoding="utf-8")
+    elif default_ini.exists():
+        target_ini.parent.mkdir(parents=True, exist_ok=True)
+        text = default_ini.read_text(encoding="utf-8")
+    else:
+        return (
+            "WARNING: Palworld DefaultPalWorldSettings.ini not found; "
+            "passwords NOT applied. Complete the install first, then set "
+            "passwords manually in Pal/Saved/Config/LinuxServer/PalWorldSettings.ini."
+        )
+
+    changed: list[str] = []
+
+    def _set(text: str, key: str, val: str) -> str:
+        # Substitute an existing key=value pair (quoted); leaves other keys
+        # untouched. Palworld quotes even numeric strings so we require the
+        # existing pattern to be `Key="..."`.
+        safe = val.replace('"', "'")   # Palworld disallows inline double quotes
+        pattern = re.compile(rf'({re.escape(key)}=)"([^"]*)"')
+        if not pattern.search(text):
+            return text
+        return pattern.sub(lambda m: f'{m.group(1)}"{safe}"', text)
+
+    if server_pw:
+        new_text = _set(text, "ServerPassword", server_pw)
+        if new_text != text:
+            changed.append("ServerPassword")
+            text = new_text
+    if admin_pw:
+        new_text = _set(text, "AdminPassword", admin_pw)
+        if new_text != text:
+            changed.append("AdminPassword")
+            text = new_text
+
+    if not changed:
+        return "NOTE: Palworld password keys not found in settings template; nothing changed."
+
+    target_ini.write_text(text, encoding="utf-8")
+    return f"Palworld: wrote {target_ini.name} with updated {', '.join(changed)}"
+
+
+# ---------- Enshrouded (JSON config) -----------------------------------------
+
+def _apply_enshrouded_config(install_dir, name: str, port: int,
+                             server_pw: str, admin_pw: str) -> str:
+    """Create or patch enshrouded_server.json in install_dir.
+
+    Enshrouded's dedicated server ships with a JSON config next to the .exe.
+    Field of interest:
+      - gamePort  (default 15636)
+      - queryPort (default 15637, must be gamePort + 1)
+      - name      (server list display name)
+      - userGroups[].password  — one entry per group; we set 'Admin' and 'Guest'.
+
+    If the file already exists we surgically update those fields (preserving
+    every other field the operator may have hand-tuned). If it doesn't, we
+    write a minimal template.
+    """
+    import json as _json
+
+    cfg_path = install_dir / "enshrouded_server.json"
+    game_port = port
+    query_port = port + 1
+
+    if cfg_path.exists():
+        try:
+            cfg = _json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            return f"WARNING: existing enshrouded_server.json unparseable ({e}); left alone."
+    else:
+        cfg = {
+            "name": name,
+            "password": "",
+            "saveDirectory": "./savegame",
+            "logDirectory": "./logs",
+            "ip": "0.0.0.0",
+            "gamePort": game_port,
+            "queryPort": query_port,
+            "slotCount": 16,
+            "voiceChatMode": "Proximity",
+            "userGroups": [
+                {"name": "Admin", "password": "", "canKickBan": True,
+                 "canAccessInventories": True, "canEditBase": True,
+                 "canExtendBase": True, "reservedSlots": 0},
+                {"name": "Guest", "password": "", "canKickBan": False,
+                 "canAccessInventories": True, "canEditBase": True,
+                 "canExtendBase": False, "reservedSlots": 0},
+            ],
+        }
+
+    changed: list[str] = []
+
+    if cfg.get("gamePort") != game_port:
+        cfg["gamePort"] = game_port
+        changed.append("gamePort")
+    if cfg.get("queryPort") != query_port:
+        cfg["queryPort"] = query_port
+        changed.append("queryPort")
+
+    groups = cfg.get("userGroups") or []
+    def _set_group_pw(group_name: str, pw: str, label: str) -> None:
+        for g in groups:
+            if str(g.get("name", "")).lower() == group_name.lower():
+                if g.get("password") != pw:
+                    g["password"] = pw
+                    changed.append(f"userGroups[{group_name}].password")
+                return
+        # Group not found — append it (rare, but keep behaviour sane).
+        groups.append({"name": group_name, "password": pw})
+        changed.append(f"userGroups[+{group_name}]")
+
+    if admin_pw:
+        _set_group_pw("Admin", admin_pw, "Admin")
+    if server_pw:
+        _set_group_pw("Guest", server_pw, "Guest")
+    cfg["userGroups"] = groups
+
+    cfg_path.write_text(_json.dumps(cfg, indent=2), encoding="utf-8")
+    if not changed:
+        return "Enshrouded: enshrouded_server.json already matched YAML; no changes."
+    return f"Enshrouded: wrote enshrouded_server.json ({', '.join(changed)})"
+
+
+# ---------- Wine wrapper -----------------------------------------------------
+
+# Wrap the recipe's `run` (a path to a .exe) in Wine, with WINEPREFIX/DEBUG
+# baked into start.sh so the systemd unit doesn't need any extra env plumbing.
+def _wine_wrap_run_cmd(run_cmd: str) -> str:
+    return (
+        'WINEPREFIX="$(pwd)/.wine" WINEDEBUG=-all WINEARCH=win64 '
+        'wine ' + run_cmd
+    )
+
+
+def _wine_prefix_init(install_dir, on_event=None) -> str:
+    """Idempotently initialise the wineprefix under install_dir/.wine.
+
+    First `wineboot -u` on a fresh prefix takes ~10-30s; subsequent runs
+    are ~1s. Errors are non-fatal — a bad init just means the first game
+    launch will re-attempt.
+    """
+    wine = shutil.which("wine")
+    if not wine:
+        raise RuntimeError(
+            "wine not installed — re-run bootstrap.sh with --with-wine (see docs/ADDING_SERVERS.md §10)."
+        )
+    prefix = install_dir / ".wine"
+    prefix.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.update({
+        "WINEPREFIX": str(prefix),
+        "WINEDEBUG": "-all",
+        "WINEARCH": "win64",
+        "DISPLAY": "",  # explicitly headless — no X server
+    })
+    if on_event:
+        on_event({"phase": "wineboot", "line": f"initialising wineprefix at {prefix}"})
+    try:
+        r = subprocess.run(
+            [wine, "wineboot", "-u"],
+            env=env, capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return f"WARNING: wineboot timed out after 120s (prefix {prefix}); first game launch may re-init."
+    if r.returncode != 0:
+        return (
+            f"WARNING: wineboot exit {r.returncode} — first game launch may re-init.\n"
+            f"stderr tail: {(r.stderr or '')[-400:]}"
+        )
+    return f"Wine: initialised prefix {prefix}"
 
 
 class SteamCmdHandler(TypeHandler):
@@ -86,10 +548,20 @@ class SteamCmdHandler(TypeHandler):
         if not steamcmd:
             raise RuntimeError("steamcmd not installed — run: sudo apt install steamcmd (or see docs)")
 
+        # Look up the recipe up front so we know whether this is a Wine game
+        # (which controls the steamcmd platform switch below).
+        recipe = _APP_RECIPES.get(self.sd.steam_app_id, {
+            "name": "generic",
+            "run": self.sd.start_cmd or "./start.sh",
+            "saves_rel": None,
+        })
+        steamcmd_platform = recipe.get("steamcmd_platform", "linux")
+        uses_wine = bool(recipe.get("wine"))
+
         # Anonymous install/update. +force_install_dir must come BEFORE +login.
         cmd = [
             steamcmd,
-            "+@sSteamCmdForcePlatformType", "linux",
+            "+@sSteamCmdForcePlatformType", steamcmd_platform,
             "+force_install_dir", str(self.install_dir),
             "+login", "anonymous",
             "+app_update", str(self.sd.steam_app_id),
@@ -99,20 +571,111 @@ class SteamCmdHandler(TypeHandler):
         cmd += ["validate", "+quit"]
 
         msgs.append(f"running: {' '.join(cmd)}")
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 60)
-        # SteamCMD prints a lot; keep the last ~30 lines for the UI response.
-        tail = "\n".join((r.stdout + r.stderr).splitlines()[-30:])
+        self._emit(phase="starting steamcmd", percent=0.0, line=" ".join(cmd))
+
+        rc, tail = _stream_steamcmd(cmd, lambda ev: self._emit(**ev))
         msgs.append(tail)
-        if r.returncode != 0:
-            raise RuntimeError(f"steamcmd failed (exit {r.returncode}):\n{tail}")
+        if rc != 0:
+            raise RuntimeError(f"steamcmd failed (exit {rc}):\n{tail}")
 
-        recipe = _APP_RECIPES.get(self.sd.steam_app_id, {
-            "name": "generic",
-            "run": self.sd.start_cmd or "./start.sh",
-            "saves_rel": None,
-        })
+        self._emit(phase="finalising", percent=100.0, line="writing start.sh + stop.sh")
 
-        run_cmd = recipe["run"].format(name=self.sd.name, port=self.sd.port)
+        game_port = _effective_game_port(self.sd)
+        run_cmd = recipe["run"].format(name=self.sd.name, port=game_port)
+        if self.sd.wake_on_demand:
+            msgs.append(
+                f"wake-on-demand: game will bind :{game_port} internally; "
+                f"wake-proxy owns public :{self.sd.port}"
+            )
+
+        # Wine wrap (Windows binaries run through Wine). Do this AFTER the
+        # per-game password / access blocks below so any switches they added
+        # to run_cmd stay inside the wine invocation.
+
+        # --- access control -------------------------------------------------
+        # Per-game translation of ServerDef.access.mode. We handle steamid
+        # allowlists inline here (writing config files + amending the run
+        # command); the ip_allowlist mode is enforced at the firewall by
+        # the separate gamesrv-firewall helper.
+        access = self.sd.access
+        if access.mode == "steamid_allowlist":
+            n = len(access.allowed_steamids)
+            if self.sd.steam_app_id in (376030, 2430930):
+                # ARK: SE / Ascended. PlayerExclusiveJoinList.txt lists the
+                # steamID64s that are allowed to join when -exclusivejoin is
+                # on the command line. Empty file + -exclusivejoin locks
+                # everyone out, which is safe-fail behaviour.
+                saved = self.install_dir / "ShooterGame" / "Saved"
+                saved.mkdir(parents=True, exist_ok=True)
+                (saved / "PlayerExclusiveJoinList.txt").write_text(
+                    "\n".join(access.allowed_steamids) + ("\n" if n else ""),
+                    encoding="utf-8",
+                )
+                if " -exclusivejoin" not in run_cmd:
+                    run_cmd += " -exclusivejoin"
+                msgs.append(f"ARK: wrote PlayerExclusiveJoinList.txt ({n} entries) + enabled -exclusivejoin")
+            else:
+                # Games without a native Steam ID whitelist. Warn loudly so
+                # the operator knows the setting isn't enforced by the game
+                # (they need password + ip_allowlist to lock it down).
+                msgs.append(
+                    f"WARNING: access.mode=steamid_allowlist but app_id "
+                    f"{self.sd.steam_app_id} has no native Steam ID whitelist. "
+                    "Set a password in the game's config and/or use ip_allowlist."
+                )
+        elif access.mode == "ip_allowlist":
+            msgs.append(
+                f"NOTE: access.mode=ip_allowlist with {len(access.allowed_ips)} entries. "
+                "Enforcement is at the firewall (see docs/ADDING_SERVERS.md#access-control)."
+            )
+
+        # --- passwords -------------------------------------------------------
+        # Per-game injection. Each helper mutates run_cmd (returning the new
+        # value) and appends a message describing what it did.
+        pw = self.sd.passwords
+        if pw.server_password or pw.admin_password:
+            if self.sd.steam_app_id == 2394010:
+                m = _apply_palworld_passwords(self.install_dir, pw.server_password, pw.admin_password)
+                if m: msgs.append(m)
+            elif self.sd.steam_app_id in (376030, 2430930):
+                run_cmd, m = _apply_ark_passwords(run_cmd, pw.server_password, pw.admin_password)
+                if m: msgs.append(m)
+            elif self.sd.steam_app_id == 896660:
+                run_cmd, m = _apply_valheim_passwords(run_cmd, pw.server_password)
+                if m: msgs.append(m)
+            elif self.sd.steam_app_id == 2278520:
+                # Enshrouded — passwords go into userGroups in the JSON config.
+                # Note: passing game_port so the JSON reflects the wake-remapped
+                # port when wake-on-demand is on.
+                m = _apply_enshrouded_config(
+                    self.install_dir, self.sd.name, game_port,
+                    pw.server_password, pw.admin_password,
+                )
+                if m: msgs.append(m)
+            else:
+                msgs.append(
+                    f"NOTE: passwords set but no per-game injection for app_id "
+                    f"{self.sd.steam_app_id}; edit the game's config by hand."
+                )
+
+        # Enshrouded always needs a config file (for its port), even when
+        # passwords aren't set. Ensure one exists.
+        if self.sd.steam_app_id == 2278520 and not (pw.server_password or pw.admin_password):
+            m = _apply_enshrouded_config(
+                self.install_dir, self.sd.name, game_port, "", "",
+            )
+            if m: msgs.append(m)
+
+        # Wine games: initialise the wineprefix (idempotent) and wrap the
+        # run command. Do this AFTER access + password mutations so the wine
+        # invocation covers the final launch argv.
+        if uses_wine:
+            self._emit(phase="wine setup", line="initialising wineprefix")
+            m = _wine_prefix_init(self.install_dir, on_event=lambda ev: self._emit(**ev))
+            if m: msgs.append(m)
+            run_cmd = _wine_wrap_run_cmd(run_cmd)
+            msgs.append(f"Wine: wrapped run command → {run_cmd}")
+
         self.write_script(
             "start.sh",
             _START_TEMPLATE.format(name=self.sd.name, run_cmd=run_cmd),
@@ -138,7 +701,11 @@ class SteamCmdHandler(TypeHandler):
                 saves.symlink_to(self.world_dir)
                 msgs.append(f"symlinked {saves} -> {self.world_dir}")
 
-        env_values = {"GAME_PORT": str(self.sd.port), "MEMORY_MB": str(self.sd.memory_mb)}
+        env_values = {"GAME_PORT": str(game_port), "MEMORY_MB": str(self.sd.memory_mb)}
+        # Recipe-provided env (e.g. HOME for Satisfactory) is applied before
+        # user extras so the user's YAML always wins.
+        for k, v in (recipe.get("env") or {}).items():
+            env_values[k] = v.format(install_dir=self.install_dir, world_dir=self.world_dir)
         env_values.update(self.sd.extra_env)
         self.write_env_file(env_values)
         msgs.append(f"wrote {self.install_dir/'server.env'}")

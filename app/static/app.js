@@ -513,15 +513,75 @@ $("#env-save-and-restart")?.addEventListener("click", async () => {
 async function refreshServers() {
   if (!TOKEN) return;
   try {
-    const rows = await api("/api/servers");
+    // Aggregate stats + per-server list share the same refresh tick so the
+    // header stays in sync with the cards below.
+    const [rows, stats] = await Promise.all([
+      api("/api/servers"),
+      api("/api/stats").catch(() => null),   // stats is best-effort — don't break the whole tick
+    ]);
     renderServerGrid(rows);
     updatePerfHistory(rows);
+    if (stats) renderStatsBar(stats);
     const badge = $("#auth-badge");
     if (badge && badge.classList.contains("err")) { badge.textContent = "token loaded"; badge.className = "ok"; }
   } catch (e) {
     const badge = $("#auth-badge");
     if (badge) { badge.textContent = "auth error — check Admin page"; badge.className = "err"; }
   }
+}
+
+// ---------- Aggregate dashboard stats ----------
+// Populated from /api/stats. Everything is best-effort: if the endpoint
+// hasn't shipped on the server yet, we simply keep the bar hidden.
+
+function renderStatsBar(stats) {
+  const bar = $("#stats-bar");
+  if (!bar) return;
+  bar.hidden = false;
+
+  const s = stats.servers || {};
+  $("#stat-servers").textContent = `${s.running || 0} / ${s.total || 0}`;
+  const bits = [];
+  if (s.failed)  bits.push(`${s.failed} failed`);
+  if (s.stopped) bits.push(`${s.stopped} stopped`);
+  $("#stat-servers-sub").textContent = bits.join(" · ") || "all healthy";
+
+  const ram = stats.ram || {};
+  const ramPct = Number(ram.percent) || 0;
+  $("#stat-ram").textContent = fmtBytes(ram.used_bytes || 0);
+  $("#stat-ram-fill").style.width = Math.min(100, ramPct).toFixed(1) + "%";
+  setBarClass($("#stat-ram-fill"), ramPct);
+  const cap = ram.limit_bytes ? ` / ${fmtBytes(ram.limit_bytes)}` : "";
+  const reserved = ram.reserved_bytes
+    ? ` · ${fmtBytes(ram.reserved_bytes)} reserved`
+    : "";
+  $("#stat-ram-sub").textContent = `${ramPct.toFixed(1)}%${cap}${reserved}`;
+
+  renderDiskStat("worlds",  (stats.disk || {}).worlds_root);
+  renderDiskStat("install", (stats.disk || {}).install_root);
+
+  const up = (stats.manager || {}).uptime_sec;
+  $("#stat-uptime").textContent = up != null ? fmtDur(up) : "—";
+}
+
+function renderDiskStat(key, d) {
+  if (!d) {
+    $(`#stat-${key}`).textContent = "—";
+    $(`#stat-${key}-fill`).style.width = "0%";
+    $(`#stat-${key}-sub`).textContent = "unavailable";
+    return;
+  }
+  const pct = d.total ? (100 * d.used / d.total) : 0;
+  $(`#stat-${key}`).textContent = fmtBytes(d.used);
+  $(`#stat-${key}-fill`).style.width = Math.min(100, pct).toFixed(1) + "%";
+  setBarClass($(`#stat-${key}-fill`), pct);
+  $(`#stat-${key}-sub`).textContent = `${pct.toFixed(1)}% of ${fmtBytes(d.total)}`;
+}
+
+function setBarClass(el, pct) {
+  el.classList.remove("ok", "warn", "err");
+  if (pct >= 90) el.classList.add("err");
+  else if (pct >= 75) el.classList.add("warn");
 }
 
 // ---------- Perf history + sparklines ----------
@@ -637,6 +697,56 @@ function renderServerGrid(rows) {
       ? `${fmtBytes(s.mem_bytes)} / ${d.memory_mb} MB`
       : `— / ${d.memory_mb} MB`;
 
+    // Access-mode chip (public / steamid_allowlist / ip_allowlist).
+    const accessMode = (d.access && d.access.mode) || "public";
+    let accessChip = "";
+    if (accessMode === "steamid_allowlist") {
+      const n = (d.access.allowed_steamids || []).length;
+      accessChip = `<span class="chip chip-lock" title="Steam ID allowlist (${n})">🔒 ${n} IDs</span>`;
+    } else if (accessMode === "ip_allowlist") {
+      const n = (d.access.allowed_ips || []).length;
+      accessChip = `<span class="chip chip-lock" title="IP allowlist (${n})">🔒 ${n} IPs</span>`;
+    }
+
+    // Watchdog / idle-shutdown chip (only when server is running and
+    // idle_shutdown_min is set). Shows current player count and, if empty,
+    // the countdown to auto-shutdown.
+    let idleChip = "";
+    const wd = r.watchdog;
+    if (d.idle_shutdown_min && s.active === "active" && wd) {
+      const pl = wd.players;
+      if (pl == null || !wd.probe_ok) {
+        idleChip = `<span class="chip" title="Waiting for A2S/SLP probe response">👥 —</span>`;
+      } else if (pl > 0) {
+        const max = wd.max_players ? `/${wd.max_players}` : "";
+        idleChip = `<span class="chip chip-ok" title="Players online">👥 ${pl}${max}</span>`;
+      } else {
+        const remainMin = Math.max(0, d.idle_shutdown_min - Math.floor((wd.empty_sec || 0) / 60));
+        idleChip = `<span class="chip chip-warn" title="Empty; auto-shutdown countdown">💤 ${remainMin}m</span>`;
+      }
+    }
+
+    // Wake-on-demand chip. Different label depending on whether the
+    // proxy is currently sleeping (game stopped, awaiting a connection)
+    // or actively waking one up.
+    let wakeChip = "";
+    if (d.wake_on_demand) {
+      const wk = r.wake;
+      if (wk && wk.waking) {
+        wakeChip = `<span class="chip chip-warn" title="Buffered ${wk.buffered_packets} pkts; waking (${wk.waking_sec}s)">🌙 waking…</span>`;
+      } else if (s.active === "active") {
+        wakeChip = `<span class="chip chip-accent" title="Proxy is relaying to :${wk?.internal_port || (d.port + 10000)}">🌙 relay</span>`;
+      } else {
+        wakeChip = `<span class="chip" title="Wake proxy listening — first client packet will start the server">🌙 sleeping</span>`;
+      }
+    }
+
+    // Connect string: what a player types into the game client. Uses the
+    // hostname the operator is currently browsing on (works over LAN, VPN,
+    // and DNS names). Copy button on the right.
+    const host = window.location.hostname || "your-lxc";
+    const connectStr = `${host}:${d.port}`;
+
     const card = document.createElement("div");
     card.className = "server-card" + (CURRENT === d.name ? " selected" : "");
     card.dataset.name = d.name;
@@ -650,6 +760,14 @@ function renderServerGrid(rows) {
         <span class="chip">:${d.port}</span>
         ${s.enabled === "enabled" ? '<span class="chip chip-accent">on boot</span>' : ''}
         ${s.console_available ? '<span class="chip">console</span>' : ''}
+        ${accessChip}
+        ${idleChip}
+        ${wakeChip}
+      </div>
+      <div class="server-card-connect">
+        <span class="connect-label">Connect</span>
+        <code class="connect-str">${escape(connectStr)}</code>
+        <button class="btn btn-tiny btn-ghost" data-copy="${escape(connectStr)}" title="Copy">📋</button>
       </div>
       <div class="server-card-meta">
         <div class="ram-bar" title="${ramLabel}">
@@ -680,6 +798,16 @@ function escape(s) {
 document.addEventListener("click", async (ev) => {
   const t = ev.target;
   if (t.dataset.open)  { ev.preventDefault(); openServer(t.dataset.open); return; }
+  if (t.dataset.copy) {
+    ev.preventDefault(); ev.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(t.dataset.copy);
+      const prev = t.textContent;
+      t.textContent = "✓";
+      setTimeout(() => { t.textContent = prev; }, 900);
+    } catch (e) { alert("Copy failed: " + e.message); }
+    return;
+  }
   if (t.dataset.quick) {
     try {
       await api(`/api/servers/${t.dataset.name}/action`, {
@@ -700,9 +828,109 @@ async function openServer(name) {
   CURRENT = name;
   $("#detail-panel").hidden = false;
   $("#detail-title").textContent = name;
+  // Clear any progress widget carried over from a previously-opened server;
+  // resumeJobIfRunning() below re-shows it if this server has a live job.
+  clearInterval(JOB_TIMER); JOB_TIMER = null;
+  hideProgress();
   showTab("control");
   refreshServers();  // to re-highlight the selected card
   $("#detail-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+  resumeJobIfRunning(name);
+  loadIdleWakePanel(name);
+}
+
+// ---------- Idle / Wake control panel (on the Control tab) ----------
+// Populates + saves the two per-server toggles without needing to touch
+// the raw JSON in the Definition tab. Values live in the ServerDef under
+// idle_shutdown_min / wake_on_demand / wake_timeout_sec.
+
+// Cached snapshot of the def so we can spot whether a save flipped the
+// wake toggle (which requires a Reinstall) and hint accordingly.
+let IW_PREV_DEF = null;
+
+async function loadIdleWakePanel(name) {
+  try {
+    const r = await api(`/api/servers/${name}`);
+    const d = r.def || {};
+    IW_PREV_DEF = d;
+
+    const idleMin = d.idle_shutdown_min || 0;
+    $("#iw-idle-enabled").checked = idleMin > 0;
+    $("#iw-idle-min").value = idleMin > 0 ? idleMin : 20;
+    $("#iw-idle-status").textContent = "";
+
+    $("#iw-wake-enabled").checked = !!d.wake_on_demand;
+    $("#iw-wake-sec").value = d.wake_timeout_sec || 90;
+    $("#iw-wake-status").textContent = "";
+    $("#iw-reinstall-hint").hidden = true;
+  } catch (e) {
+    $("#iw-idle-status").textContent = "ERROR: " + e.message;
+  }
+}
+
+async function _saveDefPatch(name, patch, statusEl) {
+  statusEl.textContent = "saving…";
+  try {
+    const r = await api(`/api/servers/${name}`);
+    const sd = Object.assign({}, r.def, patch);
+    await api("/api/servers", { method: "POST", body: JSON.stringify(sd) });
+    statusEl.textContent = "✓ saved";
+    setTimeout(() => { if (statusEl.textContent === "✓ saved") statusEl.textContent = ""; }, 2500);
+    refreshServers();
+    return sd;
+  } catch (e) {
+    statusEl.textContent = "ERROR: " + e.message;
+    return null;
+  }
+}
+
+$("#iw-save-idle")?.addEventListener("click", async () => {
+  if (!CURRENT) return;
+  const enabled = $("#iw-idle-enabled").checked;
+  const raw = parseInt($("#iw-idle-min").value, 10);
+  const minVal = enabled ? (Number.isFinite(raw) && raw > 0 ? raw : 20) : null;
+  await _saveDefPatch(CURRENT, { idle_shutdown_min: minVal }, $("#iw-idle-status"));
+});
+
+$("#iw-save-wake")?.addEventListener("click", async () => {
+  if (!CURRENT) return;
+  const enabled = $("#iw-wake-enabled").checked;
+  const rawTo = parseInt($("#iw-wake-sec").value, 10);
+  const timeout = Number.isFinite(rawTo) && rawTo >= 10 ? Math.min(600, rawTo) : 90;
+
+  // Guard: public port must fit port + 10000 <= 65535 when enabling.
+  if (enabled && IW_PREV_DEF && IW_PREV_DEF.port && IW_PREV_DEF.port + 10000 > 65535) {
+    $("#iw-wake-status").textContent =
+      "ERROR: public port too high (needs <= 55535 to reserve port+10000 for the game)";
+    return;
+  }
+
+  const toggleChanged = !!(IW_PREV_DEF && IW_PREV_DEF.wake_on_demand !== enabled);
+  const sd = await _saveDefPatch(CURRENT, {
+    wake_on_demand: enabled,
+    wake_timeout_sec: timeout,
+  }, $("#iw-wake-status"));
+  if (sd) {
+    IW_PREV_DEF = sd;
+    // A wake toggle changes the port the game binds. Warn loudly so the
+    // operator remembers to Reinstall before the next start.
+    $("#iw-reinstall-hint").hidden = !toggleChanged;
+  }
+});
+
+// Enter key in the number fields saves the corresponding row.
+$("#iw-idle-min")?.addEventListener("keydown", (e) => { if (e.key === "Enter") $("#iw-save-idle").click(); });
+$("#iw-wake-sec")?.addEventListener("keydown", (e) => { if (e.key === "Enter") $("#iw-save-wake").click(); });
+
+async function resumeJobIfRunning(name) {
+  try {
+    const j = await api(`/api/servers/${name}/job`);
+    if (j.exists && !j.done) {
+      showProgress(j.kind || "install");
+      updateProgress(j);
+      pollJob(name);
+    }
+  } catch (e) { /* no token / no server — silent */ }
 }
 
 function showTab(name) {
@@ -733,17 +961,144 @@ $$(".subtab").forEach(b => b.onclick = () => showTab(b.dataset.tab));
 document.addEventListener("click", async (ev) => {
   const action = ev.target.dataset.action;
   if (!action || !CURRENT) return;
+  // Install and Update Game Software run as background jobs so the UI can
+  // stream a progress bar (SteamCMD downloads can take a while).
+  if (action === "install" || action === "update-type") {
+    await startInstallJob(action);
+    return;
+  }
   try {
-    let path;
-    if (action === "install") path = `/api/servers/${CURRENT}/install`;
-    else if (action === "update-type") path = `/api/servers/${CURRENT}/update`;
-    else path = `/api/servers/${CURRENT}/action`;
-    const opts = { method: "POST" };
-    if (path.endsWith("/action")) opts.body = JSON.stringify({ action });
+    const path = `/api/servers/${CURRENT}/action`;
+    const opts = { method: "POST", body: JSON.stringify({ action }) };
     const r = await api(path, opts);
     $("#control-out").textContent = JSON.stringify(r, null, 2);
     setTimeout(refreshServers, 500);
   } catch (e) { $("#control-out").textContent = "ERROR: " + e.message; }
+});
+
+// ---------- Install / Update / Backup / Restore progress ----------
+// The install, update, backup and restore endpoints all return a job id;
+// we poll GET /api/servers/<name>/job every ~1s and paint the shared
+// progress widget (above the subtabs) until job.done is true.
+
+let JOB_TIMER = null;
+let JOB_SERVER = null;
+
+async function startInstallJob(action) {
+  const kind = action === "install" ? "install" : "update";
+  const path = kind === "install"
+    ? `/api/servers/${CURRENT}/install`
+    : `/api/servers/${CURRENT}/update`;
+  return startJob(kind, path);
+}
+
+async function startJob(kind, path, extra = {}) {
+  $("#control-out").textContent = "";
+  showProgress(kind);
+  const opts = { method: "POST", ...extra };
+  try {
+    await api(path, opts);
+    pollJob(CURRENT);
+  } catch (e) {
+    // 409 = a job is already running for this server — resume polling.
+    if (String(e.message).includes("HTTP 409") && !String(e.message).includes("stop the server")) {
+      pollJob(CURRENT);
+    } else {
+      $("#progress-status").textContent = "failed to start";
+      $("#progress-tail").hidden = false;
+      $("#progress-show-log").checked = true;
+      $("#progress-tail").textContent = "ERROR: " + e.message;
+    }
+  }
+}
+
+function pollJob(server) {
+  clearInterval(JOB_TIMER);
+  JOB_SERVER = server;
+  const tick = async () => {
+    // Stop polling if the user switched servers.
+    if (CURRENT !== JOB_SERVER) { clearInterval(JOB_TIMER); JOB_TIMER = null; return; }
+    try {
+      const j = await api(`/api/servers/${server}/job`);
+      if (!j.exists) { clearInterval(JOB_TIMER); JOB_TIMER = null; return; }
+      updateProgress(j);
+      if (j.done) {
+        clearInterval(JOB_TIMER); JOB_TIMER = null;
+        finalizeProgress(j);
+        setTimeout(refreshServers, 500);
+      }
+    } catch (e) {
+      // Transient error — keep polling; a permanent auth failure will
+      // surface via the auth badge elsewhere.
+      console.warn("job poll failed", e);
+    }
+  };
+  tick();
+  JOB_TIMER = setInterval(tick, 1000);
+}
+
+function showProgress(kind) {
+  $("#install-progress").hidden = false;
+  $("#progress-kind").textContent = kind;
+  $("#progress-phase").textContent = "starting…";
+  $("#progress-status").textContent = "";
+  $("#progress-percent").textContent = "0%";
+  $("#progress-bytes").textContent = "";
+  $("#progress-elapsed").textContent = "";
+  $("#progress-bar-fill").style.width = "0%";
+  $("#progress-bar-fill").classList.remove("ok", "err");
+  $("#progress-tail").textContent = "";
+}
+
+function hideProgress() { $("#install-progress").hidden = true; }
+
+function updateProgress(j) {
+  const p = j.progress || {};
+  const pct = Math.max(0, Math.min(100, Number(p.percent) || 0));
+  $("#progress-bar-fill").style.width = pct.toFixed(2) + "%";
+  $("#progress-percent").textContent = pct.toFixed(1) + "%";
+  $("#progress-phase").textContent = p.phase || (j.done ? (j.ok ? "complete" : "failed") : "working…");
+  $("#progress-kind").textContent = j.kind || "install";
+  const bd = Number(p.bytes_done) || 0;
+  const bt = Number(p.bytes_total) || 0;
+  $("#progress-bytes").textContent = (bd && bt) ? `${fmtBytes(bd)} / ${fmtBytes(bt)}` : "";
+  $("#progress-elapsed").textContent = j.elapsed_sec ? `${fmtDur(Math.round(j.elapsed_sec))} elapsed` : "";
+  const tailEl = $("#progress-tail");
+  const wasAtBottom = tailEl.scrollTop + tailEl.clientHeight >= tailEl.scrollHeight - 10;
+  const lines = (j.tail || []).slice(-100);
+  tailEl.textContent = lines.join("\n");
+  if (wasAtBottom) tailEl.scrollTop = tailEl.scrollHeight;
+}
+
+function finalizeProgress(j) {
+  const fill = $("#progress-bar-fill");
+  if (j.ok) {
+    fill.classList.add("ok");
+    $("#progress-status").textContent = `✓ done in ${fmtDur(Math.round(j.elapsed_sec))}`;
+    $("#control-out").textContent = (j.messages || []).join("\n\n");
+    // Auto-hide on success; keep the log on-screen on failure.
+    setTimeout(() => { if ($("#install-progress").querySelector("#progress-status").textContent.startsWith("✓")) hideProgress(); }, 6000);
+  } else {
+    fill.classList.add("err");
+    $("#progress-status").textContent = `✕ ${j.error || "failed"}`;
+    $("#control-out").textContent = "ERROR: " + (j.error || "install failed") +
+      "\n\n" + (j.tail || []).join("\n");
+    // Force the log open so the user can see what went wrong.
+    $("#progress-show-log").checked = true;
+    $("#progress-tail").hidden = false;
+  }
+  // Refresh state-dependent panels after backup/restore completes.
+  if (j.ok && (j.kind === "backup" || j.kind === "restore")) {
+    loadBackups();
+  }
+}
+
+// Wire progress-widget controls (close + show-log toggle).
+document.addEventListener("DOMContentLoaded", () => {
+  const closeBtn = $("#progress-close");
+  const toggle = $("#progress-show-log");
+  if (closeBtn) closeBtn.onclick = () => hideProgress();
+  if (toggle) toggle.onchange = () => { $("#progress-tail").hidden = !toggle.checked; };
 });
 
 // Console
@@ -1107,22 +1462,16 @@ async function loadBackups() {
 $("#backups-refresh").onclick = loadBackups;
 $("#backup-now").onclick = async () => {
   if (!CURRENT) return;
-  try {
-    const r = await api(`/api/servers/${CURRENT}/backup`, { method: "POST" });
-    $("#backups-out").textContent = JSON.stringify(r, null, 2);
-    loadBackups();
-  } catch (e) { $("#backups-out").textContent = "ERROR: " + e.message; }
+  // Streams progress through the shared job widget above the subtabs.
+  await startJob("backup", `/api/servers/${CURRENT}/backup`);
 };
 document.addEventListener("click", async (ev) => {
   const name = ev.target.dataset.restore;
   if (!name || !CURRENT) return;
   if (!confirm(`Restore ${name}? Server must be STOPPED. Existing world will be moved aside.`)) return;
-  try {
-    const r = await api(`/api/servers/${CURRENT}/restore`, {
-      method: "POST", body: JSON.stringify({ backup_name: name }),
-    });
-    $("#backups-out").textContent = JSON.stringify(r, null, 2);
-  } catch (e) { $("#backups-out").textContent = "ERROR: " + e.message; }
+  await startJob("restore", `/api/servers/${CURRENT}/restore`, {
+    body: JSON.stringify({ backup_name: name }),
+  });
 });
 
 // Definition
@@ -1305,6 +1654,8 @@ function openNewServerModal() {
   initFiles = [];
   renderInitFileList();
   applyTypeDefaults($("#f-type").value);
+  syncAccessMode();
+  syncWakeToggle();
   modal.hidden = false;
   setTimeout(() => $("#f-name").focus(), 30);
 }
@@ -1393,6 +1744,9 @@ function applyTypeDefaults(type) {
   const d = TYPE_DEFAULTS[type] || {};
   $("#fs-steamcmd").hidden = type !== "steamcmd";
   $("#fs-forge").hidden    = type !== "minecraft-forge";
+  // Passwords fieldset only makes sense for SteamCMD games (Palworld / ARK /
+  // Valheim get real injection; other steamcmd apps get an advisory note).
+  $("#fs-passwords").hidden = type !== "steamcmd";
 
   const setIfDefault = (id, key, formatter = (v) => v) => {
     const el = document.getElementById(id);
@@ -1411,6 +1765,21 @@ function applyTypeDefaults(type) {
   prevTypeDefaults = d;
 }
 $("#f-type").addEventListener("change", (ev) => applyTypeDefaults(ev.target.value));
+
+// Access-mode toggle: show/hide the appropriate allowlist textarea.
+$("#f-access-mode")?.addEventListener("change", () => syncAccessMode());
+function syncAccessMode() {
+  const mode = $("#f-access-mode").value;
+  $("#f-steamids-wrap").hidden = mode !== "steamid_allowlist";
+  $("#f-ips-wrap").hidden      = mode !== "ip_allowlist";
+}
+
+// Wake-on-demand toggle: only expose the timeout field when the box is checked.
+$("#f-wake-on-demand")?.addEventListener("change", () => syncWakeToggle());
+function syncWakeToggle() {
+  const on = $("#f-wake-on-demand").checked;
+  $("#f-wake-timeout-wrap").hidden = !on;
+}
 
 function syncPathsFromName() {
   const name = ($("#f-name").value || "").trim();
@@ -1460,6 +1829,46 @@ $("#new-server-form").addEventListener("submit", async (ev) => {
     sd.rcon = { enabled: rconEnabled };
     if (rconPort)  sd.rcon.port = parseInt(rconPort, 10);
     if (rconPwEnv) sd.rcon.password_env = rconPwEnv;
+  }
+
+  // Access control: mode + the matching allowlist. We always send the
+  // block so the server side sees defaults explicitly (not a missing key
+  // that gets filled in with model defaults).
+  const accessMode = $("#f-access-mode").value || "public";
+  const parseLines = (s) => (s || "")
+    .split(/[\n,]+/).map(x => x.trim()).filter(Boolean);
+  sd.access = {
+    mode: accessMode,
+    allowed_steamids: accessMode === "steamid_allowlist" ? parseLines($("#f-steamids").value) : [],
+    allowed_ips:      accessMode === "ip_allowlist"      ? parseLines($("#f-ips").value)      : [],
+  };
+
+  // Scale-to-zero
+  const idleMinRaw = $("#f-idle-min").value.trim();
+  if (idleMinRaw) {
+    const n = parseInt(idleMinRaw, 10);
+    if (Number.isFinite(n) && n > 0) sd.idle_shutdown_min = n;
+  }
+
+  // Wake-on-demand (v1: UDP games only). The manager's proxy owns the
+  // public port and remaps the game to port+10000 on Install.
+  if ($("#f-wake-on-demand").checked) {
+    sd.wake_on_demand = true;
+    const wto = parseInt($("#f-wake-timeout").value, 10);
+    if (Number.isFinite(wto) && wto >= 10) sd.wake_timeout_sec = wto;
+    if (sd.port && sd.port + 10000 > 65535) {
+      showFormError("Wake-on-demand requires a public port <= 55535 (internal port = port + 10000)");
+      return;
+    }
+  }
+
+  // Passwords (SteamCMD games only — the fieldset is hidden otherwise).
+  if (type === "steamcmd") {
+    const spw = $("#f-server-pw").value;
+    const apw = $("#f-admin-pw").value;
+    if (spw || apw) {
+      sd.passwords = { server_password: spw, admin_password: apw };
+    }
   }
 
   // git_source (optional). Only added if a URL was supplied.

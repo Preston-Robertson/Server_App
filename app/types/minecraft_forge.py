@@ -178,6 +178,14 @@ class MinecraftForgeHandler(TypeHandler):
             link.symlink_to(self.world_dir)
             msgs.append(f"symlinked world -> {self.world_dir}")
 
+        # 4b. Wake-on-demand: force server-port to the internal port so the
+        # manager's TCP proxy can own the public port. Forge honours
+        # server.properties on next launch.
+        if getattr(self.sd, "wake_on_demand", False):
+            internal_port = self.sd.port + 10000
+            msgs.append("wake-on-demand: " + self.patch_server_properties("server-port", str(internal_port)))
+            msgs.append(f"wake-on-demand: game will bind :{internal_port}; proxy owns public :{self.sd.port}")
+
         # 5. EULA reminder — do NOT auto-accept for the user.
         eula = self.install_dir / "eula.txt"
         if not eula.exists() or "eula=true" not in eula.read_text(encoding="utf-8", errors="ignore"):

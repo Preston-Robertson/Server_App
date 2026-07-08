@@ -2,22 +2,24 @@
 
   GET  /                          — dashboard
   GET  /healthz                   — health check (unauthenticated)
+  GET  /api/stats                 — aggregate dashboard header stats
   GET  /api/servers               — list defs + status
   POST /api/servers               — create/update a def
   DEL  /api/servers/{name}        — remove a def (does NOT delete files)
   GET  /api/servers/{name}        — full detail
   POST /api/servers/{name}/action — start/stop/restart/enable/disable
-  POST /api/servers/{name}/install — run type-handler install
-  POST /api/servers/{name}/update  — run type-handler update (steamcmd re-runs +app_update)
+  POST /api/servers/{name}/install — kick off type-handler install (async job)
+  POST /api/servers/{name}/update  — kick off type-handler update (async job)
+  GET  /api/servers/{name}/job     — current install/update job progress
   POST /api/servers/{name}/console — send a console command
   GET  /api/servers/{name}/logs   — journalctl tail
   GET  /api/servers/{name}/files  — list files under area (install|world)
   POST /api/servers/{name}/files  — upload a file
   GET  /api/servers/{name}/files/download  — download a file
   DEL  /api/servers/{name}/files  — delete a file
-  POST /api/servers/{name}/backup — snapshot world_dir to tgz
+  POST /api/servers/{name}/backup — snapshot world_dir to tgz (async job)
   GET  /api/servers/{name}/backups — list snapshots
-  POST /api/servers/{name}/restore — restore a snapshot (server must be stopped)
+  POST /api/servers/{name}/restore — restore a snapshot (async job; server must be stopped)
   POST /api/manager/update        — self-update the manager from GitHub
   GET  /api/manager/update/log    — tail update.log
 
@@ -35,7 +37,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from . import control, registry, uploads, updater, git_source, env_file
+from . import control, registry, uploads, updater, git_source, env_file, jobs, watchdog, wake_proxy
 from .auth import require_token
 from .config import settings
 from .types import handler_for
@@ -46,6 +48,21 @@ app = FastAPI(title="Game Server Manager", version="0.1.0")
 _APP_ROOT = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(_APP_ROOT / "templates"))
 app.mount("/static", StaticFiles(directory=str(_APP_ROOT / "static")), name="static")
+
+# Manager start time — surfaced via /api/stats for the dashboard header.
+import time as _time
+_MANAGER_STARTED_MONO = _time.monotonic()
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    # Idle-shutdown watchdog: polls player counts and stops empty servers.
+    # Servers without `idle_shutdown_min` set are ignored, so this is safe
+    # to always run.
+    watchdog.watchdog.start()
+    # UDP wake-on-demand proxy. Only binds the public port of servers with
+    # wake_on_demand=true; unmentioned defs incur zero cost.
+    wake_proxy.wake_proxy.start()
 
 
 # ---------- health / dashboard ----------
@@ -60,11 +77,115 @@ def dashboard(request: Request) -> HTMLResponse:
     return templates.TemplateResponse("index.html", {"request": request})
 
 
+def _read_cgroup_mem_limit() -> int | None:
+    """Return the LXC / container memory limit in bytes, or None.
+
+    Reads cgroup v2 first (memory.max), then falls back to v1
+    (memory.limit_in_bytes). Both report "max" / a huge sentinel when no
+    limit is set — treat those as None so the frontend can decide whether
+    to divide by MemTotal instead.
+    """
+    try:
+        with open("/sys/fs/cgroup/memory.max", encoding="ascii") as f:
+            v = f.read().strip()
+        if v and v != "max":
+            n = int(v)
+            if 0 < n < 10**18:
+                return n
+    except OSError:
+        pass
+    try:
+        with open("/sys/fs/cgroup/memory/memory.limit_in_bytes", encoding="ascii") as f:
+            n = int(f.read().strip())
+        if 0 < n < 10**18:
+            return n
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _read_meminfo_total() -> int | None:
+    try:
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    return kb * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _disk_usage(path: Path) -> dict | None:
+    import shutil as _sh
+    try:
+        du = _sh.disk_usage(str(path))
+        return {"total": du.total, "used": du.used, "free": du.free}
+    except OSError:
+        return None
+
+
+@app.get("/api/stats", dependencies=[Depends(require_token)])
+def api_stats() -> dict:
+    """Aggregate stats for the dashboard header: server counts, combined
+    RAM usage across all running servers, and disk usage of the install
+    and world roots. Cheap enough to poll on the 5s dashboard refresh.
+    """
+    total = running = failed = stopped = 0
+    ram_used = 0
+    ram_cap_sum = 0  # sum of per-server memory_mb (informational)
+    for sd in registry.list_defs():
+        total += 1
+        try:
+            st = control.status(sd)
+        except Exception:
+            continue
+        if st.active == "active":
+            running += 1
+        elif st.active == "failed":
+            failed += 1
+        else:
+            stopped += 1
+        if st.mem_bytes:
+            ram_used += st.mem_bytes
+        ram_cap_sum += (sd.memory_mb or 0) * 1024 * 1024
+
+    limit = _read_cgroup_mem_limit()
+    mem_total = _read_meminfo_total()
+    # Prefer the LXC/container limit as the denominator; fall back to
+    # MemTotal (which inside an LXC is usually the container's view anyway).
+    ram_limit = limit or mem_total
+    ram_percent = (100.0 * ram_used / ram_limit) if (ram_limit and ram_used) else 0.0
+
+    return {
+        "servers": {
+            "total": total, "running": running,
+            "failed": failed, "stopped": stopped,
+        },
+        "ram": {
+            "used_bytes": ram_used,
+            "limit_bytes": ram_limit,
+            "reserved_bytes": ram_cap_sum,   # sum of memory_mb across all defs
+            "percent": round(ram_percent, 1),
+        },
+        "disk": {
+            "install_root": _disk_usage(settings.install_root),
+            "worlds_root":  _disk_usage(settings.worlds_root),
+            "backup_root":  _disk_usage(settings.backup_root),
+        },
+        "manager": {
+            "uptime_sec": int(_time.monotonic() - _MANAGER_STARTED_MONO),
+        },
+    }
+
+
 # ---------- server registry ----------
 
 @app.get("/api/servers", dependencies=[Depends(require_token)])
 def api_list_servers() -> list[dict]:
     out = []
+    wd_snap = watchdog.watchdog.snapshot()
+    wake_snap = wake_proxy.wake_proxy.snapshot()
     for sd in registry.list_defs():
         st = control.status(sd)
         out.append({
@@ -75,6 +196,8 @@ def api_list_servers() -> list[dict]:
                 "uptime_sec": st.uptime_sec,
                 "console_available": control.console_available(sd),
             },
+            "watchdog": wd_snap.get(sd.name),
+            "wake": wake_snap.get(sd.name),
         })
     return out
 
@@ -91,6 +214,8 @@ def api_get_server(name: str) -> dict:
             "uptime_sec": st.uptime_sec,
             "console_available": control.console_available(sd),
         },
+        "watchdog": watchdog.watchdog.snapshot().get(name),
+        "wake": wake_proxy.wake_proxy.snapshot().get(name),
         "backups": uploads.list_backups(sd, settings.backup_root),
     }
 
@@ -136,22 +261,61 @@ def api_action(name: str, body: ActionBody) -> dict:
 
 @app.post("/api/servers/{name}/install", dependencies=[Depends(require_token)])
 def api_install(name: str) -> dict:
+    """Kick off an install job in a background thread.
+
+    Returns immediately with the job id. Poll GET /api/servers/{name}/job
+    for progress (phase, percent, bytes, live tail). Only one install or
+    update job may run per server at a time.
+    """
     sd = registry.load_def(name)
+    if jobs.registry.is_running(name):
+        raise HTTPException(status_code=409, detail="an install or update is already running for this server")
+    handler = handler_for(sd)
+
+    def _target(cb):
+        handler.set_progress_cb(cb)
+        return handler.install()
+
     try:
-        msgs = handler_for(sd).install()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-    return {"ok": True, "messages": msgs}
+        job = jobs.registry.start(name, "install", _target)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"ok": True, "job_id": job.id, "server": name, "kind": "install"}
 
 
 @app.post("/api/servers/{name}/update", dependencies=[Depends(require_token)])
 def api_type_update(name: str) -> dict:
+    """Same job machinery as install; for SteamCMD games this re-runs
+    +app_update validate (patches to the latest build)."""
     sd = registry.load_def(name)
+    if jobs.registry.is_running(name):
+        raise HTTPException(status_code=409, detail="an install or update is already running for this server")
+    handler = handler_for(sd)
+
+    def _target(cb):
+        handler.set_progress_cb(cb)
+        return handler.update()
+
     try:
-        msgs = handler_for(sd).update()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-    return {"ok": True, "messages": msgs}
+        job = jobs.registry.start(name, "update", _target)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"ok": True, "job_id": job.id, "server": name, "kind": "update"}
+
+
+@app.get("/api/servers/{name}/job", dependencies=[Depends(require_token)])
+def api_server_job(name: str) -> dict:
+    """Current install/update job state for this server.
+
+    Returns {"exists": False} if no job has ever been started (or the
+    manager restarted since). Otherwise returns the full job snapshot:
+    kind, done, ok, error, elapsed_sec, progress {phase, percent, bytes_*},
+    tail (last ~200 lines), and messages (populated on completion).
+    """
+    j = jobs.registry.get(name)
+    if not j:
+        return {"exists": False}
+    return {"exists": True, **j.to_dict()}
 
 
 # ---------- console + logs ----------
@@ -307,9 +471,20 @@ def api_git_clear_cache(name: str) -> dict:
 
 @app.post("/api/servers/{name}/backup", dependencies=[Depends(require_token)])
 def api_backup(name: str) -> dict:
+    """Kick off a backup job. Polls at GET /api/servers/{name}/job."""
     sd = registry.load_def(name)
-    dest = uploads.make_backup(sd, settings.backup_root)
-    return {"ok": True, "backup": str(dest), "bytes": dest.stat().st_size}
+    if jobs.registry.is_running(name):
+        raise HTTPException(status_code=409, detail="an install/update/backup is already running for this server")
+
+    def _target(cb):
+        dest = uploads.make_backup(sd, settings.backup_root, on_event=cb)
+        return [f"wrote {dest} ({dest.stat().st_size} bytes)"]
+
+    try:
+        job = jobs.registry.start(name, "backup", _target)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"ok": True, "job_id": job.id, "server": name, "kind": "backup"}
 
 
 @app.get("/api/servers/{name}/backups", dependencies=[Depends(require_token)])
@@ -324,12 +499,25 @@ class RestoreBody(BaseModel):
 
 @app.post("/api/servers/{name}/restore", dependencies=[Depends(require_token)])
 def api_restore(name: str, body: RestoreBody) -> dict:
+    """Kick off a restore job. Rejects up front if the server is running or
+    another job is in flight — cheap safety before the thread starts."""
     sd = registry.load_def(name)
     st = control.status(sd)
     if st.active == "active":
         raise HTTPException(status_code=409, detail="stop the server before restoring")
-    uploads.restore_backup(sd, settings.backup_root, body.backup_name)
-    return {"ok": True}
+    if jobs.registry.is_running(name):
+        raise HTTPException(status_code=409, detail="an install/update/backup is already running for this server")
+    backup_name = body.backup_name
+
+    def _target(cb):
+        uploads.restore_backup(sd, settings.backup_root, backup_name, on_event=cb)
+        return [f"restored {backup_name} into {sd.world_dir}"]
+
+    try:
+        job = jobs.registry.start(name, "restore", _target)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"ok": True, "job_id": job.id, "server": name, "kind": "restore"}
 
 
 # ---------- self-update ----------

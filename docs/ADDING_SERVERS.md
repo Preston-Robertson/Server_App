@@ -62,6 +62,16 @@ git_source:                          # optional; leave url blank to disable
   deployed_sha: ""                   # written by sync; read by the UI
   deployed_ref: ""
   deployed_at: ""
+
+access:                              # per-server access control (see §7)
+  mode: public                       # public | steamid_allowlist | ip_allowlist
+  allowed_steamids: []               # 17-digit steamID64 strings
+  allowed_ips: []                    # CIDRs or single IPs
+
+idle_shutdown_min: null              # scale-to-zero (see §8); null = disabled
+
+wake_on_demand: false                # UDP-only v1; proxy owns port, game rebinds +10000
+wake_timeout_sec: 90                 # max seconds to hold client packets during wake
 ```
 
 ## 3. Workflow
@@ -74,6 +84,10 @@ git_source:                          # optional; leave url blank to disable
 
 ## 4. Adding a new `steamcmd` app not in the built-in recipes
 
+Built-in recipes today: Palworld (`2394010`), Satisfactory (`1690800`),
+ARK: SE (`376030`), ARK: Ascended (`2430930`), Valheim (`896660`),
+Enshrouded (`2278520`, Wine).
+
 Edit `app/types/steamcmd.py`, add to `_APP_RECIPES`:
 
 ```python
@@ -81,6 +95,16 @@ _APP_RECIPES[123456] = {
     "name": "mygame",
     "run": "./MyGameServer -port={port} -someflag",
     "saves_rel": "Saved/SaveGames",   # relative to install_dir; symlinked to world_dir
+    # Optional. Written to server.env so systemd + tmux inherit it. Useful
+    # when the game writes saves under $HOME (e.g. Satisfactory pins HOME to
+    # install_dir so .config/Epic/... falls inside the symlinked tree).
+    # "env": {"HOME": "{install_dir}"},
+
+    # Windows-only servers: set both of these to run under Wine. The
+    # handler downloads the Windows depot, initialises a wineprefix
+    # under install_dir/.wine, and wraps `run` in `wine ...`.
+    # "wine": True,
+    # "steamcmd_platform": "windows",
 }
 ```
 
@@ -137,4 +161,162 @@ The handler will:
 **Updating the game software:** *manual*. Upload replacement mod jars into
 `mods/` and/or a new Forge tree, then click **Update Game Software**. There\u2019s\nno reliable auto-update for a modded pack, so the handler just re-runs the\nprovisioning step (regenerates scripts + `user_jvm_args.txt` in case\n`memory_mb` changed).
 
-**Do NOT use `type: minecraft-java` for Forge.** That handler runs\n`java -jar server.jar nogui`, which is the wrong entrypoint for modern\nForge \u2014 it won\u2019t start.
+**Do NOT use `type: minecraft-java` for Forge.** That handler runs\n`java -jar server.jar nogui`, which is the wrong entrypoint for modern\nForge — it won't start.
+
+## 7. Access control
+
+Every server has an `access` block. Three modes:
+
+| Mode | Where enforced | Games with native support |
+|---|---|---|
+| `public` | Nowhere (game's own controls only — passwords, in-game whitelists) | All |
+| `steamid_allowlist` | In the game's config file | **ARK: SE, ARK: Ascended** (writes `PlayerExclusiveJoinList.txt` + adds `-exclusivejoin`). Palworld/Satisfactory/Valheim/Enshrouded have no native equivalent — the handler emits a WARNING telling you to use a password + `ip_allowlist` instead. |
+| `ip_allowlist` | Firewall (UFW) | All — but the UFW helper is not wired up yet. Today this mode is *advisory* (logged, chip shown in UI). See §7.1. |
+
+Example: lock an ARK server to two friends:
+
+```yaml
+access:
+  mode: steamid_allowlist
+  allowed_steamids:
+    - "76561198000000000"
+    - "76561198111111111"
+```
+
+The whitelist file is regenerated on every **Install** / **Update Game
+Software** — the YAML is the source of truth. Editing the file by hand
+gets clobbered on the next reprovision.
+
+### 7.1 IP allowlist (planned)
+
+The schema accepts `mode: ip_allowlist` and validates the CIDRs/IPs, but
+the UFW-side enforcement is not automated yet. The intended architecture:
+
+1. Manager writes `/var/lib/gamesrv/firewall.rules` (one `port/proto CIDR`
+   per line) whenever a def is saved.
+2. A `scripts/gamesrv-firewall.sh` helper reads that file and applies
+   the rules via `ufw allow from <cidr> to any port <port> proto <proto>`.
+3. `gamesrv` runs the helper via a narrow sudoers entry:
+   `gamesrv ALL=(root) NOPASSWD: /opt/gamesrv/scripts/gamesrv-firewall.sh`
+4. `bootstrap.sh` installs the sudoers file to `/etc/sudoers.d/gamesrv-firewall`.
+
+**Why deferred:** if you're moving to Tailscale, ACLs there are more
+expressive (per-tag, per-user, at the mesh layer) and don't need any
+sudo dance on the LXC. Ping me when you're ready to pick one path.
+
+## 8. Scale-to-zero (idle shutdown)
+
+Set `idle_shutdown_min` on a server def and a background watchdog will
+stop it after that many minutes of zero players.
+
+```yaml
+idle_shutdown_min: 20    # stop after 20 min of empty
+```
+
+Player counts are polled every 60 s via:
+
+- **Steam A2S_INFO** on `27015/UDP` for Palworld / ARK / Valheim / any
+  Steam game with a standard query response. Satisfactory (single-port
+  since Update 8) is queried on its game port instead.
+- **Minecraft SLP** on the server's TCP port for `minecraft-java` and
+  `minecraft-forge`.
+
+The dashboard card shows one of three chips while the server is running:
+
+- `👥 3/8` — players online
+- `💤 12m` — empty; auto-shutdown in N minutes
+- `👥 —`  — probe pending or unavailable
+
+Timers reset if the manager restarts. Servers whose type has no probe
+(custom, or a SteamCMD app that doesn't answer A2S) are ignored — you
+can still set the field, it'll just never fire.
+
+## 9. Wake-on-demand (UDP + TCP)
+
+Toggle `wake_on_demand: true` (and optionally raise `wake_timeout_sec`
+for heavy games) to have the manager's proxy keep the public port
+bound while the game is stopped. Two protocol paths:
+
+- **UDP** (Palworld / Satisfactory / ARK / Valheim / Enshrouded):
+  buffers the incoming datagram, starts the game via systemd, polls
+  A2S until the game answers, replays buffered packets, then acts as
+  a per-client UDP relay.
+- **TCP** (Minecraft Java / Forge): accepts the connection, peeks at
+  the handshake. SLP status pings (`next_state=1`) are answered
+  locally with a "server is asleep" MOTD — no wake triggered. Login
+  intent (`next_state=2`) triggers the wake, buffers the client's
+  bytes, waits for the JVM to answer SLP, then splices the connection
+  to the backend. Player sees one connection attempt, no retry.
+
+Because the proxy always owns the public port, the game process must
+bind a different port. For SteamCMD games the handler substitutes
+`port + 10000` into the recipe's launch command. For Minecraft the
+handlers patch `server-port=<port+10000>` into `server.properties`.
+**Reinstall the server after toggling** either way so those files
+reflect the new port. Constraint: public port must be ≤ 55535.
+
+Dashboard chips: `🌙 sleeping` (proxy up, game stopped) →
+`🌙 waking…` (kicking + buffering) → `🌙 relay` (game up, forwarding).
+
+**Caveats:**
+
+- **Server browser listings** — games that advertise their own port to
+  a Steam-side server browser will report `port + 10000` (that's what
+  the game actually bound). This does not affect direct-connect via
+  the Connect string on the card. Fine for private servers, not for
+  public listings.
+- **Minecraft SLP shows 0/20** even when players are online — the
+  proxy answers status pings locally so idle server-list refreshes
+  don't wake the JVM. The real player count is still shown in the
+  dashboard's `👥 N/max` chip via the watchdog's own SLP probe.
+- **Threading model** — each active Minecraft player uses two threads
+  in the manager process (splice pumps). Negligible on any modern
+  host; noted for completeness.
+
+## 10. Wine-based Windows servers (Enshrouded, etc.)
+
+Some dedicated servers ship only as a Windows `.exe` (Enshrouded is
+today's headline example). Recipes for those set two extra keys:
+
+```python
+_APP_RECIPES[2278520] = {
+    ...
+    "wine": True,
+    "steamcmd_platform": "windows",
+}
+```
+
+That does three things on Install:
+
+1. `steamcmd` is invoked with `+@sSteamCmdForcePlatformType windows`
+   so the Windows depot is downloaded (instead of the empty / broken
+   Linux one).
+2. `_wine_prefix_init()` runs `wineboot -u` under `install_dir/.wine`
+   to initialise a per-server wineprefix (~10–30 s the first time;
+   ~1 s on subsequent Installs). Fully isolated from other servers.
+3. The recipe's `run` (a `.exe` path) is wrapped as
+   `WINEPREFIX=... WINEDEBUG=-all WINEARCH=win64 wine ./Server.exe`
+   before being written into `start.sh`.
+
+**One-time prerequisite:** re-run bootstrap with `--with-wine` so
+`wine-staging` is installed from `dl.winehq.org`. Debian 12's stock
+Wine is usually too old for current-year games:
+
+```bash
+sudo bash /opt/gamesrv/bootstrap.sh --with-wine
+```
+
+**Overhead vs. native:** roughly 10–20% more RAM and ~5–15% more CPU
+per Wine-hosted game. Zero networking overhead — Wine uses native
+Linux sockets, and the wake proxy sees Wine servers identically to
+native ones. Wineprefix on disk is ~200–500 MB per server.
+
+**Recommended combo for Wine games:** `wake_on_demand: true` +
+`idle_shutdown_min: 20` +  `wake_timeout_sec: 180` (Wine cold-start
+adds latency to the first wake). Together these mean the Wine
+overhead only exists while someone is actively playing.
+
+**Patch fragility:** Enshrouded (and other Wine-hosted games)
+occasionally break after a Steam patch until Wine catches up. Fix is
+usually `sudo apt upgrade winehq-staging`. Check the game's entry on
+[appdb.winehq.org](https://appdb.winehq.org/) if it stops booting.

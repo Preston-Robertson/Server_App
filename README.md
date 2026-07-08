@@ -9,14 +9,45 @@ Supported server types out of the box:
 - **`minecraft-forge`** — Modded Forge 1.17+ (yes, 1.20.1). Launches Forge's
   own `run.sh` inside `tmux`, writes `-Xms`/`-Xmx` into `user_jvm_args.txt`,
   warns if `mc_version` and the installed Java disagree.
-- **`steamcmd`** — anything anonymously installable via SteamCMD
-  (Palworld, Valheim, ARK, 7DTD, …). Palworld is a first-class recipe.
+- **`steamcmd`** — anything anonymously installable via SteamCMD. First-class
+  recipes for **Palworld**, **Satisfactory**, **ARK: Survival Evolved**,
+  **ARK: Survival Ascended**, **Valheim**, and **Enshrouded** (Windows-only
+  binary, runs under Wine). Auto-generated `start.sh`, saves symlinked to
+  `world_dir`, per-game password + whitelist wiring.
 - **`custom`** — bring your own `start.sh`.
 
 Every server runs under a shared systemd template unit (one instance per
 game). The manager itself is a systemd service running as unprivileged
 `gamesrv`. Console + graceful stop work because each game launches inside a
 `tmux` session the manager talks to.
+
+**Feature highlights**
+
+- **Live progress bars** for every long-running action — SteamCMD downloads,
+  backup archiving, restore extraction — streamed via a background job
+  registry and polled by the dashboard.
+- **Aggregate stats bar** at the top of the Dashboard: combined RAM (as %
+  of the LXC's cgroup limit), running/total server count, worlds + install
+  disk usage, manager uptime.
+- **Access control** per server: `public`, `steamid_allowlist` (native for
+  ARK via `PlayerExclusiveJoinList.txt` + `-exclusivejoin`), or
+  `ip_allowlist` (schema landed; UFW enforcement planned — deferred if
+  you're migrating to Tailscale). Server + admin passwords for Palworld /
+  ARK / Valheim are set from the New Server modal and injected into the
+  right game config file on Install.
+- **Scale-to-zero (idle shutdown)**: set `idle_shutdown_min` on any server
+  and a background watchdog polls players via A2S_INFO (Steam) or SLP
+  (Minecraft). Zero players for N minutes → graceful stop.
+- **Wake-on-demand (UDP + TCP)**: toggle `wake_on_demand` and the manager's
+  built-in proxy owns the public port. When a client packet or connection
+  arrives while the server is stopped, traffic is **buffered**, the server
+  starts, and the buffered traffic is replayed once the game is
+  responsive — no "first attempt fails, second succeeds" for the player.
+  Per-server `wake_timeout_sec` controls how long the proxy waits.
+  Supported: Palworld, Satisfactory, ARK, Valheim, Enshrouded (UDP) and
+  Minecraft Java / Forge (TCP + SLP). Minecraft's SLP status pings are
+  answered locally with a "server is asleep" MOTD so idle server-list
+  refreshes don't wake the JVM.
 
 Design borrows heavily from the sibling
 [luigi-web](https://github.com/Preston-Robertson/To_Do_List) app so both
@@ -32,21 +63,25 @@ apps feel like siblings when you switch tabs.
    - [Minecraft — Vanilla / Paper](#minecraft--vanilla--paper)
    - [Minecraft — Forge (modded)](#minecraft--forge-modded)
    - [Palworld (SteamCMD)](#palworld-steamcmd)
-4. [Uploading server data](#uploading-server-data)
-5. [Pulling server data from git](#pulling-server-data-from-git)
-6. [Backups and world data](#backups-and-world-data)
-7. [Live logs, console, and performance](#live-logs-console-and-performance)
-8. [The Admin page](#the-admin-page)
-9. [Manager self-update](#manager-self-update)
-10. [Troubleshooting](#troubleshooting)
-11. [Repository layout](#repository-layout)
-12. [API reference (short)](#api-reference-short)
-13. [Security posture](#security-posture)
+   - [Satisfactory (SteamCMD)](#satisfactory-steamcmd)
+   - [ARK: Survival Evolved (SteamCMD)](#ark-survival-evolved-steamcmd)
+   - [Enshrouded (SteamCMD via Wine)](#enshrouded-steamcmd-via-wine)
+4. [Access control + idle shutdown](#access-control--idle-shutdown)
+5. [Uploading server data](#uploading-server-data)
+6. [Pulling server data from git](#pulling-server-data-from-git)
+7. [Backups and world data](#backups-and-world-data)
+8. [Live logs, console, and performance](#live-logs-console-and-performance)
+9. [The Admin page](#the-admin-page)
+10. [Manager self-update](#manager-self-update)
+11. [Troubleshooting](#troubleshooting)
+12. [Repository layout](#repository-layout)
+13. [API reference (short)](#api-reference-short)
+14. [Security posture](#security-posture)
 
 Additional docs in [docs/](docs/):
 
 - [docs/USAGE.md](docs/USAGE.md) — deep-dive on every UI tab + every API endpoint.
-- [docs/ADDING_SERVERS.md](docs/ADDING_SERVERS.md) — YAML schema and how to add new game types.
+- [docs/ADDING_SERVERS.md](docs/ADDING_SERVERS.md) — YAML schema (§7 access control, §8 idle shutdown) and how to add new game types.
 - [docs/UPDATING_SERVER_DATA.md](docs/UPDATING_SERVER_DATA.md) — how to upload/replace server files safely.
 
 ---
@@ -192,16 +227,204 @@ Sample YAML: [servers/minecraft-forge-smp.example.yml](servers/minecraft-forge-s
 Sample YAML: [servers/palworld.example.yml](servers/palworld.example.yml).
 
 1. **+ New Server** → type `steamcmd`, name `palworld`, memory `16384`,
-   port `8211`, Steam App ID `2394010` (pre-filled).
+   port `8211`, Steam App ID `2394010` (pre-filled). Optionally set a
+   **Server password** + **Admin password** in the modal — they'll be
+   injected into `PalWorldSettings.ini` on Install.
 2. **Create Server** → **Control** → **Install** (takes a while — several
-   GB download).
-3. **Files** → optional: edit
+   GB download; watch the progress bar).
+3. **Files** → optional: further tune
    `Pal/Saved/Config/LinuxServer/PalWorldSettings.ini` for server name /
-   password / difficulty.
+   difficulty. Passwords set in the modal are already applied.
 4. `scripts/ufw-setup.sh` opens **8211/UDP** and **27015/UDP** by default.
 5. **Start** → **Enable on Boot**.
 6. To patch Palworld later: **Control** → **Update Game Software** re-runs
    `steamcmd +app_update 2394010 validate`.
+
+### Satisfactory (SteamCMD)
+
+Sample YAML: [servers/satisfactory.example.yml](servers/satisfactory.example.yml).
+
+1. **+ New Server** → type `steamcmd`, name `satisfactory`, port `7777`,
+   memory `12288`, Steam App ID `1690800`.
+2. **Create Server** → **Control** → **Install** (~7 GB).
+3. **Control** → **Start** for ~30 s, then **Stop** — the game creates
+   `world_dir/SaveGames/server/`.
+4. **Files** → `world_dir` area → drop your existing `.sav` into
+   `SaveGames/server/`.
+5. **Start** → connect via the Satisfactory client's Server Manager →
+   claim → load save.
+6. UFW default: `7777/UDP` (Update 8+ single-port for game + query).
+
+### ARK: Survival Evolved (SteamCMD)
+
+Sample YAML: [servers/ark.example.yml](servers/ark.example.yml).
+For Survival Ascended see [servers/ark-ascended.example.yml](servers/ark-ascended.example.yml)
+(App `2430930`, ~24 GB RAM, native Linux support has been patchy — Wine
+support is on the roadmap).
+
+1. **+ New Server** → type `steamcmd`, name `ark`, port `7777`, memory
+   `14336`, Steam App ID `376030`. Set **Server password** + **Admin
+   password** — they become `?ServerPassword=…?ServerAdminPassword=…`
+   on the launch line.
+2. Under **Access & Idle** in the modal, pick **Steam ID allowlist** and
+   paste in the steamID64s of everyone allowed to join — the handler
+   writes `ShooterGame/Saved/PlayerExclusiveJoinList.txt` and appends
+   `-exclusivejoin` on Install. Optionally set an **Idle shutdown**
+   window (e.g. `30`) so the server auto-stops after 30 min of zero
+   players.
+3. **Create Server** → **Control** → **Install** (~20 GB, big download).
+4. UFW: `7777/UDP` (game), `27015/UDP` (query), `7778/UDP` (raw) — all
+   opened by `scripts/ufw-setup.sh` by default.
+5. **Start** → **Enable on Boot**.
+
+### Enshrouded (SteamCMD via Wine)
+
+Enshrouded's dedicated server is a **Windows binary**; we run it under
+Wine. Sample YAML: [servers/enshrouded.example.yml](servers/enshrouded.example.yml).
+
+Prerequisite (one-time, on the LXC):
+
+```bash
+sudo bash /opt/gamesrv/bootstrap.sh --with-wine   # adds wine-staging (~1 GB)
+```
+
+Then:
+
+1. **+ New Server** → type `steamcmd`, name `enshrouded`, port `15636`,
+   memory `12288`, Steam App ID `2278520`. Wine adds ~10–20% RAM overhead
+   vs. a native Linux server — the recipe pre-fills a generous budget.
+2. Set **Server password** (players' Guest group) and **Admin password**
+   in the modal. Both land in `enshrouded_server.json` under `userGroups`
+   on Install.
+3. In **Access & Idle**: enable **Wake on demand** with timeout **180 s**
+   (Wine cold-start is slower than native), and set **Idle shutdown**
+   to 20 min. Wake-on-demand + idle-shutdown together mean Enshrouded
+   only consumes RAM when someone is actually playing.
+4. **Create Server** → **Control** → **Install**. The handler will:
+   - Download the Windows depot via `steamcmd +@sSteamCmdForcePlatformType windows`.
+   - Initialise a Wine prefix under `install_dir/.wine` (`wineboot -u`, ~10–30 s first time).
+   - Write `enshrouded_server.json` with your port + passwords.
+   - Generate a `start.sh` that runs `WINEPREFIX=… wine ./enshrouded_server.exe`.
+5. UFW: `15636/UDP` (game) + `15637/UDP` (query) are opened by default.
+6. **Start**. First launch under Wine takes an extra 20–40 s while the
+   prefix warms up — that's why we bumped `wake_timeout_sec` to 180.
+
+**Wine gotchas to know:**
+
+- Occasional Enshrouded patches break under an older Wine. Fix is usually
+  `sudo apt upgrade winehq-staging` — check the [Wine app DB](https://appdb.winehq.org/)
+  entry if it stops booting after a Steam update.
+- Wine adds no measurable network overhead — the wake proxy sees Wine
+  servers identically to native Linux ones.
+- Each Wine-flagged server gets its own prefix under `install_dir/.wine`
+  (~200 MB), fully isolated from the others.
+
+---
+
+## Access control + idle shutdown
+
+Both live under fields on every server def; see [docs/ADDING_SERVERS.md
+§7 and §8](docs/ADDING_SERVERS.md) for the exact schema. The **+ New
+Server** modal has an **Access & Idle** fieldset that writes them for
+you.
+
+**Access modes:**
+
+- **`public`** — no allowlist. Anyone reachable on the port can attempt
+  to join; the game's own password / whitelist is the only check.
+- **`steamid_allowlist`** — enforced natively on **ARK: SE / Ascended**
+  (`PlayerExclusiveJoinList.txt` + `-exclusivejoin`). For Palworld,
+  Satisfactory, Valheim, Enshrouded, the handler emits a WARNING on
+  Install — those games have no native equivalent, so use a **password**
+  and/or `ip_allowlist` instead.
+- **`ip_allowlist`** — schema validated and displayed as a chip on the
+  server card, but **not yet enforced** at the firewall. See the
+  deferral plan in [docs/ADDING_SERVERS.md §7.1](docs/ADDING_SERVERS.md).
+  Once you're on Tailscale, ACLs there are a cleaner enforcement layer
+  than dynamic UFW rules.
+
+**Server + admin passwords** (Palworld, ARK, Valheim) are set in the
+modal and stored in `servers/<name>.yml`. On Install:
+
+- **Palworld** — the handler copies `DefaultPalWorldSettings.ini` if
+  needed and substitutes `ServerPassword` / `AdminPassword`.
+- **ARK** — the passwords are appended to the launch URL as
+  `?ServerPassword=…?ServerAdminPassword=…`. Avoid spaces or the
+  characters `?`, `&`, `"`, `'`.
+- **Valheim** — replaces the placeholder in the recipe's `-password`
+  argument. Avoid spaces or shell metacharacters.
+
+> **Warning:** passwords are written to `servers/*.yml` in plain text.
+> Keep that directory out of any public git remote. If you already push
+> your configs, use the Admin page's env editor to put the actual
+> secrets in `/etc/gamesrv.env` under `*_PASSWORD` keys and leave the
+> YAML password fields blank — a future release will resolve `*_env`
+> fields at Install time.
+
+**Idle shutdown:** set `Idle shutdown (min)` in the modal, or
+`idle_shutdown_min: 20` in YAML, and the background watchdog stops the
+server after that many minutes of zero players. Cards show one of:
+
+| Chip | Meaning |
+|---|---|
+| `👥 3/8` | Players online |
+| `💤 12m` | Empty; auto-shutdown in N minutes |
+| `👥 —` | Probe pending / server not answering yet |
+
+The watchdog polls A2S_INFO on `27015/UDP` (or the game port for
+single-port games like Satisfactory) and Minecraft SLP on the TCP port.
+Servers whose type has no probe (custom, generic steamcmd) are ignored.
+
+**Wake-on-demand (UDP + TCP).** Toggle *Wake on demand* in the modal (or
+`wake_on_demand: true` in YAML) to have the manager keep the server's
+public port bound *while the game is stopped*.
+
+**UDP path** (Palworld / Satisfactory / ARK / Valheim / Enshrouded):
+
+1. The proxy buffers the incoming datagram.
+2. It calls `systemctl start` on the game.
+3. It polls A2S every 2 s until the game responds — or
+   `wake_timeout_sec` elapses (default 90; set higher for ARK / Wine).
+4. Once ready, the buffered packets are replayed and the proxy switches
+   to a transparent per-client UDP relay.
+
+**TCP path** (Minecraft Java / Forge):
+
+1. A new connection is accepted. The proxy peeks at the Minecraft
+   handshake to determine intent.
+2. **Status ping** (`next_state=1`, from the server list): the proxy
+   answers locally with a JSON status that includes a MOTD like
+   *"§eServer is asleep§r — join to wake (my-smp)"*. This does **not**
+   trigger a wake — server-list refreshes fire every second and we
+   don't want them starting the JVM.
+3. **Login intent** (`next_state=2`): the proxy kicks the wake, holds
+   the TCP connection open, polls Minecraft SLP on the internal port,
+   and once the server answers it opens a backend socket to
+   `127.0.0.1:<internal_port>`, replays the buffered handshake bytes,
+   and splices the two sockets bidirectionally. From the player's POV:
+   one connection attempt, no manual retry. If `wake_timeout_sec`
+   elapses, the proxy sends a login-Disconnect packet with a friendly
+   message and closes.
+
+Because the proxy always owns the public port, the game process is
+remapped to `port + 10000` internally, so **reinstall after toggling**
+so `start.sh` (UDP) or `server.properties` (Minecraft) uses the correct
+port. Public port must be ≤ 55535.
+
+Dashboard chips (while `wake_on_demand` is on):
+
+| Chip | Meaning |
+|---|---|
+| `🌙 sleeping` | Proxy listening; game stopped; awaiting first packet / connection |
+| `🌙 waking…` | Wake in progress; N packets buffered; game starting |
+| `🌙 relay` | Game up; proxy is forwarding to `:port+10000` |
+
+Minecraft-specific caveat: the TCP splice adds ~one thread per active
+player connection (fine for a homelab, negligible RAM). SLP status is
+answered locally even when the game is running, so the "player count"
+in the server-list view is always shown as 0/20 — that's cosmetic. The
+`👥 N/max` chip on the dashboard card still reflects the real count via
+the watchdog probe.
 
 ---
 

@@ -3,11 +3,14 @@
 #
 # Idempotent. Safe to re-run. Run as root on the LXC:
 #   sudo bash /opt/gamesrv/bootstrap.sh
+#   sudo bash /opt/gamesrv/bootstrap.sh --with-wine   # for Enshrouded / other Windows-only servers
 #
 # What it does:
 #   1. Creates the `gamesrv` service user + group.
 #   2. Creates required dirs and fixes ownership.
 #   3. Installs required system packages (python venv, git, tmux, java, steamcmd).
+#      With --with-wine: also installs wine-staging (~1 GB extra) for
+#      Windows-only dedicated servers such as Enshrouded.
 #   4. Builds the Python venv and installs requirements.
 #   5. Installs the systemd manager unit + template unit, enables the manager.
 #   6. Installs the polkit rule that lets `gamesrv` control `gamesrv@*` units.
@@ -18,6 +21,13 @@ APP_DIR="${APP_DIR:-/opt/gamesrv}"
 INSTALL_ROOT="${INSTALL_ROOT:-/srv/gameservers}"
 WORLDS_ROOT="${WORLDS_ROOT:-/opt/gamesrv/worlds}"
 SERVICE_USER="${SERVICE_USER:-gamesrv}"
+WITH_WINE=0
+for arg in "$@"; do
+  case "$arg" in
+    --with-wine) WITH_WINE=1 ;;
+    *) echo "unknown arg: $arg" >&2; exit 2 ;;
+  esac
+done
 
 if [[ $EUID -ne 0 ]]; then
   echo "must run as root (sudo)" >&2
@@ -83,6 +93,37 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
 DEBIAN_FRONTEND=noninteractive apt-get install -y steamcmd || \
   DEBIAN_FRONTEND=noninteractive apt-get install -y steamcmd-jessie || \
   echo "WARNING: steamcmd not installed automatically — install manually if you need SteamCMD servers."
+
+if [[ "$WITH_WINE" -eq 1 ]]; then
+  echo "== 3b. wine (--with-wine) =="
+  # Debian 12's shipped Wine is often too old for current-year games. Use
+  # WineHQ's Debian repo so we get wine-staging (which pulls in the fixes
+  # Enshrouded / newer Windows-only servers need). Adds ~1 GB.
+  install -d -m 0755 /etc/apt/keyrings
+  if [[ ! -f /etc/apt/keyrings/winehq-archive.key ]]; then
+    curl -fsSL https://dl.winehq.org/wine-builds/winehq.key \
+      | gpg --dearmor -o /etc/apt/keyrings/winehq-archive.key
+  fi
+  # Bookworm = Debian 12. Adjust here if you're on trixie/sid.
+  cat > /etc/apt/sources.list.d/winehq.sources <<'EOF'
+Types: deb
+URIs: https://dl.winehq.org/wine-builds/debian/
+Suites: bookworm
+Components: main
+Architectures: amd64 i386
+Signed-By: /etc/apt/keyrings/winehq-archive.key
+EOF
+  apt-get update -y
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --install-recommends winehq-staging \
+    || DEBIAN_FRONTEND=noninteractive apt-get install -y wine-staging wine \
+    || echo "WARNING: wine install failed — see winehq.org for manual instructions."
+  # Verify.
+  if command -v wine >/dev/null; then
+    wine --version || true
+  else
+    echo "WARNING: wine binary not on PATH after install."
+  fi
+fi
 
 echo "== 4. venv + requirements =="
 if [[ ! -x "$APP_DIR/.venv/bin/python" ]]; then

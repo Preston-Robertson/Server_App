@@ -99,6 +99,15 @@ class MinecraftJavaHandler(TypeHandler):
         self.write_env_file(env_values)
         msgs.append(f"wrote {self.install_dir/'server.env'}")
 
+        # Wake-on-demand: the manager's TCP proxy owns sd.port and MC has
+        # to bind sd.port + 10000 instead. Force it via server.properties
+        # (Minecraft honours this on next launch; --port on argv is less
+        # reliable across launchers).
+        if getattr(self.sd, "wake_on_demand", False):
+            internal_port = self.sd.port + 10000
+            msgs.append("wake-on-demand: " + self.patch_server_properties("server-port", str(internal_port)))
+            msgs.append(f"wake-on-demand: game will bind :{internal_port}; proxy owns public :{self.sd.port}")
+
         # Symlink world into the install dir so Minecraft writes to the NFS bind mount.
         link = self.install_dir / "world"
         if not link.exists():

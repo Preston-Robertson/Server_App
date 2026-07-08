@@ -1,0 +1,36 @@
+# Example: ARK: Survival Evolved Dedicated Server (SteamCMD app id 376030).
+# Copy to servers/ark.yml. NOTE: this is the ORIGINAL "ARK: Survival Evolved",
+# NOT "ARK: Survival Ascended" (which is a separate app id and a much heavier
+# Unreal 5 build).
+#
+# Ports (open in UFW / router):
+#   {port}/udp    game traffic       (default: 7777)
+#   27015/udp     Steam server query (must be exactly 27015; not configurable)
+#   {port+1}/udp  raw socket         (default: 7778 — inbound peer-to-peer)
+#
+# Saves + configs live at ShooterGame/Saved/ inside install_dir, which the
+# handler symlinks to world_dir so a TrueNAS bind mount holds them.
+#
+# ARK is heavy: expect 8-14 GB RAM at idle, more with mods. Give the LXC
+# headroom or the OOM killer will win.
+#
+# To change the map: after Install, edit install_dir/start.sh and replace
+# "TheIsland" (e.g. TheCenter, Ragnarok, ScorchedEarth). The handler
+# regenerates start.sh on each Install/Update Game Software, so also update
+# the recipe if you want the change to stick across reinstalls.
+name: ark
+type: steamcmd
+install_dir: /srv/gameservers/ark
+world_dir: /opt/gamesrv/worlds/ark
+port: 7777
+memory_mb: 14336                 # ~14 GB; ARK will happily eat more with mods
+steam_app_id: 376030
+steam_beta: ""
+start_cmd: "./start.sh"
+stop_cmd: ""                     # SIGINT via tmux, handled by generated stop.sh
+auto_start_on_boot: false        # ARK is heavy — opt-in per boot
+extra_env: {}
+rcon:
+  enabled: false
+backup:
+  enabled: true

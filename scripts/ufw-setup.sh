@@ -6,7 +6,15 @@ set -euo pipefail
 LAN_CIDR="${LAN_CIDR:-10.0.0.0/24}"
 MANAGER_PORT="${MANAGER_PORT:-8765}"
 # Space-separated list. Add game ports here or via `sudo ufw allow ...` later.
-GAME_PORTS="${GAME_PORTS:-25565/tcp 8211/udp 27015/udp}"   # Minecraft, Palworld, Palworld query
+#   25565/tcp  Minecraft (Java)
+#   8211/udp   Palworld game
+#   27015/udp  Palworld query + ARK query (shared)
+#   7777/udp   Satisfactory single-port + ARK game
+#   7778/udp   ARK raw socket (only needed if you host ARK)
+#   2456/udp   Valheim base (game); 2457/udp query is auto-derived (+1)
+#   15636/udp  Enshrouded game
+#   15637/udp  Enshrouded query
+GAME_PORTS="${GAME_PORTS:-25565/tcp 8211/udp 27015/udp 7777/udp 7778/udp 2456/udp 2457/udp 15636/udp 15637/udp}"
 
 if ! command -v ufw >/dev/null; then
   echo "installing ufw..."

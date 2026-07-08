@@ -274,8 +274,13 @@ def _guard_member_name(name: str, staging: Path) -> None:
 
 # ---------- backups ----------
 
-def make_backup(sd: ServerDef, backup_root: Path) -> Path:
-    """Tarball the world_dir (or backup.target) into backup_root/<name>/<ts>.tgz."""
+def make_backup(sd: ServerDef, backup_root: Path, on_event=None) -> Path:
+    """Tarball the world_dir (or backup.target) into backup_root/<name>/<ts>.tgz.
+
+    Optional ``on_event`` callback (used by the job registry) receives
+    incremental progress dicts as the archive is built. Total is the
+    uncompressed source size — the final .tgz will be smaller.
+    """
     src = Path(sd.backup.target or sd.world_dir).resolve()
     if not src.exists():
         raise HTTPException(status_code=404, detail=f"nothing to back up at {src}")
@@ -284,9 +289,54 @@ def make_backup(sd: ServerDef, backup_root: Path) -> Path:
     ts = time.strftime("%Y%m%d-%H%M%S")
     dest = dest_dir / f"{sd.name}-{ts}.tgz"
     tmp = dest.with_suffix(".tgz.part")
+
+    # Pre-scan so the progress bar shows a meaningful percent from the start.
+    if on_event:
+        on_event({"phase": "scanning", "percent": 0.0, "line": f"scanning {src}"})
+    total_bytes = 0
+    total_files = 0
+    for p in src.rglob("*"):
+        if p.is_file():
+            try:
+                total_bytes += p.stat().st_size
+            except OSError:
+                pass
+            total_files += 1
+    if on_event:
+        on_event({
+            "phase": "archiving",
+            "percent": 0.0,
+            "bytes_done": 0,
+            "bytes_total": total_bytes,
+            "line": f"{total_files} files, {human_bytes(total_bytes)} uncompressed",
+        })
+
+    done_bytes = [0]  # boxed so the filter closure can mutate
+
+    def _tar_filter(ti):
+        if ti.isfile() and ti.size:
+            done_bytes[0] += ti.size
+        if on_event:
+            pct = 100.0 * done_bytes[0] / total_bytes if total_bytes else 0.0
+            on_event({
+                "phase": "archiving",
+                "percent": min(100.0, pct),
+                "bytes_done": done_bytes[0],
+                "bytes_total": total_bytes,
+                "line": ti.name,
+            })
+        return ti
+
     with tarfile.open(tmp, "w:gz") as tar:
-        tar.add(src, arcname=src.name)
+        tar.add(src, arcname=src.name, filter=_tar_filter)
     os.replace(tmp, dest)
+
+    if on_event:
+        on_event({
+            "phase": "complete",
+            "percent": 100.0,
+            "line": f"wrote {dest.name} ({human_bytes(dest.stat().st_size)} on disk)",
+        })
     return dest
 
 
@@ -301,8 +351,12 @@ def list_backups(sd: ServerDef, backup_root: Path) -> list[dict]:
     return out
 
 
-def restore_backup(sd: ServerDef, backup_root: Path, backup_name: str) -> None:
-    """Extract a backup back over world_dir. Server MUST be stopped first."""
+def restore_backup(sd: ServerDef, backup_root: Path, backup_name: str, on_event=None) -> None:
+    """Extract a backup back over world_dir. Server MUST be stopped first.
+
+    Optional ``on_event`` callback receives incremental progress as members
+    are extracted (percent is by uncompressed member size).
+    """
     if "/" in backup_name or "\\" in backup_name or backup_name.startswith("."):
         raise HTTPException(status_code=400, detail="invalid backup name")
     src = backup_root / sd.name / backup_name
@@ -315,15 +369,45 @@ def restore_backup(sd: ServerDef, backup_root: Path, backup_name: str) -> None:
     staging.mkdir()
     try:
         with tarfile.open(src, "r:gz") as tar:
-            # Safe extract: reject any entry that escapes staging.
-            for member in tar.getmembers():
+            if on_event:
+                on_event({"phase": "reading archive", "percent": 0.0, "line": src.name})
+            members = tar.getmembers()
+            # Safe extract: reject any entry that escapes staging before we
+            # start writing anything.
+            for member in members:
                 member_path = (staging / member.name).resolve()
                 try:
                     member_path.relative_to(staging.resolve())
                 except ValueError as e:
                     raise HTTPException(status_code=400, detail=f"unsafe tar entry: {member.name}") from e
-            tar.extractall(staging)  # noqa: S202  -- guarded above
+
+            total = sum(m.size for m in members if m.isfile()) or 1
+            done = 0
+            n = len(members)
+            if on_event:
+                on_event({
+                    "phase": "extracting",
+                    "percent": 0.0,
+                    "bytes_done": 0,
+                    "bytes_total": total,
+                    "line": f"{n} entries, {human_bytes(total)} uncompressed",
+                })
+            for i, m in enumerate(members):
+                tar.extract(m, staging)  # noqa: S202 -- guarded above
+                if m.isfile():
+                    done += m.size
+                if on_event and (i % 25 == 0 or i == n - 1):
+                    pct = 100.0 * done / total
+                    on_event({
+                        "phase": "extracting",
+                        "percent": min(100.0, pct),
+                        "bytes_done": done,
+                        "bytes_total": total,
+                        "line": m.name,
+                    })
         # Move existing world aside, promote restored copy.
+        if on_event:
+            on_event({"phase": "swapping world", "percent": 99.0, "line": str(dest)})
         if dest.exists():
             aside = dest.parent / f".{dest.name}.replaced-{int(time.time())}"
             os.replace(dest, aside)
@@ -334,6 +418,8 @@ def restore_backup(sd: ServerDef, backup_root: Path, backup_name: str) -> None:
             staging.rmdir()
         else:
             os.replace(staging, dest)
+        if on_event:
+            on_event({"phase": "complete", "percent": 100.0, "line": f"restored {src.name}"})
     except Exception:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)

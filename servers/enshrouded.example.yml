@@ -1,0 +1,52 @@
+# Example: Enshrouded Dedicated Server (SteamCMD app id 2278520).
+# Copy to servers/enshrouded.yml.
+#
+# IMPORTANT: Enshrouded ships a Windows-only .exe. This server type runs it
+# under Wine. Before Install, re-run bootstrap.sh with --with-wine on the
+# LXC to install wine-staging:
+#
+#   sudo bash /opt/gamesrv/bootstrap.sh --with-wine
+#
+# Ports (open in UFW / router):
+#   {port}/udp    game traffic       (default: 15636)
+#   {port+1}/udp  Steam server query (default: 15637 \u2014 auto-derived)
+#
+# Wine overhead: expect ~10\u201320% more RAM than a native Linux server. Give
+# it generous memory_mb. Ideal candidate for wake_on_demand + idle_shutdown
+# so it doesn't sit resident when nobody's playing.
+#
+# Config lives in install_dir/enshrouded_server.json. The handler creates
+# a template on first Install and patches gamePort / queryPort /
+# userGroups.password from the fields below. Hand-edits to other fields
+# (slotCount, voiceChatMode, custom userGroups) are preserved across
+# subsequent Installs.
+#
+# Saves are in savegame/ inside install_dir, symlinked to world_dir.
+name: enshrouded
+type: steamcmd
+install_dir: /srv/gameservers/enshrouded
+world_dir: /opt/gamesrv/worlds/enshrouded
+port: 15636
+memory_mb: 12288                 # ~12 GB; Wine adds overhead vs. native
+steam_app_id: 2278520
+steam_beta: ""
+start_cmd: "./start.sh"
+stop_cmd: ""                     # SIGINT via tmux, handled by generated stop.sh
+auto_start_on_boot: false        # opt-in; rely on wake-on-demand below
+extra_env: {}
+rcon:
+  enabled: false
+backup:
+  enabled: true
+# Enshrouded uses userGroups for permissions. server_password sets the
+# 'Guest' group password (what regular players type); admin_password
+# sets the 'Admin' group password. Kept out of any public git remote \u2014
+# see docs/ADDING_SERVERS.md \u00a7\u2764 for the secret-hygiene note.
+passwords:
+  server_password: "change-me-guest"
+  admin_password: "change-me-admin"
+# Wake-on-demand: proxy owns :15636 and starts the game on first packet.
+# Wine cold-start is slower than native, so bump timeout generously.
+wake_on_demand: true
+wake_timeout_sec: 180
+idle_shutdown_min: 20            # stop the game after 20 min empty

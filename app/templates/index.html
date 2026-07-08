@@ -27,6 +27,45 @@
         </div>
       </div>
 
+      <!-- Aggregate stats: total RAM used across running servers, counts,
+           disk usage of the world/install roots. Populated by /api/stats. -->
+      <div id="stats-bar" class="stats-bar" hidden>
+        <div class="stat-cell">
+          <div class="stat-label">Servers</div>
+          <div class="stat-value" id="stat-servers">—</div>
+          <div class="stat-sub" id="stat-servers-sub"></div>
+        </div>
+        <div class="stat-cell stat-cell-wide">
+          <div class="stat-label">Combined RAM</div>
+          <div class="stat-value" id="stat-ram">—</div>
+          <div class="progress-bar stat-bar">
+            <div class="progress-bar-fill" id="stat-ram-fill"></div>
+          </div>
+          <div class="stat-sub" id="stat-ram-sub"></div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-label">Worlds disk</div>
+          <div class="stat-value" id="stat-worlds">—</div>
+          <div class="progress-bar stat-bar">
+            <div class="progress-bar-fill" id="stat-worlds-fill"></div>
+          </div>
+          <div class="stat-sub" id="stat-worlds-sub"></div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-label">Install disk</div>
+          <div class="stat-value" id="stat-install">—</div>
+          <div class="progress-bar stat-bar">
+            <div class="progress-bar-fill" id="stat-install-fill"></div>
+          </div>
+          <div class="stat-sub" id="stat-install-sub"></div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-label">Manager up</div>
+          <div class="stat-value" id="stat-uptime">—</div>
+          <div class="stat-sub muted">this process</div>
+        </div>
+      </div>
+
       <div id="server-grid" class="server-grid">
         <!-- server cards injected by JS -->
       </div>
@@ -52,6 +91,32 @@
             <button class="subtab" data-tab="def">Definition</button>
           </div>
 
+          <!--
+            Shared progress widget for install / update / backup / restore
+            jobs. Lives outside all .subtab-body divs so it stays visible
+            regardless of which subtab the user is on.
+          -->
+          <div id="install-progress" class="install-progress" hidden>
+            <div class="ip-header">
+              <span class="ip-kind" id="progress-kind">install</span>
+              <span class="ip-phase" id="progress-phase">starting…</span>
+              <span class="ip-status" id="progress-status"></span>
+              <button class="btn btn-ghost btn-tiny" id="progress-close" title="Hide">&times;</button>
+            </div>
+            <div class="progress-bar">
+              <div class="progress-bar-fill" id="progress-bar-fill"></div>
+            </div>
+            <div class="ip-meta">
+              <span id="progress-percent">0%</span>
+              <span id="progress-bytes"></span>
+              <span id="progress-elapsed" class="muted"></span>
+            </div>
+            <pre class="ip-tail" id="progress-tail" hidden></pre>
+            <div class="ip-toggle">
+              <label><input type="checkbox" id="progress-show-log" /> Show live log</label>
+            </div>
+          </div>
+
           <div class="subtab-body" data-body="control">
             <div class="row">
               <button class="btn btn-success" data-action="start">Start</button>
@@ -64,6 +129,38 @@
             <div class="row">
               <button class="btn btn-primary" data-action="install">Install / Reprovision</button>
               <button class="btn"             data-action="update-type">Update Game Software</button>
+            </div>
+
+            <hr />
+            <h3 style="margin: 6px 0;">Idle shutdown &amp; wake-on-demand</h3>
+            <div class="iw-panel">
+              <div class="iw-row">
+                <label class="inline">
+                  <input type="checkbox" id="iw-idle-enabled" />
+                  <span><strong>Auto-shutdown when empty</strong></span>
+                </label>
+                <span class="muted">after</span>
+                <input type="number" id="iw-idle-min" min="1" max="1440" step="1" placeholder="20" />
+                <span class="muted">min</span>
+                <button class="btn btn-tiny btn-primary" id="iw-save-idle">Save</button>
+                <span id="iw-idle-status" class="small muted"></span>
+              </div>
+              <div class="iw-row">
+                <label class="inline">
+                  <input type="checkbox" id="iw-wake-enabled" />
+                  <span><strong>Wake on demand</strong> <em>(UDP + Minecraft TCP)</em></span>
+                </label>
+                <span class="muted">timeout</span>
+                <input type="number" id="iw-wake-sec" min="10" max="600" step="5" placeholder="90" />
+                <span class="muted">sec</span>
+                <button class="btn btn-tiny btn-primary" id="iw-save-wake">Save</button>
+                <span id="iw-wake-status" class="small muted"></span>
+              </div>
+              <p class="small muted" id="iw-reinstall-hint" hidden>
+                <strong>Reinstall required</strong> — toggling wake-on-demand remaps the game to
+                <code>port + 10000</code>. Click <strong>Install / Reprovision</strong> above so
+                <code>start.sh</code> picks up the new port.
+              </p>
             </div>
 
             <hr />
@@ -437,7 +534,7 @@
               <select name="type" id="f-type" required>
                 <option value="minecraft-java">Minecraft — Vanilla / Paper / Purpur</option>
                 <option value="minecraft-forge">Minecraft — Forge (modded, 1.17+)</option>
-                <option value="steamcmd">SteamCMD (Palworld, Valheim, ARK, …)</option>
+                <option value="steamcmd">SteamCMD (Palworld, Satisfactory, Valheim, ARK, …)</option>
                 <option value="custom">Custom (bring your own start.sh)</option>
               </select>
             </label>
@@ -466,7 +563,7 @@
             <legend>SteamCMD</legend>
             <div class="form-row two-col">
               <label>
-                <span>Steam App ID <em>(2394010 = Palworld, 896660 = Valheim)</em></span>
+                <span>Steam App ID <em>(2394010 = Palworld, 1690800 = Satisfactory, 376030 = ARK:SE, 2278520 = Enshrouded [Wine], 896660 = Valheim)</em></span>
                 <input name="steam_app_id" id="f-steam-app-id" type="number" min="1" />
               </label>
               <label>
@@ -488,6 +585,77 @@
                 <input name="forge_version" id="f-forge-version" placeholder="e.g. 47.3.0" />
               </label>
             </div>
+          </fieldset>
+
+          <fieldset id="fs-access">
+            <legend>Access &amp; Idle</legend>
+            <div class="form-row two-col">
+              <label>
+                <span>Who can join</span>
+                <select id="f-access-mode">
+                  <option value="public">Public (no allowlist)</option>
+                  <option value="steamid_allowlist">Steam ID allowlist</option>
+                  <option value="ip_allowlist">IP allowlist</option>
+                </select>
+              </label>
+              <label>
+                <span>Idle shutdown (min) <em>(blank = never)</em></span>
+                <input id="f-idle-min" type="number" min="0" placeholder="e.g. 20" />
+              </label>
+            </div>
+            <label id="f-steamids-wrap" hidden>
+              <span>Allowed Steam IDs <em>(one 17-digit steamID64 per line)</em></span>
+              <textarea id="f-steamids" rows="3" placeholder="76561198000000000&#10;76561198111111111"></textarea>
+            </label>
+            <label id="f-ips-wrap" hidden>
+              <span>Allowed IPs / CIDRs <em>(one per line; enforcement pending — see docs)</em></span>
+              <textarea id="f-ips" rows="3" placeholder="10.0.0.5&#10;100.64.0.0/10"></textarea>
+            </label>
+            <p class="small muted" id="f-access-note">
+              Native Steam ID enforcement works on <strong>ARK: SE / Ascended</strong> today.
+              Other games fall back to password + IP allowlist.
+            </p>
+
+            <hr />
+
+            <div class="form-row two-col">
+              <label class="inline">
+                <input id="f-wake-on-demand" type="checkbox" />
+                <span>Wake on demand <em>(UDP + Minecraft TCP)</em></span>
+              </label>
+              <label id="f-wake-timeout-wrap" hidden>
+                <span>Wake timeout (sec)</span>
+                <input id="f-wake-timeout" type="number" min="10" max="600" value="90" />
+              </label>
+            </div>
+            <p class="small muted">
+              With wake-on-demand, the manager's proxy owns the public port and
+              buffers client packets while the game starts — no "first attempt
+              fails" for players. The game process is remapped to
+              <code>port + 10000</code> internally, so <strong>reinstall
+              after toggling</strong>. Minecraft SLP status pings are
+              answered locally so idle server-list refreshes don't wake the JVM.
+            </p>
+          </fieldset>
+
+          <fieldset id="fs-passwords" hidden>
+            <legend>Game passwords <em>(Palworld / ARK / Valheim)</em></legend>
+            <div class="form-row two-col">
+              <label>
+                <span>Server password <em>(what players type to join)</em></span>
+                <input id="f-server-pw" type="password" autocomplete="new-password" />
+              </label>
+              <label>
+                <span>Admin password <em>(ARK ServerAdminPassword; Palworld AdminPassword)</em></span>
+                <input id="f-admin-pw" type="password" autocomplete="new-password" />
+              </label>
+            </div>
+            <p class="small muted">
+              Passwords are written to <code>servers/&lt;name&gt;.yml</code>.
+              Keep that directory out of any public git remote.
+              Avoid spaces or the characters <code>?</code> <code>&amp;</code>
+              <code>"</code> <code>'</code> — those break the game's parser.
+            </p>
           </fieldset>
 
           <details class="advanced">

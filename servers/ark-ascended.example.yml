@@ -1,0 +1,44 @@
+# Example: ARK: Survival Ascended Dedicated Server (SteamCMD app id 2430930).
+# Copy to servers/ark-ascended.yml.
+#
+# CAVEAT: ARK: Survival Ascended is Unreal Engine 5 and MUCH heavier than
+# ARK: SE. Expect 16-24 GB RAM at idle for a single-map server. Native Linux
+# server support from the developer has been intermittent across releases;
+# if steamcmd installs Windows-only files (no ShooterGame/Binaries/Linux),
+# you'll need Wine \u2014 that's a separate track we haven't wired up yet.
+#
+# Map names use the _WP (World Partition) suffix in Ascended:
+#   TheIsland_WP, ScorchedEarth_WP, Aberration_WP, TheCenter_WP, Extinction_WP
+# To change map, edit install_dir/start.sh after Install (the handler
+# regenerates it each Install; also update the recipe if you want the
+# change to stick across reinstalls).
+#
+# Ports (open in UFW / router):
+#   {port}/udp   game traffic       (default: 7777)
+#   27015/udp    Steam server query (must be exactly 27015; not configurable)
+name: ark-ascended
+type: steamcmd
+install_dir: /srv/gameservers/ark-ascended
+world_dir: /opt/gamesrv/worlds/ark-ascended
+port: 7777
+memory_mb: 24576                 # ~24 GB; Ascended is greedy. Tune to LXC cap.
+steam_app_id: 2430930
+steam_beta: ""
+start_cmd: "./start.sh"
+stop_cmd: ""
+auto_start_on_boot: false        # opt-in; Ascended eats RAM even idle
+extra_env: {}
+rcon:
+  enabled: false
+backup:
+  enabled: true
+# Locks the server to a Steam ID whitelist via ARK's native -exclusivejoin
+# flag. Delete this block to make it public, or change mode to ip_allowlist.
+access:
+  mode: steamid_allowlist
+  allowed_steamids:
+    - "76561198000000000"        # replace with your + friends' steamID64s
+    - "76561198111111111"
+# Scale-to-zero: shut down after 20 minutes with zero players. The
+# watchdog polls A2S_INFO on 27015/UDP. Set to null / 0 to disable.
+idle_shutdown_min: 20
