@@ -22,7 +22,13 @@ ExecStart=/srv/gameservers/%i/start.sh
 # stop.sh must be graceful (send console 'stop' via tmux, wait). Systemd's own
 # SIGTERM would corrupt Minecraft worlds — the stop script MUST wait for a clean exit.
 ExecStop=/srv/gameservers/%i/stop.sh
-TimeoutStopSec=120
+# Modded packs (Forge with Deeper Darker, Create, etc.) can take 2+ minutes
+# to flush custom dimensions during 'stop'. Give the whole stop sequence
+# 5 minutes before systemd escalates to SIGTERM/SIGKILL — otherwise mid-save
+# world corruption is very real. This value must be >= (stop.sh worst-case
+# wait + a small buffer for the JVM to actually exit after tmux dies). See
+# app/control.py::_STOP_TIMEOUT_SEC which polls systemctl for up to 240s.
+TimeoutStopSec=300
 Restart=on-failure
 RestartSec=10
 KillMode=mixed

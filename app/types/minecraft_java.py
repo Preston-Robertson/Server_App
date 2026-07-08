@@ -41,13 +41,21 @@ if ! command -v tmux >/dev/null; then
   exit 1
 fi
 
+# systemd runs us without a controlling terminal and often with TERM unset.
+# Older tmux (<3.3) prints "open terminal failed: not a terminal" and exits
+# 1 in that case even with -d. Setting a known-good TERM and using -f
+# /dev/null (so tmux doesn't try to source a user config that references a
+# terminal) avoids that failure mode.
+export TERM="${TERM:-screen-256color}"
+TMUX="tmux -f /dev/null"
+
 # Kill any stale detached session with the same name.
-tmux kill-session -t "$SESSION" 2>/dev/null || true
+$TMUX kill-session -t "$SESSION" 2>/dev/null || true
 
 # Start tmux DETACHED (no PTY needed under systemd), then block until the
 # session ends. See minecraft_forge.py for the design rationale.
-tmux new-session -d -s "$SESSION" -n mc "java -Xms{xms}M -Xmx{xmx}M {extra_args} -jar $JAR nogui"
-while tmux has-session -t "$SESSION" 2>/dev/null; do
+$TMUX new-session -d -s "$SESSION" -n mc "java -Xms{xms}M -Xmx{xmx}M {extra_args} -jar $JAR nogui"
+while $TMUX has-session -t "$SESSION" 2>/dev/null; do
   sleep 1
 done
 """

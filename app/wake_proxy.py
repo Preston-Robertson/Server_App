@@ -600,14 +600,31 @@ class WakeProxy:
                 )
                 return
 
-        # Splice the connection to the backend.
-        try:
-            backend = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            backend.settimeout(5.0)
-            backend.connect(("127.0.0.1", p.internal_port))
-            backend.settimeout(None)
-        except OSError as e:
-            _mc_send_login_disconnect(conn, f"Backend unavailable: {e}")
+        # Splice the connection to the backend. Even after is_running
+        # flipped (which requires a successful SLP probe), the JVM's
+        # accept-backlog can momentarily reject a fresh connection under
+        # a burst; retry for a few seconds before giving up so the player
+        # doesn't see "Backend unavailable" for a purely transient error.
+        backend: Optional[socket.socket] = None
+        last_err: Optional[OSError] = None
+        connect_deadline = time.monotonic() + 8.0
+        while time.monotonic() < connect_deadline and not self._stop.is_set():
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(3.0)
+                s.connect(("127.0.0.1", p.internal_port))
+                s.settimeout(None)
+                backend = s
+                break
+            except OSError as e:
+                last_err = e
+                try:
+                    s.close()
+                except (OSError, UnboundLocalError):
+                    pass
+                time.sleep(0.4)
+        if backend is None:
+            _mc_send_login_disconnect(conn, f"Backend unavailable: {last_err}")
             return
 
         # Replay the client bytes we already read (handshake + any queued
@@ -705,18 +722,48 @@ class WakeProxy:
             st = control.status(sd)
         except Exception:
             return
-        was_running = p.is_running
-        p.is_running = (st.active == "active")
-        if not p.is_running and was_running:
-            # Server was stopped (probably by the idle watchdog). Drop
-            # client sockets so we don't route stale traffic to a dead port.
-            with self._lock:
-                for cm in p.clients.values():
-                    try:
-                        cm.outbound.close()
-                    except OSError:
-                        pass
-                p.clients.clear()
+
+        active = (st.active == "active")
+
+        # Demote first: if systemd says inactive, drop any state we had
+        # and close client sockets so we don't route stale traffic.
+        if not active:
+            if p.is_running:
+                p.is_running = False
+                with self._lock:
+                    for cm in p.clients.values():
+                        try:
+                            cm.outbound.close()
+                        except OSError:
+                            pass
+                    p.clients.clear()
+            return
+
+        # Already known-running, nothing to reconcile.
+        if p.is_running:
+            return
+
+        # A wake is in flight — let _wake_target's own probe promote when
+        # it's confirmed the game answers. Double-probing here would just
+        # add load and race the worker.
+        if p.waking_since is not None:
+            return
+
+        # systemd-active but we haven't promoted yet: the game was started
+        # outside our knowledge (operator hit Start, auto-start on boot,
+        # or a manual `systemctl start`). Probe the native protocol before
+        # flipping is_running — a modded Forge server can be systemd-active
+        # for 60-120s of mod loading before it actually binds the port.
+        # If we promoted on ActiveState alone, the next login-wake would
+        # race into a backend.connect() and get ECONNREFUSED, which the
+        # player sees as "Backend unavailable: [Errno 111] Connection
+        # refused" (see the login-disconnect path in _handle_mc_login_wake).
+        if p.protocol == "tcp":
+            result = probe_mc_slp("127.0.0.1", p.internal_port, timeout=1.5)
+        else:
+            result = probe_a2s("127.0.0.1", p.internal_port, timeout=1.5)
+        if result is not None:
+            p.is_running = True
 
     def _prune_idle_clients(self, p: _ServerProxy, now: float) -> None:
         stale = [addr for addr, cm in p.clients.items()

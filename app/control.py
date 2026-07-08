@@ -35,11 +35,12 @@ def start(sd: ServerDef) -> subprocess.CompletedProcess:
     return _run(["systemctl", "start", _unit(sd.name)])
 
 
-# Must comfortably exceed the unit's TimeoutStopSec (120s) plus stop.sh overhead
-# (up to ~65s for Minecraft's world-save wait) or subprocess.run raises
-# TimeoutExpired before systemctl actually returns. The API layer catches
-# TimeoutExpired and returns 504, but we'd rather not hit it under normal load.
-_STOP_TIMEOUT_SEC = 240
+# Must comfortably exceed the unit's TimeoutStopSec (300s in
+# systemd/gamesrv@.service) plus a bit of syscall overhead — otherwise
+# subprocess.run raises TimeoutExpired for stops that systemd would have
+# completed cleanly. The API layer catches TimeoutExpired and returns 504,
+# but we'd rather not hit it for a stop that's actually still going.
+_STOP_TIMEOUT_SEC = 330
 
 
 def stop(sd: ServerDef) -> subprocess.CompletedProcess:
