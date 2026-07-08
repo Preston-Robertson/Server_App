@@ -86,18 +86,28 @@ done
 
 _STOP_TEMPLATE = """#!/usr/bin/env bash
 # Graceful stop: send 'stop' to the Forge console via tmux, then wait for
-# the JVM to exit. Modded packs (Deeper Darker etc.) can take a while to
-# flush all custom dimensions — allow up to 120s before systemd hard-kills.
+# the JVM to exit. Modded packs (Deeper Darker, Create, etc.) can take
+# multiple minutes to flush all custom dimensions — wait up to ~280s before
+# returning, which stays safely under systemd's TimeoutStopSec=300 in
+# systemd/gamesrv@.service. If we return earlier (as the old 120s loop
+# did), systemd's KillMode=mixed immediately SIGKILLs the JVM and can
+# corrupt the mid-save world.
 set -euo pipefail
 SESSION="gs-{name}"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   tmux send-keys -t "$SESSION" "say Server stopping in 10s..." Enter || true
   sleep 10
   tmux send-keys -t "$SESSION" "stop" Enter || true
-  for _ in $(seq 1 120); do
+  # Heartbeat every 30s so the journal shows the stop is still progressing
+  # rather than looking hung.
+  for i in $(seq 1 280); do
     tmux has-session -t "$SESSION" 2>/dev/null || exit 0
+    if (( i % 30 == 0 )); then
+      echo "stop.sh: still waiting for tmux session to exit (${{i}}s elapsed)" >&2
+    fi
     sleep 1
   done
+  echo "stop.sh: JVM did not exit within 280s — systemd will now SIGKILL the cgroup" >&2
 fi
 """
 

@@ -63,18 +63,24 @@ done
 
 _STOP_TEMPLATE = """#!/usr/bin/env bash
 # Graceful stop: send 'stop' to the MC console via tmux, wait, then let
-# systemd finish. Prevents world corruption.
+# systemd finish. Prevents world corruption. Waits up to 240s — large
+# vanilla worlds can take a while to flush and this stays within the
+# systemd TimeoutStopSec=300 budget in systemd/gamesrv@.service.
 set -euo pipefail
 SESSION="gs-{name}"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   tmux send-keys -t "$SESSION" "say Server stopping in 5s..." Enter || true
   sleep 5
   tmux send-keys -t "$SESSION" "stop" Enter || true
-  # Wait up to 60s for Minecraft to exit.
-  for _ in $(seq 1 60); do
+  # Heartbeat every 30s so the journal shows the stop is progressing.
+  for i in $(seq 1 240); do
     tmux has-session -t "$SESSION" 2>/dev/null || exit 0
+    if (( i % 30 == 0 )); then
+      echo "stop.sh: still waiting for tmux session to exit (${{i}}s elapsed)" >&2
+    fi
     sleep 1
   done
+  echo "stop.sh: JVM did not exit within 240s — systemd will now SIGKILL the cgroup" >&2
 fi
 """
 
