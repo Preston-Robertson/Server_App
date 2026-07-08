@@ -522,6 +522,10 @@ async function refreshServers() {
     renderServerGrid(rows);
     updatePerfHistory(rows);
     if (stats) renderStatsBar(stats);
+    // Refresh the RAM history chart if the card is visible. Fetching is
+    // independent of the stats above (different endpoint + user-selected
+    // timeframe) so we don't parallelize inside the Promise.all above.
+    refreshRamChart().catch(() => {});
     const badge = $("#auth-badge");
     if (badge && badge.classList.contains("err")) { badge.textContent = "token loaded"; badge.className = "ok"; }
   } catch (e) {
@@ -583,6 +587,210 @@ function setBarClass(el, pct) {
   if (pct >= 90) el.classList.add("err");
   else if (pct >= 75) el.classList.add("warn");
 }
+
+// ---------- Rolling RAM history chart ----------
+//
+// The manager samples aggregate RAM every 15s (see app/perf.py) and
+// keeps up to 24h in memory. This block fetches the selected window,
+// draws it into a vanilla <canvas> (no chart library — the plot is
+// intentionally simple), and re-renders on each dashboard tick.
+//
+// Data shape from /api/stats/history:
+//   { minutes, sample_interval_sec, samples: [{t_ms, used_bytes,
+//     reserved_bytes, limit_bytes, running}, ...] }
+
+const RAM_CHART_STATE = { minutes: 60, lastRender: 0 };
+
+function ramChartRange() {
+  const el = $("#ram-chart-range");
+  const n = el ? Number(el.value) : 60;
+  return Number.isFinite(n) && n > 0 ? n : 60;
+}
+
+async function refreshRamChart() {
+  const card = $("#ram-chart-card");
+  if (!card) return;
+  const minutes = ramChartRange();
+  RAM_CHART_STATE.minutes = minutes;
+  let data;
+  try {
+    data = await api(`/api/stats/history?minutes=${minutes}`);
+  } catch {
+    return;   // silent — chart is best-effort like the stats bar
+  }
+  card.hidden = false;
+  drawRamChart(data);
+}
+
+function drawRamChart(data) {
+  const canvas = $("#ram-chart");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+
+  // Handle HiDPI: back the canvas with devicePixelRatio-scaled pixels
+  // so lines stay crisp. Only resize the backing store when needed so we
+  // don't churn the GPU on every 5s tick.
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 900;
+  const cssH = canvas.clientHeight || 180;
+  const needW = Math.round(cssW * dpr);
+  const needH = Math.round(cssH * dpr);
+  if (canvas.width !== needW || canvas.height !== needH) {
+    canvas.width = needW;
+    canvas.height = needH;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const samples = (data && data.samples) || [];
+  const sub = $("#ram-chart-sub");
+  if (samples.length === 0) {
+    if (sub) sub.textContent = `no samples yet in the last ${data && data.minutes || RAM_CHART_STATE.minutes} min`;
+    // Draw the empty grid so the card doesn't look broken.
+    drawChartFrame(ctx, cssW, cssH, RAM_CHART_STATE.minutes, 0, 1);
+    return;
+  }
+
+  // Y-axis: use the container limit if we have one, else max observed.
+  const limit = samples.reduce((m, s) => Math.max(m, s.limit_bytes || 0), 0);
+  const maxObs = samples.reduce((m, s) => Math.max(m,
+    s.used_bytes || 0, s.reserved_bytes || 0, s.limit_bytes || 0), 0);
+  const yMax = limit > 0 ? limit : Math.max(1, maxObs * 1.1);
+  const now = Date.now();
+  const windowMs = RAM_CHART_STATE.minutes * 60_000;
+  const xMin = now - windowMs;
+
+  drawChartFrame(ctx, cssW, cssH, RAM_CHART_STATE.minutes, yMax, limit);
+
+  const pad = { l: 52, r: 8, t: 8, b: 20 };
+  const plotW = cssW - pad.l - pad.r;
+  const plotH = cssH - pad.t - pad.b;
+  const xOf = (t) => pad.l + ((t - xMin) / windowMs) * plotW;
+  const yOf = (v) => pad.t + plotH - (v / yMax) * plotH;
+
+  // Filled "used" line first (behind), then "reserved" line on top.
+  const cs = getComputedStyle(document.documentElement);
+  const cAccent   = cs.getPropertyValue("--accent").trim()   || "#4f8cff";
+  const cWarn     = cs.getPropertyValue("--warn").trim()     || "#f5a524";
+  const cTextDim  = cs.getPropertyValue("--text-dim").trim() || "#9aa3b2";
+
+  // Fill under "used".
+  ctx.beginPath();
+  ctx.moveTo(xOf(samples[0].t_ms), pad.t + plotH);
+  for (const s of samples) ctx.lineTo(xOf(s.t_ms), yOf(s.used_bytes || 0));
+  ctx.lineTo(xOf(samples[samples.length - 1].t_ms), pad.t + plotH);
+  ctx.closePath();
+  ctx.fillStyle = hexAlpha(cAccent, 0.16);
+  ctx.fill();
+
+  // Used line
+  strokePath(ctx, samples, xOf, yOf, "used_bytes", cAccent, 1.75);
+  // Reserved line (dashed so it visually differs from used)
+  ctx.save();
+  ctx.setLineDash([4, 3]);
+  strokePath(ctx, samples, xOf, yOf, "reserved_bytes", cWarn, 1.5);
+  ctx.restore();
+
+  // Sub-caption: latest values.
+  const latest = samples[samples.length - 1];
+  if (sub) {
+    sub.textContent =
+      `Now: ${fmtBytes(latest.used_bytes || 0)} used · `
+      + `${fmtBytes(latest.reserved_bytes || 0)} reserved`
+      + (latest.limit_bytes ? ` / ${fmtBytes(latest.limit_bytes)} limit` : "")
+      + ` · ${samples.length} samples over last ${RAM_CHART_STATE.minutes} min`;
+  }
+}
+
+function drawChartFrame(ctx, w, h, minutes, yMax, limit) {
+  const pad = { l: 52, r: 8, t: 8, b: 20 };
+  const plotW = w - pad.l - pad.r;
+  const plotH = h - pad.t - pad.b;
+  const cs = getComputedStyle(document.documentElement);
+  const cBorder  = cs.getPropertyValue("--border").trim()   || "#2a2f3a";
+  const cTextDim = cs.getPropertyValue("--text-dim").trim() || "#9aa3b2";
+
+  // Horizontal gridlines at 0/25/50/75/100% of yMax.
+  ctx.strokeStyle = cBorder;
+  ctx.lineWidth = 1;
+  ctx.font = "10px system-ui, sans-serif";
+  ctx.fillStyle = cTextDim;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + (plotH * i) / 4;
+    ctx.beginPath();
+    ctx.moveTo(pad.l, y);
+    ctx.lineTo(pad.l + plotW, y);
+    ctx.stroke();
+    const val = yMax * (1 - i / 4);
+    ctx.fillText(fmtBytesShort(val), pad.l - 4, y);
+  }
+
+  // Limit line — a solid horizontal line if a limit is known and it fits
+  // within yMax.
+  if (limit > 0 && limit <= yMax) {
+    const y = pad.t + plotH - (limit / yMax) * plotH;
+    ctx.save();
+    ctx.strokeStyle = cTextDim;
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath();
+    ctx.moveTo(pad.l, y);
+    ctx.lineTo(pad.l + plotW, y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // X-axis ticks — 5 evenly spaced labels (oldest → now).
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  for (let i = 0; i <= 4; i++) {
+    const x = pad.l + (plotW * i) / 4;
+    const ago = Math.round((minutes * (1 - i / 4)));
+    const label = ago === 0 ? "now" : `-${ago}m`;
+    ctx.fillText(label, x, pad.t + plotH + 4);
+  }
+}
+
+function strokePath(ctx, samples, xOf, yOf, key, color, width) {
+  ctx.beginPath();
+  let started = false;
+  for (const s of samples) {
+    const v = s[key];
+    if (v == null) continue;
+    const x = xOf(s.t_ms);
+    const y = yOf(v);
+    if (!started) { ctx.moveTo(x, y); started = true; }
+    else ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.stroke();
+}
+
+function fmtBytesShort(n) {
+  // Compact variant for axis labels (e.g. "3.2G").
+  if (!n) return "0";
+  const units = ["B", "K", "M", "G", "T"];
+  let i = 0; let v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v >= 10 ? v.toFixed(0) : v.toFixed(1)}${units[i]}`;
+}
+
+function hexAlpha(hex, alpha) {
+  // #rrggbb -> rgba(r,g,b,alpha). Falls through unchanged for anything
+  // exotic (rgb(), hsl(), etc.) — the fill just won't be translucent.
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return hex;
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
+
+// Re-render when the operator changes the timeframe.
+document.addEventListener("DOMContentLoaded", () => {
+  const sel = $("#ram-chart-range");
+  if (sel) sel.addEventListener("change", () => refreshRamChart().catch(() => {}));
+});
 
 // ---------- Perf history + sparklines ----------
 //

@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import select
 import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -176,6 +177,11 @@ class WakeProxy:
 
     def __init__(self) -> None:
         self._proxies: dict[str, _ServerProxy] = {}
+        # name -> (public_port, protocol, error_string) for defs whose wake
+        # proxy we couldn't bind. Surfaced via snapshot() so the dashboard
+        # can flag the problem instead of failing silently (which manifests
+        # to players as raw "Connection refused" on login).
+        self._bind_errors: dict[str, tuple[int, str, str]] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -203,6 +209,8 @@ class WakeProxy:
                     "public_port": p.public_port,
                     "internal_port": p.internal_port,
                     "protocol": p.protocol,
+                    "bound": True,
+                    "bind_error": "",
                     "is_running": p.is_running,
                     "waking": p.waking_since is not None,
                     "waking_sec": waking_for,
@@ -210,6 +218,23 @@ class WakeProxy:
                     "active_clients": len(p.clients) if p.protocol == "udp" else p.tcp_conn_count,
                     "wake_timeout_sec": p.wake_timeout_sec,
                     "last_wake_error": p.last_wake_error,
+                }
+            for name, (pub, proto, err) in self._bind_errors.items():
+                if name in out:
+                    continue
+                out[name] = {
+                    "public_port": pub,
+                    "internal_port": pub + WAKE_INTERNAL_OFFSET,
+                    "protocol": proto,
+                    "bound": False,
+                    "bind_error": err,
+                    "is_running": False,
+                    "waking": False,
+                    "waking_sec": 0,
+                    "buffered_packets": 0,
+                    "active_clients": 0,
+                    "wake_timeout_sec": 0,
+                    "last_wake_error": "",
                 }
             return out
 
@@ -259,6 +284,11 @@ class WakeProxy:
             for name in list(self._proxies.keys()):
                 if name not in wanted or self._proxies[name].protocol != wanted[name][3]:
                     self._close_proxy_locked(name)
+            # Purge stale bind-error entries for defs that no longer want
+            # wake-on-demand.
+            for name in list(self._bind_errors.keys()):
+                if name not in wanted:
+                    self._bind_errors.pop(name, None)
 
             # Bind new proxies. Bind can fail if the game currently holds
             # the port (operator toggled wake_on_demand on but hasn't
@@ -267,6 +297,7 @@ class WakeProxy:
                 if name in self._proxies:
                     # Update mutable settings without rebinding.
                     self._proxies[name].wake_timeout_sec = wto
+                    self._bind_errors.pop(name, None)
                     continue
                 try:
                     if proto == "udp":
@@ -280,11 +311,33 @@ class WakeProxy:
                         s.setblocking(False)
                         s.bind(("0.0.0.0", pub))
                         s.listen(64)
-                except OSError:
+                except OSError as e:
                     # Almost always EADDRINUSE — the game still binds the
                     # public port. Operator needs to reinstall so the game
-                    # moves to the internal port.
+                    # moves to the internal port. Surface it: log once per
+                    # transition and expose via snapshot so the dashboard
+                    # can flag it. Otherwise players hit raw "Connection
+                    # refused" with nothing in the logs.
+                    err = f"bind :{pub}/{proto} failed: {e}"
+                    prev = self._bind_errors.get(name)
+                    if prev is None or prev[2] != err:
+                        print(
+                            f"[wake_proxy] {name}: {err} "
+                            f"(will retry every 5s; likely the game process "
+                            f"still owns :{pub} — reinstall to move it to "
+                            f":{internal})",
+                            file=sys.stderr, flush=True,
+                        )
+                    self._bind_errors[name] = (pub, proto, err)
                     continue
+                # Success — clear any stale error and log the bind.
+                if name in self._bind_errors:
+                    self._bind_errors.pop(name, None)
+                    print(
+                        f"[wake_proxy] {name}: now bound to :{pub}/{proto} "
+                        f"(backend :{internal})",
+                        file=sys.stderr, flush=True,
+                    )
                 self._proxies[name] = _ServerProxy(
                     name=name,
                     public_port=pub,

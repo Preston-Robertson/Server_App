@@ -31,13 +31,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+import subprocess
+
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from . import control, registry, uploads, updater, git_source, env_file, jobs, watchdog, wake_proxy
+from . import control, registry, uploads, updater, git_source, env_file, jobs, watchdog, wake_proxy, perf
 from .auth import require_token
 from .config import settings
 from .types import handler_for
@@ -63,6 +65,10 @@ def _startup() -> None:
     # UDP wake-on-demand proxy. Only binds the public port of servers with
     # wake_on_demand=true; unmentioned defs incur zero cost.
     wake_proxy.wake_proxy.start()
+    # Background RAM sampler for the dashboard history chart. Samples the
+    # same aggregate the /api/stats endpoint returns, at a fixed cadence,
+    # so the chart is smooth regardless of when the UI polls.
+    perf.perf_sampler.start(_collect_ram_sample)
 
 
 # ---------- health / dashboard ----------
@@ -133,22 +139,28 @@ def api_stats() -> dict:
     """
     total = running = failed = stopped = 0
     ram_used = 0
-    ram_cap_sum = 0  # sum of per-server memory_mb (informational)
+    # "reserved" = memory_mb sum for servers that are currently active. A
+    # stopped server's memory_mb doesn't consume anything on the host, so
+    # counting it here would give a misleading "we're out of RAM" signal.
+    ram_reserved = 0
+    ram_configured = 0   # sum across all defs (informational only)
     for sd in registry.list_defs():
         total += 1
         try:
             st = control.status(sd)
         except Exception:
             continue
+        cap_bytes = (sd.memory_mb or 0) * 1024 * 1024
+        ram_configured += cap_bytes
         if st.active == "active":
             running += 1
+            ram_reserved += cap_bytes
         elif st.active == "failed":
             failed += 1
         else:
             stopped += 1
         if st.mem_bytes:
             ram_used += st.mem_bytes
-        ram_cap_sum += (sd.memory_mb or 0) * 1024 * 1024
 
     limit = _read_cgroup_mem_limit()
     mem_total = _read_meminfo_total()
@@ -156,6 +168,7 @@ def api_stats() -> dict:
     # MemTotal (which inside an LXC is usually the container's view anyway).
     ram_limit = limit or mem_total
     ram_percent = (100.0 * ram_used / ram_limit) if (ram_limit and ram_used) else 0.0
+    ram_available = max(0, (ram_limit or 0) - ram_reserved) if ram_limit else 0
 
     return {
         "servers": {
@@ -165,7 +178,9 @@ def api_stats() -> dict:
         "ram": {
             "used_bytes": ram_used,
             "limit_bytes": ram_limit,
-            "reserved_bytes": ram_cap_sum,   # sum of memory_mb across all defs
+            "reserved_bytes": ram_reserved,        # active-only (what's actually held)
+            "configured_bytes": ram_configured,    # sum across all defs (informational)
+            "available_bytes": ram_available,      # limit - reserved (headroom for a new start)
             "percent": round(ram_percent, 1),
         },
         "disk": {
@@ -176,6 +191,74 @@ def api_stats() -> dict:
         "manager": {
             "uptime_sec": int(_time.monotonic() - _MANAGER_STARTED_MONO),
         },
+    }
+
+
+def _ram_snapshot(exclude_name: str | None = None) -> dict:
+    """Compute available RAM headroom right now.
+
+    Reserved = sum of memory_mb for currently-active servers (optionally
+    excluding one — used by the start pre-flight check so that restarting
+    an already-active server doesn't double-count its own reservation).
+    """
+    reserved = 0
+    for sd in registry.list_defs():
+        if exclude_name is not None and sd.name == exclude_name:
+            continue
+        try:
+            st = control.status(sd)
+        except Exception:
+            continue
+        if st.active == "active":
+            reserved += (sd.memory_mb or 0) * 1024 * 1024
+    limit = _read_cgroup_mem_limit() or _read_meminfo_total() or 0
+    return {
+        "limit_bytes": limit,
+        "reserved_bytes": reserved,
+        "available_bytes": max(0, limit - reserved) if limit else 0,
+    }
+
+
+def _collect_ram_sample() -> dict:
+    """Called by the background sampler. Returns one datapoint for the
+    RAM history chart. Kept tiny — the sampler stores these verbatim."""
+    running = 0
+    ram_used = 0
+    ram_reserved = 0
+    for sd in registry.list_defs():
+        try:
+            st = control.status(sd)
+        except Exception:
+            continue
+        if st.active == "active":
+            running += 1
+            ram_reserved += (sd.memory_mb or 0) * 1024 * 1024
+        if st.mem_bytes:
+            ram_used += st.mem_bytes
+    limit = _read_cgroup_mem_limit() or _read_meminfo_total() or 0
+    return {
+        "t_ms": int(_time.time() * 1000),
+        "used_bytes": ram_used,
+        "reserved_bytes": ram_reserved,
+        "limit_bytes": limit,
+        "running": running,
+    }
+
+
+@app.get("/api/stats/history", dependencies=[Depends(require_token)])
+def api_stats_history(minutes: int = 60) -> dict:
+    """Rolling RAM history for the dashboard chart.
+
+    ``minutes`` bounds how far back to return (1..1440). Points are
+    sampled by a background thread at a fixed cadence (see perf.py) so
+    the shape doesn't jitter with UI poll timing.
+    """
+    minutes = max(1, min(1440, int(minutes)))
+    samples = perf.perf_sampler.history(minutes)
+    return {
+        "minutes": minutes,
+        "sample_interval_sec": perf.SAMPLE_INTERVAL_SEC,
+        "samples": samples,
     }
 
 
@@ -250,7 +333,52 @@ def api_action(name: str, body: ActionBody) -> dict:
     }.get(body.action)
     if fn is None:
         raise HTTPException(status_code=400, detail=f"unknown action {body.action!r}")
-    r = fn(sd)
+    # Pre-flight RAM check for start/restart. We don't reserve RAM until
+    # a server is active, so multiple servers can share a host as long as
+    # only a subset are up at any time. If asking to start would push the
+    # total past the container's RAM limit, refuse with 507 — the operator
+    # can stop another server and retry, instead of getting a cryptic
+    # OOM-kill mid-boot.
+    if body.action in ("start", "restart"):
+        try:
+            cur_status = control.status(sd)
+        except Exception:
+            cur_status = None
+        already_active = bool(cur_status and cur_status.active == "active")
+        # For restart of an already-active server, its own reservation is
+        # about to be released and re-taken — exclude it from the sum so
+        # we don't double-count.
+        snap = _ram_snapshot(exclude_name=sd.name if already_active else None)
+        needed = (sd.memory_mb or 0) * 1024 * 1024
+        if snap["limit_bytes"] and needed > snap["available_bytes"]:
+            avail_mb = snap["available_bytes"] // (1024 * 1024)
+            resv_mb = snap["reserved_bytes"] // (1024 * 1024)
+            limit_mb = snap["limit_bytes"] // (1024 * 1024)
+            raise HTTPException(
+                status_code=507,
+                detail=(
+                    f"Not enough RAM to start {sd.name}: needs "
+                    f"{sd.memory_mb} MB, only ~{avail_mb} MB available "
+                    f"({resv_mb} MB reserved by other active servers, "
+                    f"limit {limit_mb} MB). Stop another server first "
+                    "or lower this server's memory_mb."
+                ),
+            )
+    try:
+        r = fn(sd)
+    except subprocess.TimeoutExpired as e:
+        # systemctl didn't return in time — usually means the game is still
+        # shutting down (Minecraft world-save can take a while). The stop
+        # itself is still in progress on the host; the operator can poll
+        # /api/servers to see when SubState flips to dead.
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"systemctl {body.action} did not return within "
+                f"{int(e.timeout)}s — the server is likely still shutting "
+                "down. Refresh the dashboard in a moment."
+            ),
+        ) from e
     return {
         "ok": r.returncode == 0,
         "returncode": r.returncode,

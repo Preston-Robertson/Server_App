@@ -66,6 +66,36 @@
         </div>
       </div>
 
+      <!-- Rolling RAM history chart. Sampled server-side every 15s; the
+           select controls how far back we render. Per-server breakdown +
+           annotations will land here once the aggregate line looks right. -->
+      <div id="ram-chart-card" class="widget ram-chart-card" hidden>
+        <div class="ram-chart-header">
+          <div>
+            <div class="ram-chart-title">RAM usage over time</div>
+            <div class="ram-chart-sub muted" id="ram-chart-sub">—</div>
+          </div>
+          <label class="ram-chart-range">
+            <span class="muted">Range</span>
+            <select id="ram-chart-range">
+              <option value="10">10 min</option>
+              <option value="30">30 min</option>
+              <option value="60" selected>1 hour</option>
+              <option value="360">6 hours</option>
+              <option value="1440">24 hours</option>
+            </select>
+          </label>
+        </div>
+        <div class="ram-chart-body">
+          <canvas id="ram-chart" width="900" height="180"></canvas>
+          <div class="ram-chart-legend">
+            <span class="legend-item"><span class="legend-swatch legend-used"></span>Used</span>
+            <span class="legend-item"><span class="legend-swatch legend-reserved"></span>Reserved (active caps)</span>
+            <span class="legend-item"><span class="legend-swatch legend-limit"></span>Limit</span>
+          </div>
+        </div>
+      </div>
+
       <div id="server-grid" class="server-grid">
         <!-- server cards injected by JS -->
       </div>

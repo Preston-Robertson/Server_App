@@ -29,6 +29,19 @@ game). The manager itself is a systemd service running as unprivileged
 - **Aggregate stats bar** at the top of the Dashboard: combined RAM (as %
   of the LXC's cgroup limit), running/total server count, worlds + install
   disk usage, manager uptime.
+- **Rolling RAM history chart** below the stats bar with a 10 min / 30 min
+  / 1 h / 6 h / 24 h range selector. A background sampler snapshots
+  aggregate RAM every 15 s (up to 24 h retained in memory). Per-server
+  breakdown and event annotations are planned; the current chart plots
+  three series: **used** (actual mem in use), **reserved** (sum of
+  `memory_mb` for currently-active servers), and the cgroup **limit**.
+- **RAM is only counted as reserved while a server is active**, so
+  running many servers on one LXC is safe as long as only a subset are
+  up at any time. Every `start`/`restart` runs a pre-flight check: if
+  the server's `memory_mb` won't fit in the remaining headroom, the API
+  returns **HTTP 507** with a message like *"needs 4096 MB, only ~2100 MB
+  available — stop another server first"* instead of letting the LXC
+  OOM-kill something mid-boot.
 - **Access control** per server: `public`, `steamid_allowlist` (native for
   ARK via `PlayerExclusiveJoinList.txt` + `-exclusivejoin`), or
   `ip_allowlist` (schema landed; UFW enforcement planned — deferred if
@@ -150,6 +163,25 @@ Each card shows:
 The card currently open in the detail panel gets an accent border. **+ New
 Server** in the header opens a modal (see [Creating your first
 server](#creating-your-first-server)).
+
+### Dashboard — RAM history chart
+
+Between the stats bar and the server grid, a **RAM usage over time** card
+plots aggregate memory for the whole LXC:
+
+- **Used** (filled area) — actual `MemoryCurrent` summed across every
+  active `gamesrv@*` unit.
+- **Reserved (active caps)** (dashed line) — sum of `memory_mb` for the
+  servers currently in `active` state. This is your "how much can I still
+  safely start" line.
+- **Limit** (thin dashed reference line) — the container's cgroup memory
+  limit (or `MemTotal` fallback).
+
+The **Range** dropdown flips between 10 min / 30 min / 1 h / 6 h / 24 h.
+Sampling cadence is fixed at 15 s server-side, so the chart shape stays
+stable regardless of how often the browser polls. History is process-local
+— a manager restart clears the buffer (intentional; no on-disk store).
+Per-server breakdown and start/stop event annotations are on the roadmap.
 
 ### Dashboard — server detail tabs
 
@@ -658,6 +690,10 @@ sudo -u gamesrv git -C /opt/gamesrv remote set-url origin \
 | Console tab says "tmux session not available" | The server isn't running, or `start.sh` was hand-edited to not wrap in tmux. Re-run **Install** on the Control tab. |
 | Git sync says "could not read Username" | Private repo, no PAT. Paste one into the **PAT for this sync** field on the Git tab, or set `token_env`. |
 | Manager update fails with "history diverged" | Someone committed to the LXC's local checkout. `sudo -u gamesrv git -C /opt/gamesrv log --oneline @{u}..HEAD` to see the offending commits, then decide. |
+| **`HTTP 507` on start**: *"Not enough RAM to start ..."* | Pre-flight rejected the start because `memory_mb` doesn't fit in remaining headroom (limit − sum of active servers' caps). Stop another server, or lower this server's `memory_mb` on the Definition tab. |
+| **`HTTP 504` on stop**: *"systemctl stop did not return within Ns"* | Server is still shutting down (usually a slow Minecraft world save on a modded pack). Wait ~30 s and refresh — the SubState chip will flip to `dead`. Won't happen unless the whole stop exceeds 240 s. |
+| **Player gets raw "Connection refused" joining a wake-enabled server** | Wake proxy failed to bind the public port. Run `sudo journalctl -u gamesrv-manager -n 200 \| grep wake_proxy`. Most common cause: the game process still owns the public port (wake was toggled on without a re-install). Stop the server, re-run **Install** so `server.properties` / `start.sh` moves the game to `port + 10000`, then start again. The `/api/servers` response now exposes `wake.bound` and `wake.bind_error` for the same info via the API. |
+| Manual **Stop** returns 500 (older builds) | Fixed: `subprocess.run` in `control.stop` was racing systemd's `TimeoutStopSec=120`. Now bounded at 240 s and any true timeout returns 504 with a clear message instead of 500. Pull latest and restart the manager. |
 
 More detail in [docs/USAGE.md](docs/USAGE.md).
 
@@ -668,18 +704,22 @@ More detail in [docs/USAGE.md](docs/USAGE.md).
 ```
 Server_App/
 ├── app/                          FastAPI application
-│   ├── main.py                   routes
+│   ├── main.py                   routes (incl. /api/stats, /api/stats/history, RAM pre-flight)
 │   ├── config.py                 env-backed settings
 │   ├── auth.py                   bearer token
 │   ├── registry.py               server YAML CRUD (+ GitSourceCfg)
-│   ├── control.py                systemctl / journalctl / tmux
+│   ├── control.py                systemctl / journalctl / tmux (240s stop timeout)
 │   ├── uploads.py                file upload / download / archive extract / backup
 │   ├── git_source.py             clone / fetch / rsync into install_dir
 │   ├── env_file.py               schema-driven /etc/gamesrv.env editor
 │   ├── updater.py                runtime info + restart + update log tail
+│   ├── jobs.py                   background job registry (install/update/backup)
+│   ├── watchdog.py               scale-to-zero: A2S / SLP player probe → idle stop
+│   ├── wake_proxy.py             wake-on-demand UDP + TCP proxy (bind-error surfaced via snapshot)
+│   ├── perf.py                   background RAM sampler (15s cadence, 24h ring buffer)
 │   ├── types/                    minecraft-java, minecraft-forge, steamcmd, custom
 │   ├── templates/index.html      dashboard + admin
-│   └── static/                   app.css + app.js (single-file client)
+│   └── static/                   app.css + app.js (single-file client, includes RAM chart)
 ├── servers/                      *.example.yml (copy to *.yml to activate)
 ├── systemd/
 │   ├── gamesrv-manager.service   FastAPI manager (Restart=always)
@@ -708,15 +748,31 @@ All `/api/*` endpoints require `Authorization: Bearer <GAMESRV_TOKEN>`.
 
 **Servers**
 
-- `GET /api/servers` — list servers + status
+- `GET /api/servers` — list servers + status. Each entry now includes a
+  `wake` object with `bound`, `bind_error`, `is_running`, `waking_sec`,
+  and `active_clients` so bind failures surface in the API.
 - `POST /api/servers` — create/update a def (body: full ServerDef JSON)
 - `GET /api/servers/{name}` — full detail (def + status + backups)
 - `DELETE /api/servers/{name}` — remove def (does not delete files)
-- `POST /api/servers/{name}/action` — start/stop/restart/enable/disable
+- `POST /api/servers/{name}/action` — start/stop/restart/enable/disable.
+  Returns **507** if a `start`/`restart` would exceed available RAM,
+  **504** if `stop`/`restart` doesn't return within 240 s (server is
+  still shutting down; poll `/api/servers` for the SubState flip).
 - `POST /api/servers/{name}/install` — run type-handler install
 - `POST /api/servers/{name}/update` — run type-handler update
 - `POST /api/servers/{name}/console` — send a command
 - `GET /api/servers/{name}/logs?lines=N` — journalctl tail
+
+**Aggregate stats**
+
+- `GET /api/stats` — dashboard header stats. `ram.reserved_bytes` is now
+  **active-only** (sum of `memory_mb` across currently-running servers),
+  `ram.configured_bytes` is sum-across-all-defs (informational), and
+  `ram.available_bytes` = `limit − reserved` is the pre-flight headroom.
+- `GET /api/stats/history?minutes=N` — rolling RAM history (1..1440 min).
+  Returns `{minutes, sample_interval_sec, samples: [{t_ms, used_bytes,
+  reserved_bytes, limit_bytes, running}, ...]}`. Sampled every 15 s
+  server-side, up to 24 h retained; a manager restart resets the buffer.
 
 **Files**
 
