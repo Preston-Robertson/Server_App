@@ -1071,6 +1071,23 @@ async function loadIdleWakePanel(name) {
     $("#iw-wake-sec").value = d.wake_timeout_sec || 90;
     $("#iw-wake-status").textContent = "";
     $("#iw-reinstall-hint").hidden = true;
+
+    // Stop-wait control: only relevant for handlers whose stop.sh is
+    // manager-generated AND parameterized on stop_timeout_sec. Right now
+    // that's just the two Minecraft handlers; the SteamCMD template still
+    // has a fixed wait and custom servers ship their own scripts. We hide
+    // the row rather than showing a control that silently no-ops.
+    const stopEditable = ["minecraft-java", "minecraft-forge"].includes(d.type);
+    const stopRow = $("#iw-stop-row");
+    if (stopRow) stopRow.hidden = !stopEditable;
+    if (stopEditable) {
+      // Fall back to a sensible per-type default so the input isn't blank
+      // when stop_timeout_sec has never been set on this def.
+      const typeDefault = d.type === "minecraft-forge" ? 280 : 240;
+      $("#iw-stop-sec").value = d.stop_timeout_sec || typeDefault;
+      $("#iw-stop-status").textContent = "";
+      $("#iw-stop-hint").hidden = true;
+    }
   } catch (e) {
     $("#iw-idle-status").textContent = "ERROR: " + e.message;
   }
@@ -1129,6 +1146,24 @@ $("#iw-save-wake")?.addEventListener("click", async () => {
 // Enter key in the number fields saves the corresponding row.
 $("#iw-idle-min")?.addEventListener("keydown", (e) => { if (e.key === "Enter") $("#iw-save-idle").click(); });
 $("#iw-wake-sec")?.addEventListener("keydown", (e) => { if (e.key === "Enter") $("#iw-save-wake").click(); });
+$("#iw-stop-sec")?.addEventListener("keydown", (e) => { if (e.key === "Enter") $("#iw-save-stop").click(); });
+
+$("#iw-save-stop")?.addEventListener("click", async () => {
+  if (!CURRENT) return;
+  // Clamp to the same bound the server-side handler applies so the user
+  // sees the corrected number in the input if they typed something absurd.
+  const raw = parseInt($("#iw-stop-sec").value, 10);
+  const clamped = Number.isFinite(raw) ? Math.min(285, Math.max(10, raw)) : 240;
+  $("#iw-stop-sec").value = clamped;
+  const prev = IW_PREV_DEF ? IW_PREV_DEF.stop_timeout_sec : null;
+  const sd = await _saveDefPatch(CURRENT, { stop_timeout_sec: clamped }, $("#iw-stop-status"));
+  if (sd) {
+    IW_PREV_DEF = sd;
+    // The value only takes effect after stop.sh is regenerated. Prompt
+    // the operator to reinstall if the number actually changed.
+    if (prev !== clamped) $("#iw-stop-hint").hidden = false;
+  }
+});
 
 async function resumeJobIfRunning(name) {
   try {

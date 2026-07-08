@@ -30,7 +30,7 @@ import re
 import shutil
 import subprocess
 
-from .base import TypeHandler
+from .base import TypeHandler, resolve_stop_timeout
 
 
 _START_TEMPLATE = """#!/usr/bin/env bash
@@ -68,7 +68,7 @@ fi
 # exit 1 in that case, even with -d. Setting a known-good TERM and using
 # -f /dev/null (so tmux doesn't try to source a user config that references
 # a terminal) avoids that failure mode.
-export TERM="${TERM:-screen-256color}"
+export TERM="${{TERM:-screen-256color}}"
 TMUX="tmux -f /dev/null"
 
 $TMUX kill-session -t "$SESSION" 2>/dev/null || true
@@ -87,27 +87,27 @@ done
 _STOP_TEMPLATE = """#!/usr/bin/env bash
 # Graceful stop: send 'stop' to the Forge console via tmux, then wait for
 # the JVM to exit. Modded packs (Deeper Darker, Create, etc.) can take
-# multiple minutes to flush all custom dimensions — wait up to ~280s before
-# returning, which stays safely under systemd's TimeoutStopSec=300 in
-# systemd/gamesrv@.service. If we return earlier (as the old 120s loop
-# did), systemd's KillMode=mixed immediately SIGKILLs the JVM and can
-# corrupt the mid-save world.
+# multiple minutes to flush all custom dimensions — wait up to {stop_timeout_sec}s
+# before returning. This value is controlled by stop_timeout_sec on the
+# ServerDef and must stay under systemd's TimeoutStopSec=300 in
+# systemd/gamesrv@.service; the handler clamps it there.
+# If we return earlier, systemd's KillMode=mixed immediately SIGKILLs the
+# JVM and can corrupt the mid-save world.
 set -euo pipefail
 SESSION="gs-{name}"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   tmux send-keys -t "$SESSION" "say Server stopping in 10s..." Enter || true
   sleep 10
   tmux send-keys -t "$SESSION" "stop" Enter || true
-  # Heartbeat every 30s so the journal shows the stop is still progressing
-  # rather than looking hung.
-  for i in $(seq 1 280); do
+  # Heartbeat every 30s so the journal shows the stop is progressing.
+  for i in $(seq 1 {stop_timeout_sec}); do
     tmux has-session -t "$SESSION" 2>/dev/null || exit 0
     if (( i % 30 == 0 )); then
       echo "stop.sh: still waiting for tmux session to exit (${{i}}s elapsed)" >&2
     fi
     sleep 1
   done
-  echo "stop.sh: JVM did not exit within 280s — systemd will now SIGKILL the cgroup" >&2
+  echo "stop.sh: JVM did not exit within {stop_timeout_sec}s — systemd will now SIGKILL the cgroup" >&2
 fi
 """
 
@@ -173,9 +173,13 @@ class MinecraftForgeHandler(TypeHandler):
         msgs.append(f"wrote {user_args} (-Xms{xms}M -Xmx{xmx}M)")
 
         # 2. Launcher scripts.
+        stop_timeout = resolve_stop_timeout(self.sd, default_sec=280)
         self.write_script("start.sh", _START_TEMPLATE.format(name=self.sd.name))
-        self.write_script("stop.sh", _STOP_TEMPLATE.format(name=self.sd.name))
-        msgs.append(f"wrote {self.install_dir/'start.sh'} + stop.sh")
+        self.write_script(
+            "stop.sh",
+            _STOP_TEMPLATE.format(name=self.sd.name, stop_timeout_sec=stop_timeout),
+        )
+        msgs.append(f"wrote {self.install_dir/'start.sh'} + stop.sh (wait {stop_timeout}s)")
 
         # 3. server.env (informational for the unit).
         env_values = {

@@ -174,6 +174,12 @@ class ServerDef(BaseModel):
     # How long the wake-proxy will hold client packets waiting for the game
     # to become responsive. Larger values suit heavy games (ARK ~90 s).
     wake_timeout_sec: int = 90
+    # Per-server override for how long stop.sh waits for the game to exit
+    # cleanly (in seconds). Baked into the generated stop.sh at install
+    # time. None → each type handler picks a sensible default (240s for
+    # vanilla MC, 280s for Forge). Must be strictly less than the systemd
+    # unit's TimeoutStopSec (300s) — the handlers clamp on that bound.
+    stop_timeout_sec: int | None = None
 
     @field_validator("name")
     @classmethod

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import TypeHandler
+from .base import TypeHandler, resolve_stop_timeout
 
 
 _START_TEMPLATE = """#!/usr/bin/env bash
@@ -46,7 +46,7 @@ fi
 # 1 in that case even with -d. Setting a known-good TERM and using -f
 # /dev/null (so tmux doesn't try to source a user config that references a
 # terminal) avoids that failure mode.
-export TERM="${TERM:-screen-256color}"
+export TERM="${{TERM:-screen-256color}}"
 TMUX="tmux -f /dev/null"
 
 # Kill any stale detached session with the same name.
@@ -63,9 +63,9 @@ done
 
 _STOP_TEMPLATE = """#!/usr/bin/env bash
 # Graceful stop: send 'stop' to the MC console via tmux, wait, then let
-# systemd finish. Prevents world corruption. Waits up to 240s — large
-# vanilla worlds can take a while to flush and this stays within the
-# systemd TimeoutStopSec=300 budget in systemd/gamesrv@.service.
+# systemd finish. Prevents world corruption. Waits up to {stop_timeout_sec}s
+# — controlled by stop_timeout_sec on the ServerDef; the handler clamps it
+# under the systemd TimeoutStopSec=300 budget in systemd/gamesrv@.service.
 set -euo pipefail
 SESSION="gs-{name}"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -73,14 +73,14 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
   sleep 5
   tmux send-keys -t "$SESSION" "stop" Enter || true
   # Heartbeat every 30s so the journal shows the stop is progressing.
-  for i in $(seq 1 240); do
+  for i in $(seq 1 {stop_timeout_sec}); do
     tmux has-session -t "$SESSION" 2>/dev/null || exit 0
     if (( i % 30 == 0 )); then
       echo "stop.sh: still waiting for tmux session to exit (${{i}}s elapsed)" >&2
     fi
     sleep 1
   done
-  echo "stop.sh: JVM did not exit within 240s — systemd will now SIGKILL the cgroup" >&2
+  echo "stop.sh: JVM did not exit within {stop_timeout_sec}s — systemd will now SIGKILL the cgroup" >&2
 fi
 """
 
@@ -100,12 +100,13 @@ class MinecraftJavaHandler(TypeHandler):
             xms=xms,
             extra_args=self.sd.java_args,
         )
-        stop_sh = _STOP_TEMPLATE.format(name=self.sd.name)
+        stop_timeout = resolve_stop_timeout(self.sd, default_sec=240)
+        stop_sh = _STOP_TEMPLATE.format(name=self.sd.name, stop_timeout_sec=stop_timeout)
 
         self.write_script("start.sh", start_sh)
         self.write_script("stop.sh", stop_sh)
         msgs.append(f"wrote {self.install_dir/'start.sh'}")
-        msgs.append(f"wrote {self.install_dir/'stop.sh'}")
+        msgs.append(f"wrote {self.install_dir/'stop.sh'} (wait {stop_timeout}s)")
 
         # server.env: pass Minecraft options as env vars if needed later.
         env_values = {"MC_MEMORY_MB": str(self.sd.memory_mb), "MC_PORT": str(self.sd.port)}

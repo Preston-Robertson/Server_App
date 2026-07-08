@@ -12,6 +12,25 @@ from ..registry import ServerDef
 ProgressCallback = Callable[[dict], None]
 
 
+# Hard upper bound for the stop.sh internal wait loop. Must stay strictly
+# under the systemd unit's TimeoutStopSec (300s in systemd/gamesrv@.service)
+# so systemd never fires its own timeout while stop.sh is still trying to
+# save cleanly. Handlers may pick a lower per-type default and users can
+# override via ServerDef.stop_timeout_sec (also clamped here).
+STOP_TIMEOUT_MAX_SEC = 285
+STOP_TIMEOUT_MIN_SEC = 10
+
+
+def resolve_stop_timeout(sd: ServerDef, default_sec: int) -> int:
+    """Return the effective stop.sh wait (in seconds) for ``sd``.
+
+    Uses ``sd.stop_timeout_sec`` when set, else the handler's per-type
+    default. Always clamped to [STOP_TIMEOUT_MIN_SEC, STOP_TIMEOUT_MAX_SEC].
+    """
+    raw = sd.stop_timeout_sec if sd.stop_timeout_sec else default_sec
+    return max(STOP_TIMEOUT_MIN_SEC, min(STOP_TIMEOUT_MAX_SEC, int(raw)))
+
+
 class TypeHandler:
     """Subclasses implement install() and update(). Both must be idempotent.
 

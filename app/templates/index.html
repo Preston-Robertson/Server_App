@@ -186,10 +186,21 @@
                 <button class="btn btn-tiny btn-primary" id="iw-save-wake">Save</button>
                 <span id="iw-wake-status" class="small muted"></span>
               </div>
+              <div class="iw-row" id="iw-stop-row" hidden>
+                <span><strong>Stop wait</strong> <em>(seconds stop.sh holds for a clean save)</em></span>
+                <input type="number" id="iw-stop-sec" min="10" max="285" step="5" placeholder="240" />
+                <span class="muted">sec</span>
+                <button class="btn btn-tiny btn-primary" id="iw-save-stop">Save</button>
+                <span id="iw-stop-status" class="small muted"></span>
+              </div>
               <p class="small muted" id="iw-reinstall-hint" hidden>
                 <strong>Reinstall required</strong> — toggling wake-on-demand remaps the game to
                 <code>port + 10000</code>. Click <strong>Install / Reprovision</strong> above so
                 <code>start.sh</code> picks up the new port.
+              </p>
+              <p class="small muted" id="iw-stop-hint" hidden>
+                <strong>Reinstall required</strong> — click <strong>Install / Reprovision</strong>
+                above so the new wait duration gets baked into <code>stop.sh</code>.
               </p>
             </div>
 
