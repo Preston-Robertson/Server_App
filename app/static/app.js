@@ -1085,6 +1085,21 @@ async function loadIdleWakePanel(name) {
       $("#iw-wl-status").textContent = "";
     }
 
+    // Firewall panel — mode radio + optional IP allow list. Reads
+    // whatever's in ServerDef.firewall; defaults to "lan" if the field
+    // is missing on an older def.
+    const fw = (d.firewall && typeof d.firewall === "object") ? d.firewall : {};
+    const fwMode = ["lan", "public", "allowlist"].includes(fw.mode) ? fw.mode : "lan";
+    const modeEl = $(`#fw-mode-${fwMode}`);
+    if (modeEl) modeEl.checked = true;
+    $("#fw-ips").value = Array.isArray(fw.allow_ips) ? fw.allow_ips.join("\n") : "";
+    $("#fw-ips-row").hidden = (fwMode !== "allowlist");
+    $("#fw-warning").hidden = (fwMode !== "public");
+    // Small header label so the operator sees which port this applies to.
+    const proto = ["minecraft-java", "minecraft-forge"].includes(d.type) ? "tcp" : "udp";
+    $("#fw-port-label").textContent = `— port ${d.port}/${proto}`;
+    $("#fw-status").textContent = "";
+
     // Stop-wait control: only relevant for handlers whose stop.sh is
     // manager-generated AND parameterized on stop_timeout_sec. Right now
     // that's just the two Minecraft handlers; the SteamCMD template still
@@ -1212,6 +1227,65 @@ $("#iw-save-wl")?.addEventListener("click", async () => {
   $("#iw-wl-names").value = names.join("\n");
   const sd = await _saveDefPatch(CURRENT, { wake_whitelist: names }, $("#iw-wl-status"));
   if (sd) IW_PREV_DEF = sd;
+});
+
+// Firewall panel: reveal/hide the IP textarea + warning based on mode,
+// and let the operator save the mode + IP list. The backend applies UFW
+// rules synchronously on save; the response includes a firewall status
+// object we render into the status line.
+$$('input[name="fw-mode"]').forEach((r) => {
+  r.addEventListener("change", () => {
+    const mode = document.querySelector('input[name="fw-mode"]:checked')?.value;
+    $("#fw-ips-row").hidden = (mode !== "allowlist");
+    $("#fw-warning").hidden = (mode !== "public");
+  });
+});
+
+$("#fw-save")?.addEventListener("click", async () => {
+  if (!CURRENT) return;
+  const mode = document.querySelector('input[name="fw-mode"]:checked')?.value || "lan";
+  // Sanitize IP list: strip whitespace, dedupe, drop blanks. We let the
+  // server-side pydantic validator reject anything that isn't a valid
+  // IP or CIDR; failed saves show up in fw-status.
+  const raw = $("#fw-ips").value.split(/\r?\n/);
+  const seen = new Set();
+  const ips = [];
+  for (const line of raw) {
+    const s = line.trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    ips.push(s);
+  }
+  $("#fw-ips").value = ips.join("\n");
+
+  const statusEl = $("#fw-status");
+  statusEl.textContent = "applying…";
+  try {
+    // Merge into the existing def so we don't clobber other fields.
+    const r = await api(`/api/servers/${CURRENT}`);
+    const sd = Object.assign({}, r.def, {
+      firewall: { mode, allow_ips: mode === "allowlist" ? ips : [] },
+    });
+    const resp = await api("/api/servers", {
+      method: "POST", body: JSON.stringify(sd),
+    });
+    IW_PREV_DEF = sd;
+    const fw = resp.firewall || {};
+    if (fw.skipped) {
+      statusEl.textContent = "⚠ ufw not installed on host — def saved but no rules applied";
+    } else if (fw.ok === false) {
+      statusEl.textContent = "ERROR: " + (fw.detail || "unknown");
+    } else {
+      const n = fw.rules_added || 0;
+      statusEl.textContent = `✓ applied (${n} rule${n === 1 ? "" : "s"})`;
+      setTimeout(() => {
+        if (statusEl.textContent.startsWith("✓")) statusEl.textContent = "";
+      }, 3000);
+    }
+    refreshServers();
+  } catch (e) {
+    statusEl.textContent = "ERROR: " + e.message;
+  }
 });
 
 async function resumeJobIfRunning(name) {

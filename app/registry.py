@@ -137,6 +137,53 @@ class AccessCfg(BaseModel):
         return out
 
 
+class FirewallCfg(BaseModel):
+    """Per-server network-layer access control (UFW).
+
+    Modes:
+      - "lan"        — port allowed from LAN CIDR only (default; matches
+                       the original ufw-setup.sh posture).
+      - "public"     — port open to Anywhere. Only sensible with wake-on-
+                       demand + a wake_whitelist and/or a game-level
+                       whitelist; otherwise every internet scanner will
+                       hit your box.
+      - "allowlist"  — port open to LAN + each IP/CIDR in ``allow_ips``.
+                       LAN is always included so an operator can't lock
+                       themselves out from home.
+
+    The manager reconciles these against ``sudo ufw`` on save + startup.
+    Rules it manages are tagged ``gamesrv-auto:<server>:*`` in the UFW
+    comment; hand-added rules are left alone.
+    """
+    mode: str = "lan"
+    allow_ips: list[str] = Field(default_factory=list)
+
+    @field_validator("mode")
+    @classmethod
+    def _valid_mode(cls, v: str) -> str:
+        allowed = {"lan", "public", "allowlist"}
+        if v not in allowed:
+            raise ValueError(
+                f"firewall.mode must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return v
+
+    @field_validator("allow_ips")
+    @classmethod
+    def _valid_ips(cls, v: list) -> list[str]:
+        out: list[str] = []
+        for ip in v:
+            s = str(ip).strip()
+            if not s:
+                continue
+            try:
+                ipaddress.ip_network(s, strict=False)
+            except ValueError as e:
+                raise ValueError(f"invalid IP or CIDR: {ip!r}") from e
+            out.append(s)
+        return out
+
+
 class ServerDef(BaseModel):
     name: str
     type: str  # minecraft-java | minecraft-forge | steamcmd | custom
@@ -160,6 +207,7 @@ class ServerDef(BaseModel):
     backup: BackupCfg = Field(default_factory=BackupCfg)
     git_source: GitSourceCfg = Field(default_factory=GitSourceCfg)
     access: AccessCfg = Field(default_factory=AccessCfg)
+    firewall: FirewallCfg = Field(default_factory=FirewallCfg)
     passwords: PasswordsCfg = Field(default_factory=PasswordsCfg)
     # Scale-to-zero: if set, the watchdog stops this server after N minutes
     # of zero players (polled via A2S_INFO for Steam games, SLP for Minecraft).

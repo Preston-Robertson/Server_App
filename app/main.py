@@ -39,7 +39,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from . import control, registry, uploads, updater, git_source, env_file, jobs, watchdog, wake_proxy, perf
+from . import control, registry, uploads, updater, git_source, env_file, jobs, watchdog, wake_proxy, perf, firewall
 from .auth import require_token
 from .config import settings
 from .types import handler_for
@@ -69,6 +69,13 @@ def _startup() -> None:
     # same aggregate the /api/stats endpoint returns, at a fixed cadence,
     # so the chart is smooth regardless of when the UI polls.
     perf.perf_sampler.start(_collect_ram_sample)
+    # Reconcile per-server UFW rules against ServerDef.firewall on boot.
+    # Fails soft if ufw isn't installed or sudoers isn't configured —
+    # errors go to the journal, manager still starts.
+    try:
+        firewall.reconcile_all()
+    except Exception as e:
+        print(f"[startup] firewall.reconcile_all failed: {e}", flush=True)
 
 
 # ---------- health / dashboard ----------
@@ -306,12 +313,35 @@ def api_get_server(name: str) -> dict:
 @app.post("/api/servers", dependencies=[Depends(require_token)])
 def api_upsert_server(sd: registry.ServerDef) -> dict:
     registry.save_def(sd)
-    return {"ok": True, "path": str((settings.defs_dir / f'{sd.name}.yml'))}
+    # Reconcile firewall rules for this server. Non-fatal: even if UFW
+    # isn't available (dev host, missing sudoers) the def still saves.
+    try:
+        fw_result = firewall.reconcile_server(sd)
+    except Exception as e:
+        fw_result = {"ok": False, "detail": f"exception: {e}"}
+    return {
+        "ok": True,
+        "path": str((settings.defs_dir / f'{sd.name}.yml')),
+        "firewall": fw_result,
+    }
+
+
+@app.get("/api/firewall", dependencies=[Depends(require_token)])
+def api_firewall_snapshot() -> dict:
+    """Diagnostics for the firewall UI: which auto-managed rules are live."""
+    return firewall.snapshot()
 
 
 @app.delete("/api/servers/{name}", dependencies=[Depends(require_token)])
 def api_delete_server(name: str) -> dict:
     registry.delete_def(name)
+    # Wipe any UFW rules the manager put in place for this server so
+    # deleting a def actually closes its port. Delete happens even if
+    # the def is already gone — the reconciler is a no-op then.
+    try:
+        firewall._delete_managed_for(name)   # module-private but stable
+    except Exception:
+        pass
     return {"ok": True}
 
 

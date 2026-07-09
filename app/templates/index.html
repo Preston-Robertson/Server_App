@@ -215,6 +215,40 @@
             </div>
 
             <hr />
+            <h3 style="margin: 6px 0;">Firewall (UFW) <span id="fw-port-label" class="small muted"></span></h3>
+            <div class="iw-panel">
+              <div class="iw-row">
+                <label class="inline">
+                  <input type="radio" name="fw-mode" id="fw-mode-lan" value="lan" />
+                  <span><strong>Local only</strong> <em>(LAN CIDR)</em></span>
+                </label>
+                <label class="inline">
+                  <input type="radio" name="fw-mode" id="fw-mode-public" value="public" />
+                  <span><strong>Allow all internet</strong></span>
+                </label>
+                <label class="inline">
+                  <input type="radio" name="fw-mode" id="fw-mode-allowlist" value="allowlist" />
+                  <span><strong>Only allow specific IPs</strong></span>
+                </label>
+              </div>
+              <div class="iw-row iw-row-block" id="fw-ips-row" hidden>
+                <label style="flex:1; margin:0;">
+                  <span><strong>Allowed IPs / CIDRs</strong> <em>(one per line — LAN is always included)</em></span>
+                  <textarea id="fw-ips" rows="3" placeholder="203.0.113.42&#10;198.51.100.0/24" style="width:100%; margin-top:4px;"></textarea>
+                </label>
+              </div>
+              <div class="iw-row">
+                <button class="btn btn-tiny btn-primary" id="fw-save">Apply firewall rules</button>
+                <span id="fw-status" class="small muted"></span>
+              </div>
+              <p class="small muted" id="fw-warning" hidden>
+                <strong>Careful:</strong> <em>Allow all internet</em> exposes this port to random
+                scanners. For Minecraft, combine with <strong>Wake whitelist</strong> above and
+                <code>whitelist on</code> in-game so only known players can actually get in.
+              </p>
+            </div>
+
+            <hr />
             <h3 style="margin: 6px 0;">Performance</h3>
             <div id="perf-grid" class="perf-grid">
               <div class="perf-stat">

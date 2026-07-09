@@ -146,6 +146,26 @@ echo "== 6. polkit =="
 install -m 0644 "$APP_DIR/scripts/49-gamesrv.rules" /etc/polkit-1/rules.d/49-gamesrv.rules
 systemctl restart polkit || true
 
+echo "== 6b. sudoers (ufw for gamesrv) =="
+# Lets the manager reconcile per-server UFW rules from the dashboard
+# without a password prompt. Scoped to /usr/sbin/ufw only — no other
+# root commands are granted. Owned root:root, mode 0440 as sudoers
+# requires; visudo -c validates the file before install.
+_SUDOERS_TMP="$(mktemp)"
+cat > "$_SUDOERS_TMP" <<EOF
+# Managed by gamesrv bootstrap.sh — do not hand-edit.
+# Grants the manager (running as ${SERVICE_USER}) permission to run
+# only /usr/sbin/ufw without a password. Required for the per-server
+# firewall UI in the dashboard.
+${SERVICE_USER} ALL=(root) NOPASSWD: /usr/sbin/ufw
+EOF
+if visudo -cf "$_SUDOERS_TMP" >/dev/null; then
+  install -m 0440 -o root -g root "$_SUDOERS_TMP" /etc/sudoers.d/gamesrv-ufw
+else
+  echo "!! sudoers snippet failed visudo -c; NOT installed. Firewall UI will fail." >&2
+fi
+rm -f "$_SUDOERS_TMP"
+
 echo "== 7. env file =="
 if [[ ! -f /etc/gamesrv.env ]]; then
   # Mode 660 root:gamesrv so the manager can WRITE it too (Admin env editor).
