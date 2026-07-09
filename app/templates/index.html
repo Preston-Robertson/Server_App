@@ -186,6 +186,16 @@
                 <button class="btn btn-tiny btn-primary" id="iw-save-wake">Save</button>
                 <span id="iw-wake-status" class="small muted"></span>
               </div>
+              <div class="iw-row iw-row-block" id="iw-wl-row" hidden>
+                <label style="flex:1; margin:0;">
+                  <span><strong>Wake whitelist</strong> <em>(Minecraft usernames, one per line — empty = anyone can wake)</em></span>
+                  <textarea id="iw-wl-names" rows="3" placeholder="Steve&#10;Alex" style="width:100%; margin-top:4px;"></textarea>
+                </label>
+                <div style="display:flex; gap:6px; align-items:center; margin-top:4px;">
+                  <button class="btn btn-tiny btn-primary" id="iw-save-wl">Save</button>
+                  <span id="iw-wl-status" class="small muted"></span>
+                </div>
+              </div>
               <div class="iw-row" id="iw-stop-row" hidden>
                 <span><strong>Stop wait</strong> <em>(seconds stop.sh holds for a clean save)</em></span>
                 <input type="number" id="iw-stop-sec" min="10" max="285" step="5" placeholder="240" />

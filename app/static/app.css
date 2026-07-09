@@ -430,6 +430,15 @@ textarea { font-family: ui-monospace, Consolas, monospace; }
   font-variant-numeric: tabular-nums;
 }
 .iw-row .inline { min-width: 240px; }
+/* Row variant that stacks a textarea + save under the label instead of
+   using the default single-line flex layout (used for wake_whitelist). */
+.iw-row-block { flex-direction: column; align-items: stretch; }
+.iw-row-block textarea {
+  background: var(--bg-elev); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 4px 6px; font-family: var(--mono, monospace); font-size: 12px;
+  resize: vertical; min-height: 60px;
+}
 
 .subtabs {
   display: flex; gap: 2px; border-bottom: 1px solid var(--border);

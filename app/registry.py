@@ -174,6 +174,15 @@ class ServerDef(BaseModel):
     # How long the wake-proxy will hold client packets waiting for the game
     # to become responsive. Larger values suit heavy games (ARK ~90 s).
     wake_timeout_sec: int = 90
+    # Optional per-server list of Minecraft usernames allowed to trigger a
+    # wake. When non-empty, the wake-proxy peeks at each incoming login's
+    # Login Start packet and refuses to start the JVM unless the name (case-
+    # insensitive) is on this list. Empty (default) means anyone who can
+    # reach the port can wake — fine on LAN, risky on WAN because random
+    # port-scan bots will spin up the server for no reason. Only affects
+    # Minecraft (java/forge); the Steam UDP wake path has no equivalent
+    # concept and this field is ignored there.
+    wake_whitelist: list[str] = Field(default_factory=list)
     # Per-server override for how long stop.sh waits for the game to exit
     # cleanly (in seconds). Baked into the generated stop.sh at install
     # time. None → each type handler picks a sensible default (240s for

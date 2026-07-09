@@ -1072,6 +1072,19 @@ async function loadIdleWakePanel(name) {
     $("#iw-wake-status").textContent = "";
     $("#iw-reinstall-hint").hidden = true;
 
+    // Wake whitelist row — only meaningful for Minecraft (TCP wake). For
+    // Steam UDP wake there's no per-player identity to filter on, so we
+    // don't confuse the operator by showing an input that does nothing.
+    const wlAvailable = !!d.wake_on_demand
+      && ["minecraft-java", "minecraft-forge"].includes(d.type);
+    const wlRow = $("#iw-wl-row");
+    if (wlRow) wlRow.hidden = !wlAvailable;
+    if (wlAvailable) {
+      const names = Array.isArray(d.wake_whitelist) ? d.wake_whitelist : [];
+      $("#iw-wl-names").value = names.join("\n");
+      $("#iw-wl-status").textContent = "";
+    }
+
     // Stop-wait control: only relevant for handlers whose stop.sh is
     // manager-generated AND parameterized on stop_timeout_sec. Right now
     // that's just the two Minecraft handlers; the SteamCMD template still
@@ -1140,7 +1153,22 @@ $("#iw-save-wake")?.addEventListener("click", async () => {
     // A wake toggle changes the port the game binds. Warn loudly so the
     // operator remembers to Reinstall before the next start.
     $("#iw-reinstall-hint").hidden = !toggleChanged;
+    // Also reveal/hide the whitelist row now that wake is on/off.
+    const wlAvailable = !!sd.wake_on_demand
+      && ["minecraft-java", "minecraft-forge"].includes(sd.type);
+    const wlRow = $("#iw-wl-row");
+    if (wlRow) wlRow.hidden = !wlAvailable;
   }
+});
+
+// Also toggle the whitelist row live as the wake checkbox is clicked, so
+// the operator sees it appear/disappear even before hitting Save.
+$("#iw-wake-enabled")?.addEventListener("change", () => {
+  const wlRow = $("#iw-wl-row");
+  if (!wlRow || !IW_PREV_DEF) return;
+  const wlAvailable = $("#iw-wake-enabled").checked
+    && ["minecraft-java", "minecraft-forge"].includes(IW_PREV_DEF.type);
+  wlRow.hidden = !wlAvailable;
 });
 
 // Enter key in the number fields saves the corresponding row.
@@ -1163,6 +1191,27 @@ $("#iw-save-stop")?.addEventListener("click", async () => {
     // the operator to reinstall if the number actually changed.
     if (prev !== clamped) $("#iw-stop-hint").hidden = false;
   }
+});
+
+$("#iw-save-wl")?.addEventListener("click", async () => {
+  if (!CURRENT) return;
+  // Parse the textarea: one name per line, strip whitespace, drop blanks
+  // and duplicates (case-insensitive dedupe, preserve first-seen casing).
+  const raw = $("#iw-wl-names").value.split(/\r?\n/);
+  const seen = new Set();
+  const names = [];
+  for (const line of raw) {
+    const n = line.trim();
+    if (!n) continue;
+    const key = n.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    names.push(n);
+  }
+  // Reflect the cleaned list back so the operator sees the sanitised form.
+  $("#iw-wl-names").value = names.join("\n");
+  const sd = await _saveDefPatch(CURRENT, { wake_whitelist: names }, $("#iw-wl-status"));
+  if (sd) IW_PREV_DEF = sd;
 });
 
 async function resumeJobIfRunning(name) {

@@ -91,6 +91,10 @@ class _ServerProxy:
     last_status_check: float = 0.0
     last_wake_error: str = ""
     tcp_conn_count: int = 0                        # TCP-only: connections currently spliced
+    # Case-insensitive Minecraft usernames allowed to trigger wake. Empty
+    # list = no filtering (any login attempt wakes the server). Only used
+    # for TCP wake (Minecraft); ignored for the UDP paths.
+    wake_whitelist: list = field(default_factory=list)
 
 
 # ---------- Minecraft protocol helpers --------------------------------------
@@ -258,8 +262,8 @@ class WakeProxy:
 
     def _sync_proxies(self) -> None:
         """Add/remove per-server sockets to match current YAML defs."""
-        # name -> (pub, internal, wake_timeout, protocol)
-        wanted: dict[str, tuple[int, int, int, str]] = {}
+        # name -> (pub, internal, wake_timeout, protocol, wake_whitelist)
+        wanted: dict[str, tuple[int, int, int, str, list]] = {}
         try:
             for sd in registry.list_defs():
                 if not getattr(sd, "wake_on_demand", False):
@@ -269,11 +273,13 @@ class WakeProxy:
                     # already warns operators to keep public port <= 55535.
                     continue
                 proto = "tcp" if sd.type in ("minecraft-java", "minecraft-forge") else "udp"
+                whitelist = list(getattr(sd, "wake_whitelist", None) or [])
                 wanted[sd.name] = (
                     sd.port,
                     sd.port + WAKE_INTERNAL_OFFSET,
                     max(10, int(sd.wake_timeout_sec or 90)),
                     proto,
+                    whitelist,
                 )
         except Exception:
             return
@@ -293,10 +299,11 @@ class WakeProxy:
             # Bind new proxies. Bind can fail if the game currently holds
             # the port (operator toggled wake_on_demand on but hasn't
             # reinstalled + restarted yet); we retry on the next sync.
-            for name, (pub, internal, wto, proto) in wanted.items():
+            for name, (pub, internal, wto, proto, whitelist) in wanted.items():
                 if name in self._proxies:
                     # Update mutable settings without rebinding.
                     self._proxies[name].wake_timeout_sec = wto
+                    self._proxies[name].wake_whitelist = whitelist
                     self._bind_errors.pop(name, None)
                     continue
                 try:
@@ -345,6 +352,7 @@ class WakeProxy:
                     protocol=proto,
                     wake_timeout_sec=wto,
                     listen_sock=s,
+                    wake_whitelist=whitelist,
                 )
 
     def _close_proxy_locked(self, name: str) -> None:
@@ -460,6 +468,49 @@ class WakeProxy:
 
     # -- TCP (Minecraft) ------------------------------------------------
 
+    def _peek_mc_login_username(self, conn: socket.socket,
+                                buffered: bytes) -> tuple[bytes, Optional[str]]:
+        """Read from ``conn`` until we can parse the Login Start packet's
+        name field. Returns (extended_buffered, username_or_None).
+
+        The Login Start packet layout (all versions we care about):
+            VarInt packet_length
+            VarInt packet_id (0x00 in login state)
+            String name  (VarInt length + UTF-8, max 16 chars)
+            ...           (UUID/other fields we don't need)
+
+        We deliberately never consume from the socket beyond what's needed
+        so the caller can still splice the full byte stream to the backend
+        if the whitelist check passes.
+        """
+        buf = bytearray(buffered)
+        conn.settimeout(3.0)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            try:
+                pkt_len, off = _varint_decode(bytes(buf), 0)
+                if len(buf) - off >= pkt_len:
+                    pkt_id, off2 = _varint_decode(bytes(buf), off)
+                    if pkt_id != 0x00:
+                        return bytes(buf), None
+                    name_len, off3 = _varint_decode(bytes(buf), off2)
+                    if 0 < name_len <= 32 and off3 + name_len <= off + pkt_len:
+                        name = bytes(buf[off3:off3 + name_len]).decode(
+                            "utf-8", errors="replace"
+                        )
+                        return bytes(buf), name
+                    return bytes(buf), None
+            except (IndexError, ValueError):
+                pass   # incomplete varint / short buffer — read more below
+            try:
+                chunk = conn.recv(256)
+            except (socket.timeout, OSError):
+                return bytes(buf), None
+            if not chunk:
+                return bytes(buf), None
+            buf += chunk
+        return bytes(buf), None
+
     def _handle_tcp_accept(self, p: _ServerProxy, now: float) -> None:
         try:
             conn, addr = p.listen_sock.accept()
@@ -570,6 +621,27 @@ class WakeProxy:
     def _handle_mc_login_wake(self, p: _ServerProxy, conn: socket.socket,
                               buffered: bytes) -> None:
         """Wake the server (if needed) then splice this connection to it."""
+        # Wake-whitelist gate: only run BEFORE we've spent CPU starting the
+        # JVM. Reads the Login Start packet (client sends it immediately
+        # after the handshake), extracts the username, and rejects the
+        # login without waking if the name isn't allowed. Skipped when
+        # the server is already running — MC's own whitelist handles auth
+        # from that point.
+        if not p.is_running and p.wake_whitelist:
+            buffered, username = self._peek_mc_login_username(conn, buffered)
+            if username is None:
+                # Malformed / bot / early disconnect. Drop silently — no
+                # point spending a login-disconnect packet on a scanner.
+                return
+            allowed = {n.strip().lower() for n in p.wake_whitelist if n and n.strip()}
+            if username.strip().lower() not in allowed:
+                _mc_send_login_disconnect(
+                    conn,
+                    f"§eServer is asleep§r.\n"
+                    f"§7{username}§r is not on the wake list — ask the host to add you.",
+                )
+                return
+
         # Kick a wake if the game isn't up yet and no one else has.
         if not p.is_running:
             with self._lock:
