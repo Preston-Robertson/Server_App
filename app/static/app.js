@@ -94,10 +94,36 @@ function fmtTime(ts) { return ts ? new Date(ts * 1000).toLocaleString() : "-"; }
 // This closes the "the dashboard says running but the client times out"
 // UX gap on games with multi-minute world-load times (Satisfactory
 // especially).
-function stateChip(active, sub, ready, probeSupported) {
+//
+// Two escalations when starting takes unusually long (thresholds from
+// watchdog._State: slow_start=5min, stuck_start=20min):
+//   * slow_start   → "◐ starting… (slow)" in warn color. Hint that the
+//                    game is legitimately slow to load OR something is
+//                    wrong; user should check the Console tab.
+//   * stuck_start  → "◐ starting? check Console" in error color. The
+//                    game process likely crashed or is hung — visible
+//                    signal instead of an amber chip forever.
+function stateChip(active, sub, ready, probeSupported, wd) {
   const s = (active || "unknown").toLowerCase();
   if (s === "active") {
     if (probeSupported && !ready) {
+      const startingSec = (wd && wd.starting_sec) || 0;
+      if (wd && wd.stuck_start) {
+        const mins = Math.floor(startingSec / 60);
+        return {
+          cls: "chip-err",
+          label: `◐ starting? (${mins}m)`,
+          title: `Systemd unit is active but the readiness probe hasn't succeeded in ${mins} minutes. The game likely crashed or is hung — check the Console tab for real output.`,
+        };
+      }
+      if (wd && wd.slow_start) {
+        const mins = Math.floor(startingSec / 60);
+        return {
+          cls: "chip-warn",
+          label: `◐ starting… (${mins}m)`,
+          title: `Taking longer than usual (${mins}m). Big worlds (ARK, modded MC) do this; if it's a smaller game check the Console tab for errors.`,
+        };
+      }
       return { cls: "chip-warn", label: "◐ starting" };
     }
     return { cls: "chip-ok", label: `● ${sub || "running"}` };
@@ -909,7 +935,7 @@ function renderServerGrid(rows) {
     // server went active. If the game type has no supported probe we
     // trust systemd and treat "active" as ready.
     const ready = !s.probe_supported || !!(wd && wd.ready);
-    const chip = stateChip(s.active, s.sub, ready, !!s.probe_supported);
+    const chip = stateChip(s.active, s.sub, ready, !!s.probe_supported, wd);
 
     // RAM % of the cap.
     const capBytes = (d.memory_mb || 0) * 1024 * 1024;
@@ -1011,7 +1037,7 @@ function renderServerGrid(rows) {
         <span class="server-card-type">${escape(d.type)}</span>
       </div>
       <div class="server-card-chips">
-        <span class="chip ${chip.cls}">${chip.label}</span>
+        <span class="chip ${chip.cls}"${chip.title ? ` title="${escape(chip.title)}"` : ""}>${chip.label}</span>
         <span class="chip">:${d.port}</span>
         ${s.enabled === "enabled" ? '<span class="chip chip-accent">on boot</span>' : ''}
         ${s.console_available ? '<span class="chip">console</span>' : ''}
@@ -2482,6 +2508,12 @@ function openNewServerModal() {
   form.reset();
   $("#form-error").hidden = true;
   $("#f-auto-start").checked = true;
+  // Defense in depth: some browsers restore checkbox state via autofill
+  // even after form.reset(). Wake-on-demand is intentionally opt-in —
+  // silently enabling it flips the game's bind port (public → port+10000)
+  // and inserts a wake-proxy in the traffic path, which is surprising
+  // for a first-time deploy. Force it off on every modal open.
+  $("#f-wake-on-demand").checked = false;
   prevTypeDefaults = null;
   initFiles = [];
   renderInitFileList();
@@ -2752,12 +2784,33 @@ $("#new-server-form").addEventListener("submit", async (ev) => {
     };
   }
 
+  let createResp;
   try {
-    await api("/api/servers", { method: "POST", body: JSON.stringify(sd) });
+    createResp = await api("/api/servers", { method: "POST", body: JSON.stringify(sd) });
   } catch (e) {
     showFormError("Create failed: " + e.message);
     return;
   }
+
+  // Surface firewall reconcile status. reconcile_server() is best-effort
+  // (UFW missing, sudoers not wired, rule parse error) and its result is
+  // returned in the POST response but was previously discarded. If it
+  // failed OR skipped, warn the operator — otherwise the port is silently
+  // closed and connections just time out with no clue why.
+  try {
+    const fw = createResp?.firewall;
+    if (fw && !fw.ok) {
+      alert(
+        `Server '${sd.name}' saved, but the firewall did not open its port ` +
+        `automatically:\n\n${fw.detail || "(no detail)"}\n\n` +
+        `Fix by running on the LXC:\n` +
+        `  cd /opt/gamesrv && sudo bash scripts/ufw-setup.sh\n\n` +
+        `Then re-save the server definition to trigger a fresh reconcile.`
+      );
+    } else if (fw && fw.skipped) {
+      console.warn(`firewall reconcile skipped for ${sd.name}: ${fw.detail}`);
+    }
+  } catch (_) { /* non-fatal */ }
 
   // If a git_source URL was provided, do the initial pull BEFORE running
   // any queued file uploads — so the file uploads land on top of the repo
@@ -2857,6 +2910,30 @@ $("#new-server-form").addEventListener("submit", async (ev) => {
   closeNewServerModal();
   await refreshServers();
   openServer(sd.name);
+
+  // Auto-run Install for SteamCMD servers. Without this, a new user had
+  // to hunt for the Install button on the Control tab and click it —
+  // meanwhile every other step (define, upload, start) is at their
+  // fingertips. Install for SteamCMD games is a required prerequisite
+  // for Start to do anything useful (start.sh points at binaries that
+  // don't exist yet), so kicking it off automatically matches the mental
+  // model "Create Server → play". The install job is async and streamed
+  // as a progress bar on the Control tab — the user can walk away or
+  // watch, and no other action is needed until it completes.
+  //
+  // Skipped for: minecraft-java/forge (require the operator to upload a
+  // jar or Forge tree first — auto-install would just print a "no jar
+  // found" message), custom (operator owns start.sh entirely).
+  if (sd.type === "steamcmd") {
+    try {
+      // startJob uses CURRENT (the server we just openServer'd). Kick
+      // it off but don't await — the polling loop keeps the progress
+      // bar live even if the user tabs away.
+      startJob("install", `/api/servers/${sd.name}/install`);
+    } catch (e) {
+      console.warn("auto-install trigger failed:", e);
+    }
+  }
 });
 
 function showFormError(msg) {

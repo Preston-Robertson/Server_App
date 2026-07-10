@@ -111,6 +111,15 @@ _APP_RECIPES: dict[int, dict] = {
         "name": "palworld",
         "run": "./PalServer.sh -port={port} -useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS",
         "saves_rel": "Pal/Saved",
+        # Pin HOME so Palworld's Steam layer looks for
+        # $HOME/.steam/sdk64/steamclient.so inside install_dir, where the
+        # post-install hook (_apply_palworld_steamsdk) creates it. Without
+        # this pin HOME would be /home/gamesrv (per /etc/passwd) — which
+        # a) may not exist on unprivileged LXCs with a tmpfs /home, and
+        # b) survives reinstalls, so a stale .steam dir there causes
+        # confusing state drift. Keeping runtime state under install_dir
+        # matches the pattern we already use for Satisfactory.
+        "env": {"HOME": "{install_dir}"},
     },
     1690800: {  # Satisfactory dedicated
         # Post-1.0 quirks (learned the hard way — see
@@ -594,12 +603,119 @@ def _wine_prefix_init(install_dir, on_event=None) -> str:
     return f"Wine: initialised prefix {prefix}"
 
 
+# ---------- install-time pre-flight -----------------------------------------
+
+# Rough minimum free-disk requirements per known SteamCMD app id (in GB).
+# Sized to cover: the initial download, the extracted install, a full
+# validate re-download of every file (steamcmd does this on every "install"),
+# plus a bit of headroom for the game's first-boot world/config creation.
+# Numbers err on the high side — a false-positive "not enough disk" is
+# cheap to fix (delete something, retry); a false-negative (partial install
+# because df ran out mid-download) leaves install_dir wedged.
+_MIN_DISK_GB: dict[int, int] = {
+    2394010: 8,    # Palworld (~4 GB game)
+    1690800: 15,   # Satisfactory (~7 GB game + updates)
+    376030:  35,   # ARK: Survival Evolved (~20 GB game)
+    2430930: 60,   # ARK: Survival Ascended (heavy Unreal 5 build)
+    896660:  4,    # Valheim (~1.5 GB game)
+    2278520: 30,   # Enshrouded (Wine prefix + ~10 GB game + shader cache)
+}
+_DEFAULT_MIN_DISK_GB = 10   # generic SteamCMD game with no per-app entry
+
+
+def _preflight_writable(path, label: str) -> None:
+    """Fail fast if ``path`` isn't writable by the running user.
+
+    This catches the two most common LXC/bind-mount misconfigurations:
+      * ``install_dir`` owned by root because it was pre-created with
+        ``mkdir`` as root before ``chown``ing to gamesrv.
+      * ``world_dir`` on a squashed NFS/bind mount showing up as
+        ``nobody:nogroup`` (or otherwise not writable by gamesrv).
+
+    Both fail silently later on: SteamCMD partially extracts, then the
+    game process crashes on first save without a clear log line. Refusing
+    at Install time with an actionable ``chown``/mount hint saves the
+    operator hours.
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise RuntimeError(
+            f"{label} {path} is not creatable ({e}). "
+            f"Check that its parent directory is writable by the manager user "
+            f"(usually: sudo chown -R gamesrv:gamesrv {path.parent})."
+        )
+    probe = path / ".gamesrv_write_test"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+    except OSError as e:
+        # Try to include ownership in the error so the operator has a hint
+        # without needing to shell in.
+        try:
+            st = path.stat()
+            import pwd, grp
+            try:
+                owner = pwd.getpwuid(st.st_uid).pw_name
+            except KeyError:
+                owner = str(st.st_uid)
+            try:
+                group = grp.getgrgid(st.st_gid).gr_name
+            except KeyError:
+                group = str(st.st_gid)
+            owner_info = f" [current owner: {owner}:{group}, mode {oct(st.st_mode & 0o777)}]"
+        except OSError:
+            owner_info = ""
+        raise RuntimeError(
+            f"{label} {path} is not writable by the manager user ({e}).{owner_info} "
+            f"Fix:\n"
+            f"  sudo chown -R gamesrv:gamesrv {path}\n"
+            f"If {label} is on a bind/NFS mount that squashes UIDs (owner shows as "
+            f"'nobody:nogroup'), fix the mount options — see docs/ADDING_SERVERS.md "
+            f"for the Proxmox bind-mount / TrueNAS NFS export recipe."
+        )
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
+def _preflight_disk_space(install_dir, steam_app_id: int) -> None:
+    """Fail fast if the filesystem hosting install_dir doesn't have room.
+
+    SteamCMD downloads the full app to a temp area under HOME (which we
+    pin to install_dir) and THEN moves files into place, so we can check
+    a single mount point. Uses a per-app minimum (see _MIN_DISK_GB).
+    """
+    try:
+        free_bytes = shutil.disk_usage(install_dir).free
+    except OSError:
+        return  # can't check; don't block the install on our own error
+    min_gb = _MIN_DISK_GB.get(steam_app_id, _DEFAULT_MIN_DISK_GB)
+    free_gb = free_bytes / (1024 ** 3)
+    if free_gb < min_gb:
+        raise RuntimeError(
+            f"insufficient disk space on the filesystem hosting {install_dir}: "
+            f"{free_gb:.1f} GB free, need at least {min_gb} GB for app "
+            f"{steam_app_id}. Free some space and retry."
+        )
+
+
 class SteamCmdHandler(TypeHandler):
     def install(self) -> list[str]:
         if not self.sd.steam_app_id:
             raise ValueError("steamcmd type requires steam_app_id in the definition")
         self.ensure_dirs()
         msgs: list[str] = []
+
+        # ---- pre-flight checks -----------------------------------------
+        # Run these BEFORE steamcmd so the operator gets an actionable error
+        # in seconds rather than after a multi-GB download partially completes
+        # and leaves install_dir in a wedged half-installed state.
+        _preflight_writable(self.install_dir, "install_dir")
+        _preflight_writable(self.world_dir, "world_dir")
+        _preflight_disk_space(self.install_dir, self.sd.steam_app_id)
+        # ---------------------------------------------------------------
 
         # Locate steamcmd. Debian's package installs the binary at
         # /usr/games/steamcmd, which isn't on the default systemd PATH,
@@ -814,6 +930,22 @@ class SteamCmdHandler(TypeHandler):
                 saves.symlink_to(self.world_dir)
                 msgs.append(f"symlinked {saves} -> {self.world_dir}")
 
+            # Verify the symlink actually resolves AND the target is
+            # writable by us. Catches: TrueNAS/NFS mount dropped, world_dir
+            # squashed to nobody:nogroup on a misconfigured bind mount,
+            # world_dir on a read-only ZFS snapshot. Same pattern as the
+            # top-of-install()  _preflight_writable — refuse loudly rather
+            # than let the game crash on its first save.
+            try:
+                _preflight_writable(saves, f"save symlink {saves.name} -> world_dir")
+            except RuntimeError as e:
+                # Surface as a HARD failure — first save would crash the
+                # game anyway, and we want the operator to see this in the
+                # install job output, not in tmux console 5 minutes later.
+                raise RuntimeError(
+                    f"Save directory not usable after symlink to world_dir.\n{e}"
+                ) from None
+
         env_values = {"GAME_PORT": str(game_port), "MEMORY_MB": str(self.sd.memory_mb)}
         # Recipe-provided env (e.g. HOME for Satisfactory) is applied before
         # user extras so the user's YAML always wins.
@@ -843,21 +975,113 @@ class SteamCmdHandler(TypeHandler):
 # --- per-game post-install config hooks --------------------------------------
 
 def _apply_post_install_config(sd, install_dir, world_dir) -> list[str]:
-    """Idempotent per-game config writer. Runs after every install.
+    """Idempotent per-game config writer. Runs after every install/configure.
 
-    Currently:
-      * Satisfactory (1690800) — writes AutoLoadSessionName pointing at
-        the newest .sav found in world_dir/SaveGames/server/. Skipped
-        (with a helpful message) when no save is present.
+    Dispatches by ``sd.steam_app_id`` to per-game helpers:
+      * Palworld (2394010) — creates the ``.steam/sdk64/steamclient.so``
+        symlink Palworld's SteamAPI needs (else Steam networking silently
+        degrades and clients can't join).
+      * Satisfactory (1690800) — writes ``AutoLoadSessionName`` pointing
+        at the newest ``.sav`` under ``world_dir``.
 
-    Kept as a single dispatch function so future games (Palworld
-    PalWorldSettings.ini, Enshrouded enshrouded_server.json, etc.) can
-    slot in without touching the main install() path.
+    Kept as a single dispatch function so future games can slot in without
+    touching the main install() path.
+    """
+    if sd.steam_app_id == 2394010:
+        return _apply_palworld_steamsdk(install_dir)
+    if sd.steam_app_id == 1690800:
+        return _apply_satisfactory_autoload(sd, install_dir, world_dir)
+    return []
+
+
+def _apply_palworld_steamsdk(install_dir) -> list[str]:
+    """Fix Palworld's [S_API FAIL] on SteamUser021 / SteamFriends017 / etc.
+
+    Palworld's dedicated server loads its LOCAL ``steamclient.so`` from
+    ``Pal/Binaries/Linux/`` (that part logs as ``SteamAPI_Init(): Loaded
+    local 'steamclient.so' OK``), but its Steam interface init separately
+    looks for ``$HOME/.steam/sdk64/steamclient.so``. When that file is
+    missing Steam networking never fully initialises — the game process
+    stays up and binds :8211/:27015, but:
+      * A2S queries queue on :27015 without ever being read (visible as a
+        growing Recv-Q in ``ss -lnup``).
+      * Client sessions time out because Palworld authenticates them via
+        Steam GameNetworkingSockets, which needs those interfaces.
+
+    None of this is documented in Palworld's official notes; it's
+    community folklore. The manager now sets it up unconditionally so
+    ``Install → Start`` works out of the box.
+
+    Requires the Palworld recipe to pin ``HOME`` to ``install_dir`` so
+    ``$HOME/.steam/sdk64`` lands somewhere gamesrv can write to (and
+    where the file survives reinstalls without polluting /home/gamesrv).
     """
     from pathlib import Path
-    if sd.steam_app_id != 1690800:
-        return []
+    sdk_dir = Path(install_dir) / ".steam" / "sdk64"
+    link = sdk_dir / "steamclient.so"
+    target = Path(install_dir) / "Pal" / "Binaries" / "Linux" / "steamclient.so"
 
+    if not target.exists():
+        return [
+            "post-install (Palworld): expected steamclient.so at "
+            f"{target} but it's missing — the SteamCMD download may be "
+            "incomplete. Re-run Install."
+        ]
+
+    try:
+        sdk_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return [
+            f"WARNING: could not create {sdk_dir} for Palworld SteamAPI "
+            f"symlink ({e}). Steam networking may fail with [S_API FAIL] "
+            "on client connect. Fix: chown -R gamesrv:gamesrv on install_dir."
+        ]
+
+    # Idempotent: if link exists and points at the right file, leave it.
+    if link.is_symlink() or link.exists():
+        try:
+            current_target = Path(os.readlink(link)) if link.is_symlink() else link.resolve()
+        except OSError:
+            current_target = None
+        if current_target == target:
+            return [
+                f"post-install (Palworld): .steam/sdk64/steamclient.so already "
+                f"points at {target.name} — Steam networking OK"
+            ]
+        # Wrong target — replace.
+        try:
+            link.unlink()
+        except OSError:
+            pass
+
+    try:
+        link.symlink_to(target)
+    except OSError as e:
+        # Fall back to a copy if symlink is disallowed (rare — some
+        # filesystems / bind mounts refuse symlinks). A copy works too,
+        # it just won't auto-update if the game's steamclient.so changes.
+        try:
+            import shutil as _shutil
+            _shutil.copy2(target, link)
+            return [
+                f"post-install (Palworld): copied steamclient.so → {link} "
+                f"(symlink failed: {e})"
+            ]
+        except OSError as e2:
+            return [
+                f"WARNING: could not install Palworld SteamAPI shim ({e2}). "
+                "Steam networking may fail with [S_API FAIL] on client connect."
+            ]
+
+    return [
+        f"post-install (Palworld): linked {link} → {target.name} "
+        "(fixes [S_API FAIL] SteamUser021 / clients-can't-connect)"
+    ]
+
+
+def _apply_satisfactory_autoload(sd, install_dir, world_dir) -> list[str]:
+    """Write AutoLoadSessionName into Satisfactory's Game.ini."""
+    from pathlib import Path
     saves_dir = Path(world_dir) / "SaveGames" / "server"
     sav_files = sorted(saves_dir.glob("*.sav"),
                        key=lambda p: p.stat().st_mtime, reverse=True) \

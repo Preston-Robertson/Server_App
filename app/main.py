@@ -372,6 +372,25 @@ def api_upsert_server(sd: registry.ServerDef) -> dict:
     except Exception:
         prev = None
 
+    # Reject port collisions BEFORE writing anything — the second server
+    # would silently fail at Start with "address already in use" and the
+    # operator would have to dig through journalctl to figure out which
+    # other server owned :{port}. Refuse loudly with an actionable message
+    # instead. Compares against the running def set, so renaming/updating
+    # a server to keep its own port is a no-op (prev.name == sd.name).
+    for other in registry.list_defs():
+        if other.name == sd.name:
+            continue
+        if int(other.port) == int(sd.port):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"port {sd.port} is already used by server '{other.name}' "
+                    f"(type={other.type}). Pick a different port for '{sd.name}' "
+                    f"or delete/change the other server first."
+                ),
+            )
+
     registry.save_def(sd)
 
     # Always regenerate launch scripts so start.sh reflects the new yaml.

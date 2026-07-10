@@ -424,8 +424,27 @@ class _State:
     # signal on the dashboard — the idle-shutdown countdown is driven by
     # empty_since_ms, not this field.
     first_ready_ms: Optional[int] = None
+    # Wall-clock ms at which we first observed systemd active=active for
+    # this server since it last went inactive. Populated on the first
+    # tick where the unit is up, cleared when it stops. Combined with
+    # first_ready_ms this lets the dashboard tell "still loading (normal)"
+    # apart from "stuck (probably crashed)".
+    active_since_ms: Optional[int] = None
     empty_since_ms: Optional[int] = None
     consecutive_probe_fails: int = 0
+
+
+# Thresholds for flagging a server as taking unusually long to become
+# ready. Chosen empirically:
+#   * Minecraft: typically <60 s to green.
+#   * Palworld / Satisfactory: 1-5 min cold-start.
+#   * ARK / Enshrouded: 5-15 min for large worlds.
+# So 5 min is a decent "hmm, taking a while" mark for the smaller games
+# and 20 min is "something is wrong" for even the biggest builds. The
+# frontend uses these flags to change chip color + surface a hint linking
+# to the Console tab; the watchdog itself takes no action.
+SLOW_START_THRESHOLD_SEC = 5 * 60
+STUCK_START_THRESHOLD_SEC = 20 * 60
 
 
 class Watchdog:
@@ -442,12 +461,21 @@ class Watchdog:
             out = {}
             for name, s in self._states.items():
                 empty_ms = (now_ms - s.empty_since_ms) if s.empty_since_ms else 0
+                ready = s.first_ready_ms is not None
+                # How long has this server been in the "active-but-not-ready"
+                # (i.e. "starting") state? Only meaningful when not ready.
+                starting_sec = 0
+                if not ready and s.active_since_ms:
+                    starting_sec = (now_ms - s.active_since_ms) // 1000
                 out[name] = {
                     "players": s.last_players,
                     "max_players": s.last_max,
                     "probe_ok": s.last_probe_ok,
-                    "ready": s.first_ready_ms is not None,
+                    "ready": ready,
                     "empty_sec": empty_ms // 1000,
+                    "starting_sec": starting_sec,
+                    "slow_start": starting_sec >= SLOW_START_THRESHOLD_SEC,
+                    "stuck_start": starting_sec >= STUCK_START_THRESHOLD_SEC,
                 }
             return out
 
@@ -498,6 +526,9 @@ class Watchdog:
                 continue
 
             state = self._states.setdefault(sd.name, _State())
+            # First tick observing this server as active — remember when.
+            if state.active_since_ms is None:
+                state.active_since_ms = now_ms
             result = _probe_for(sd)
             if result is None:
                 state.consecutive_probe_fails += 1
