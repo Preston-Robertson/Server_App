@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import shlex
 import shutil
+import socket
 import subprocess
+import time
 from dataclasses import dataclass
 
 from .config import settings
@@ -58,6 +60,47 @@ def enable(sd: ServerDef) -> subprocess.CompletedProcess:
 
 def disable(sd: ServerDef) -> subprocess.CompletedProcess:
     return _run(["systemctl", "disable", _unit(sd.name)])
+
+
+# ---------- port bind readiness ---------------------------------------------
+
+def wait_tcp_port_free(port: int, timeout: float = 90.0,
+                       host: str = "0.0.0.0") -> bool:
+    """Block until ``host:port`` can be freshly bound (no LISTEN, no TIME_WAIT).
+
+    Returns True as soon as the port is bindable, False if the timeout
+    elapses.
+
+    Why this matters (Satisfactory / Unreal Engine specifically): FactoryServer
+    binds its TCP sockets WITHOUT ``SO_REUSEADDR``. If a prior instance's
+    TCP socket is still in the kernel's ``TIME_WAIT`` state (typical 60–120 s
+    after a graceful close) when we start again, FactoryServer's ``bind()``
+    fails with ``EADDRINUSE`` and Unreal silently port-shifts to ``port+1``,
+    ``port+2``, etc. That silently breaks any pre-configured router forward
+    aimed at ``port`` and confuses everything that hard-coded ``port`` for
+    probes/firewall rules. Waiting for the port to actually be free before
+    calling ``systemctl start`` prevents the shift entirely.
+
+    We probe by attempting a bind ourselves (also without SO_REUSEADDR) so
+    our check reflects what FactoryServer will see. The bind is closed
+    immediately; because we never listen/connect, closing does NOT create
+    a TIME_WAIT of its own — it's a clean bind-and-release.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((host, port))
+            return True
+        except OSError:
+            pass
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+        time.sleep(0.5)
+    return False
 
 
 # ---------- status ----------

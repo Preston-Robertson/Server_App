@@ -74,16 +74,24 @@ def _extra_ports_for(sd) -> list[tuple[int, str, str]]:
     """
     if sd.type == "steamcmd" and getattr(sd, "steam_app_id", None) == 1690800:
         # Satisfactory 1.0+ (verified against Update 8 / 1.0 dedicated):
-        #   UDP <port>     — game traffic (primary; handled by _proto_for)
-        #   TCP <port+1>   — HTTPS Server API (Server Manager uses this)
-        #   TCP 8888       — Reliable messaging (save streaming during joins)
+        #   UDP <port>         — game traffic (primary; handled by _proto_for)
+        #   TCP <port>         — HTTPS Server API (normal case)
+        #   TCP <port + 1>     — HTTPS Server API (Unreal port-shift fallback
+        #                        when TCP:<port> is in TIME_WAIT at bind time)
+        #   TCP 8888           — Reliable messaging (save streaming; FIXED)
         #
-        # The API port is *derived* from -Port as `port + 1`, NOT the same
-        # as the game port. Confirmed empirically via `ss -tlnp` against
-        # a running server launched with `-Port=15777`: it binds
-        # UDP:15777, TCP:15778, TCP:8888.
+        # Both TCP <port> and TCP <port+1> are opened because Unreal Engine
+        # silently port-shifts if TCP:<port> can't be bound (bind() is done
+        # without SO_REUSEADDR, so a lingering TIME_WAIT socket from the
+        # previous instance blocks it). Opening both is harmless and means
+        # the Server Manager panel keeps working across restarts regardless
+        # of which one the game ended up on. (The manager's start hook also
+        # actively waits for TCP:<port> to be free before starting to keep
+        # the shift from happening in the first place — see
+        # control.wait_tcp_port_free.)
         return [
-            (int(sd.port) + 1, "tcp", "satisfactory-api"),
+            (int(sd.port), "tcp", "satisfactory-api"),
+            (int(sd.port) + 1, "tcp", "satisfactory-api-shifted"),
             (8888, "tcp", "satisfactory-reliable"),
         ]
     return []

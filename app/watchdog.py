@@ -331,18 +331,23 @@ def _probe_for(sd) -> Optional[ProbeResult]:
         if not sd.steam_app_id:
             return None
         # Satisfactory: A2S is broken (always reports 0 players). Route to
-        # the HTTPS Server API instead. The API listens on `port + 1` (the
-        # game socket itself is UDP-only); wake-on-demand remaps that to
-        # the internal port +1 just like the UDP game socket.
+        # the HTTPS Server API instead. Under normal operation the API
+        # lives on TCP:port (same as -Port); if the game had to Unreal-
+        # port-shift on bind (previous instance's TIME_WAIT lingered),
+        # it lands on TCP:port+1 instead. We try both so the dashboard
+        # doesn't lie when the shift happens on some edge-case restart.
+        # Wake-on-demand also offsets both.
         if sd.steam_app_id in _SATISFACTORY_APPS:
-            api_port = sd.port + 1
-            if getattr(sd, "wake_on_demand", False):
-                api_port = sd.port + _WAKE_INTERNAL_OFFSET + 1
+            offset = _WAKE_INTERNAL_OFFSET if getattr(sd, "wake_on_demand", False) else 0
             admin_pw = ""
             pw_cfg = getattr(sd, "passwords", None)
             if pw_cfg is not None:
                 admin_pw = getattr(pw_cfg, "admin_password", "") or ""
-            return probe_satisfactory_https(host, api_port, admin_pw)
+            for candidate in (sd.port + offset, sd.port + offset + 1):
+                r = probe_satisfactory_https(host, candidate, admin_pw)
+                if r is not None:
+                    return r
+            return None
         query_port = sd.port if sd.steam_app_id in _SINGLE_PORT_STEAM_APPS else 27015
         # Single-port Steam games (Satisfactory) share the game socket with
         # A2S — remap to the internal port when wake is on.
