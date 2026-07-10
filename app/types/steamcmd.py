@@ -61,9 +61,24 @@ fi
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
-# Start tmux DETACHED and block until session ends. See
-# minecraft_forge.py for why (no PTY under systemd).
-tmux new-session -d -s "$SESSION" -n game "$BIN"
+# Start tmux DETACHED, but wrap the actual game invocation so we can
+# capture its true exit code. Without this wrapper, tmux swallows the
+# game's exit code and start.sh always exits 0 — so systemd never sees
+# a real failure signal and the operator's Console tab has no clue why
+# the process died. With the wrapper:
+#   * ${{BIN}} runs normally, writing stdout/stderr to the tmux pane
+#     (which pipe-pane below tees to console.log).
+#   * When it exits, the wrapper appends a GAMESRV_EXIT=<code> line to
+#     console.log AND to stderr (visible in `journalctl -u gamesrv@<name>`).
+#     Exit-code decoder: 0 clean exit, 130 SIGINT (external stop or
+#     Palworld self-exit), 137 SIGKILL (OOM / cgroup memory limit), 139
+#     SIGSEGV (native crash), 1/2/etc  Palworld's own error paths.
+# The trailing `; exec bash` (commented out below) is available if you
+# want the tmux window to persist after the game dies for hands-on
+# debugging — enable by hand-editing start.sh; the manager won't
+# regenerate over it if you also set MANAGED=false at the top.
+tmux new-session -d -s "$SESSION" -n game \\
+  "$BIN ; ec=\\$?; printf '\\nGAMESRV_EXIT=%d\\n' \\$ec | tee -a $(pwd)/console.log >&2"
 
 # Tee the tmux pane's live output to console.log. This is the ONLY way the
 # manager's Console tab can show game output for SteamCMD games that don't

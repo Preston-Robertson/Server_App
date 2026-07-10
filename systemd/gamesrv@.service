@@ -29,7 +29,22 @@ ExecStop=/srv/gameservers/%i/stop.sh
 # wait + a small buffer for the JVM to actually exit after tmux dies). See
 # app/control.py::_STOP_TIMEOUT_SEC which polls systemctl for up to 240s.
 TimeoutStopSec=300
-Restart=on-failure
+# Restart=no on purpose. `Restart=on-failure` was masking every game-side
+# crash by silently re-executing start.sh every RestartSec seconds — the
+# operator saw "◐ starting" (Uptime 0s, RAM low) forever because
+# ActiveEnterTimestamp reset on every restart, but no message ever
+# appeared in the manager journal because these restarts happen INSIDE
+# systemd, not through control.stop(). With Restart=no, a game that dies
+# stays dead: the systemd unit flips to "failed" (visible as ✕ failed on
+# the dashboard card) and start.sh's exit-code capture in the game's
+# console.log gives the actual reason. Operators can then click Start
+# again explicitly. If a specific server needs auto-restart, add a
+# per-server drop-in:
+#   mkdir -p /etc/systemd/system/gamesrv@<name>.service.d
+#   printf '[Service]\nRestart=on-failure\nRestartSec=10\n' > \
+#     /etc/systemd/system/gamesrv@<name>.service.d/restart.conf
+#   systemctl daemon-reload
+Restart=no
 RestartSec=10
 KillMode=mixed
 # NO hardcoded MemoryMax here on purpose. A blanket cgroup memory cap in
