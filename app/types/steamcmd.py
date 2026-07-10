@@ -189,18 +189,25 @@ def _parse_line(line: str) -> dict | None:
     return None
 
 
-def _stream_steamcmd(cmd: list[str], on_event) -> tuple[int, str]:
+def _stream_steamcmd(cmd: list[str], on_event, env: dict | None = None) -> tuple[int, str]:
     """Run steamcmd; stream stdout line-by-line into on_event({...}).
 
     Handles both \\n-terminated lines and steamcmd's \\r-updated download
     progress (which would otherwise be one giant line). Returns
     (returncode, tail_str) where tail_str is the last ~40 lines for logs.
+
+    ``env`` is passed through to ``subprocess.Popen`` unchanged. Pass the
+    manager process env plus per-recipe overrides (notably ``HOME``, which
+    steamcmd needs writable to store its own state). ``None`` means inherit
+    — safe for tests, wrong for production because the manager's HOME may
+    be unwritable by the effective user.
     """
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=0,
+        env=env,
     )
     assert proc.stdout is not None
     fd = proc.stdout.fileno()
@@ -587,7 +594,22 @@ class SteamCmdHandler(TypeHandler):
         msgs.append(f"running: {' '.join(cmd)}")
         self._emit(phase="starting steamcmd", percent=0.0, line=" ".join(cmd))
 
-        rc, tail = _stream_steamcmd(cmd, lambda ev: self._emit(**ev))
+        # Build the steamcmd subprocess env. Pinning HOME to install_dir
+        # is the safe default for every recipe: steamcmd writes ~/.steam,
+        # ~/.local/share/Steam, ~/Steam etc., and the manager's own HOME
+        # (systemd's User= default) is /home/gamesrv — which doesn't have
+        # to exist. When it doesn't, steamcmd fails with "mkdir: cannot
+        # create directory '/home': Permission denied" (issue seen on
+        # unprivileged LXCs where /home is a tmpfs the service can't
+        # extend). Sandboxing per-game state under install_dir also means
+        # a game and its steamcmd cache are one unit — easy to back up
+        # or move.
+        run_env = os.environ.copy()
+        run_env["HOME"] = str(self.install_dir)
+        for k, v in (recipe.get("env") or {}).items():
+            run_env[k] = v.format(install_dir=self.install_dir, world_dir=self.world_dir)
+
+        rc, tail = _stream_steamcmd(cmd, lambda ev: self._emit(**ev), env=run_env)
         msgs.append(tail)
         if rc != 0:
             raise RuntimeError(f"steamcmd failed (exit {rc}):\n{tail}")
