@@ -45,11 +45,31 @@ if ! command -v tmux >/dev/null; then
   exit 1
 fi
 
+# Truncate the tmux pane capture so it doesn't grow unbounded across
+# restarts. See the pipe-pane call below for why we capture at all.
+: > console.log
+
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
 # Start tmux DETACHED and block until session ends. See
 # minecraft_forge.py for why (no PTY under systemd).
 tmux new-session -d -s "$SESSION" -n game "$BIN"
+
+# Tee the tmux pane's live output to console.log. This is the ONLY way the
+# manager's Console tab can show game output for SteamCMD games that don't
+# write their own log file to disk (Palworld, Valheim, generic steamcmd),
+# because their stdout goes to the tmux pane — not the systemd journal.
+# For games that DO write their own log (Satisfactory FactoryGame.log, ARK
+# ShooterGame.log), the pane capture is a useful supplement showing early
+# boot errors + steamcmd chatter before the game log opens.
+# Non-fatal: if pipe-pane fails, the game still runs; the operator just
+# won't see live output in the dashboard until the next Install regenerates
+# start.sh. Older tmux (<2.6) may not accept ``-t sess:window`` — retry
+# with just the session target if that happens.
+tmux pipe-pane -t "$SESSION:game" "cat >> $(pwd)/console.log" 2>/dev/null \\
+  || tmux pipe-pane -t "$SESSION" "cat >> $(pwd)/console.log" 2>/dev/null \\
+  || echo "WARN: tmux pipe-pane failed; Console tab will fall back to systemd journal" >&2
+
 while tmux has-session -t "$SESSION" 2>/dev/null; do
   sleep 1
 done

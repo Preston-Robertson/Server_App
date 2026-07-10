@@ -727,8 +727,19 @@ def _game_log_path(sd) -> Optional[Path]:
     # Satisfactory (steam_app_id 1690800) — the Unreal Engine log.
     if sd.type == "steamcmd" and sd.steam_app_id == 1690800:
         return Path(sd.install_dir) / "FactoryGame" / "Saved" / "Logs" / "FactoryGame.log"
-    # Other SteamCMD / custom types have no standard log location — the
-    # frontend falls back to the systemd journal view when this returns None.
+    # Every manager-generated SteamCMD start.sh pipes its tmux pane to
+    # install_dir/console.log (see app/types/steamcmd.py _START_TEMPLATE).
+    # That's the only place the game's actual stdout lives for games like
+    # Palworld / Valheim / generic SteamCMD, because tmux swallows stdout
+    # before it can reach the systemd journal. Return that path so the
+    # dashboard's Console tab shows real game output. If the file doesn't
+    # exist yet, the /game-log endpoint returns a helpful "not created
+    # yet — start the server" message instead of falling back to the
+    # (near-empty) journal.
+    if sd.type == "steamcmd":
+        return Path(sd.install_dir) / "console.log"
+    # Custom types have no standard log location — the frontend falls back
+    # to the systemd journal view when this returns None.
     return None
 
 

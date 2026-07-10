@@ -1809,7 +1809,7 @@ async function loadConsoleLog() {
     }
     if (srcLabel) {
       srcLabel.textContent = source === "game-log"
-        ? "source: game log (logs/latest.log)"
+        ? "source: game console"
         : "source: systemd journal";
     }
     const wasAtBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;

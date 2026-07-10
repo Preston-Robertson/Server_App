@@ -248,7 +248,9 @@
             <hr />
             <h3 style="margin: 6px 0;">Console <span id="console-source" class="small muted">source: —</span></h3>
             <p class="muted small" style="margin-top:4px;">
-              Live game output (Minecraft's <code>logs/latest.log</code> when available, else the systemd journal).
+              Live game output. Manager captures the game's real stdout when available
+              (Minecraft <code>logs/latest.log</code>, Satisfactory <code>FactoryGame.log</code>,
+              tmux pane capture for other SteamCMD games); falls back to the systemd journal.
               Send a command below — routed via the tmux session
               (Minecraft: <code>say hi</code>, <code>whitelist add Steve</code>, <code>op Steve</code>).
             </p>
