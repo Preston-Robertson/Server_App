@@ -949,6 +949,25 @@ function renderServerGrid(rows) {
       }
     }
 
+    // Install / job-status chip. Priority:
+    //   1. Live install/update job → phase + percent (e.g. "downloading 42%")
+    //   2. Never installed → "not installed" chip nudging the operator to
+    //      open the Admin tab.
+    // We deliberately don't surface "install failed" persistently; the
+    // Admin tab is where the operator goes to see + fix that.
+    let installChip = "";
+    const job = r.job;
+    if (job && !job.done) {
+      const phase = job.phase || job.kind;
+      const pct = Number.isFinite(job.percent) ? ` ${job.percent.toFixed(0)}%` : "";
+      installChip = `<span class="chip chip-accent" title="${escape(job.kind)} in progress">⬇ ${escape(phase)}${pct}</span>`;
+    } else if (job && job.done && !job.ok && (Date.now() / 1000 - (job.elapsed_sec ? 0 : 0)) < 60) {
+      // Recently-failed job — show a red chip so operator notices.
+      installChip = `<span class="chip chip-err" title="${escape(job.error || 'install failed')}">✕ ${escape(job.kind)} failed</span>`;
+    } else if (s.installed === false) {
+      installChip = `<span class="chip chip-warn" title="Open the Admin tab and click Install / Reprovision">⚠ not installed</span>`;
+    }
+
     // Connect string: what a player types into the game client. Uses the
     // hostname the operator is currently browsing on (works over LAN, VPN,
     // and DNS names). Copy button on the right.
@@ -971,6 +990,7 @@ function renderServerGrid(rows) {
         ${accessChip}
         ${idleChip}
         ${wakeChip}
+        ${installChip}
       </div>
       <div class="server-card-connect">
         <span class="connect-label">Connect</span>
@@ -1061,7 +1081,6 @@ async function loadIdleWakePanel(name) {
     const r = await api(`/api/servers/${name}`);
     const d = r.def || {};
     IW_PREV_DEF = d;
-
     const idleMin = d.idle_shutdown_min || 0;
     $("#iw-idle-enabled").checked = idleMin > 0;
     $("#iw-idle-min").value = idleMin > 0 ? idleMin : 20;
@@ -1072,18 +1091,17 @@ async function loadIdleWakePanel(name) {
     $("#iw-wake-status").textContent = "";
     $("#iw-reinstall-hint").hidden = true;
 
-    // Wake whitelist row — only meaningful for Minecraft (TCP wake). For
-    // Steam UDP wake there's no per-player identity to filter on, so we
-    // don't confuse the operator by showing an input that does nothing.
-    const wlAvailable = !!d.wake_on_demand
+    // Wake whitelist — always visible on the Admin tab, but with a hint
+    // when it's not currently enforced (either wake-on-demand is off, or
+    // the server isn't a Minecraft server so the TCP-login-peek filter
+    // doesn't apply).
+    const wlEnforced = !!d.wake_on_demand
       && ["minecraft-java", "minecraft-forge"].includes(d.type);
-    const wlRow = $("#iw-wl-row");
-    if (wlRow) wlRow.hidden = !wlAvailable;
-    if (wlAvailable) {
-      const names = Array.isArray(d.wake_whitelist) ? d.wake_whitelist : [];
-      $("#iw-wl-names").value = names.join("\n");
-      $("#iw-wl-status").textContent = "";
-    }
+    const wlHint = $("#admin-wl-inactive-hint");
+    if (wlHint) wlHint.hidden = wlEnforced;
+    const names = Array.isArray(d.wake_whitelist) ? d.wake_whitelist : [];
+    $("#iw-wl-names").value = names.join("\n");
+    $("#iw-wl-status").textContent = "";
 
     // Firewall panel — mode radio + optional IP allow list. Reads
     // whatever's in ServerDef.firewall; defaults to "lan" if the field
@@ -1116,6 +1134,19 @@ async function loadIdleWakePanel(name) {
       $("#iw-stop-status").textContent = "";
       $("#iw-stop-hint").hidden = true;
     }
+
+    // Memory cap row — always shown. memory_mb is used by every handler:
+    //   * minecraft-* → -Xms/-Xmx baked into start.sh + user_jvm_args.txt
+    //   * steamcmd   → informational (game manages its own memory); the
+    //                  pre-flight RAM check still uses it to prevent
+    //                  overcommit when the operator hits Start
+    $("#iw-mem-mb").value = d.memory_mb || 2048;
+    $("#iw-mem-status").textContent = "";
+    $("#iw-mem-hint").hidden = true;
+
+    // Steam ID address-book table for this server. Loaded async so the
+    // rest of the panel doesn't wait on a second HTTP hop.
+    loadSteamIdPanel(d);
   } catch (e) {
     $("#iw-idle-status").textContent = "ERROR: " + e.message;
   }
@@ -1168,22 +1199,23 @@ $("#iw-save-wake")?.addEventListener("click", async () => {
     // A wake toggle changes the port the game binds. Warn loudly so the
     // operator remembers to Reinstall before the next start.
     $("#iw-reinstall-hint").hidden = !toggleChanged;
-    // Also reveal/hide the whitelist row now that wake is on/off.
-    const wlAvailable = !!sd.wake_on_demand
+    // Update the "not enforced" hint on the Admin tab's whitelist panel
+    // in case wake was just toggled off.
+    const wlEnforced = !!sd.wake_on_demand
       && ["minecraft-java", "minecraft-forge"].includes(sd.type);
-    const wlRow = $("#iw-wl-row");
-    if (wlRow) wlRow.hidden = !wlAvailable;
+    const wlHint = $("#admin-wl-inactive-hint");
+    if (wlHint) wlHint.hidden = wlEnforced;
   }
 });
 
-// Also toggle the whitelist row live as the wake checkbox is clicked, so
-// the operator sees it appear/disappear even before hitting Save.
+// Update the Admin-tab whitelist "not enforced" hint live as the wake
+// checkbox is clicked, so the operator sees the state without saving.
 $("#iw-wake-enabled")?.addEventListener("change", () => {
-  const wlRow = $("#iw-wl-row");
-  if (!wlRow || !IW_PREV_DEF) return;
-  const wlAvailable = $("#iw-wake-enabled").checked
+  const hint = $("#admin-wl-inactive-hint");
+  if (!hint || !IW_PREV_DEF) return;
+  const wlEnforced = $("#iw-wake-enabled").checked
     && ["minecraft-java", "minecraft-forge"].includes(IW_PREV_DEF.type);
-  wlRow.hidden = !wlAvailable;
+  hint.hidden = wlEnforced;
 });
 
 // Enter key in the number fields saves the corresponding row.
@@ -1227,6 +1259,193 @@ $("#iw-save-wl")?.addEventListener("click", async () => {
   $("#iw-wl-names").value = names.join("\n");
   const sd = await _saveDefPatch(CURRENT, { wake_whitelist: names }, $("#iw-wl-status"));
   if (sd) IW_PREV_DEF = sd;
+});
+
+// Memory cap Save — clamps to the input's min, otherwise just persists.
+// Takes effect after Install (regenerates start.sh with new -Xmx) + Restart.
+$("#iw-save-mem")?.addEventListener("click", async () => {
+  if (!CURRENT) return;
+  const raw = parseInt($("#iw-mem-mb").value, 10);
+  if (!Number.isFinite(raw) || raw < 512) {
+    $("#iw-mem-status").textContent = "ERROR: memory_mb must be >= 512";
+    return;
+  }
+  // Clamp to reasonable ceiling so a typo can't set 999999 MB.
+  const mb = Math.min(raw, 262144);
+  $("#iw-mem-mb").value = mb;
+  const prev = IW_PREV_DEF ? IW_PREV_DEF.memory_mb : null;
+  const sd = await _saveDefPatch(CURRENT, { memory_mb: mb }, $("#iw-mem-status"));
+  if (sd) {
+    IW_PREV_DEF = sd;
+    if (prev !== mb) $("#iw-mem-hint").hidden = false;
+  }
+});
+$("#iw-mem-mb")?.addEventListener("keydown", (e) => { if (e.key === "Enter") $("#iw-save-mem").click(); });
+
+// ---------- Steam ID address book + per-server allowlist ----------
+//
+// The address book is a global JSON store served by /api/steam-profiles
+// (see app/steam_profiles.py). This module fetches it once per panel
+// load and renders a table where each row shows: display name, SteamID,
+// and a Remove button. Add-row inputs let the operator paste a new ID +
+// optional name; "Fetch name" tries the Steam public XML endpoint.
+//
+// Removing a row removes the ID from *this server's* allowed_steamids —
+// it leaves the display name in the address book so a re-add is fast.
+
+const STEAM_PROFILES = { data: {}, loaded: false };
+
+async function _refreshSteamProfiles() {
+  try {
+    const r = await api("/api/steam-profiles");
+    STEAM_PROFILES.data = (r && r.profiles) || {};
+    STEAM_PROFILES.loaded = true;
+  } catch {
+    STEAM_PROFILES.data = {};
+    STEAM_PROFILES.loaded = false;
+  }
+}
+
+async function loadSteamIdPanel(d) {
+  const body = $("#sid-list-body");
+  if (!body) return;
+  const note = $("#sid-note");
+  const inactiveHint = $("#sid-inactive-hint");
+
+  const access = d.access || {};
+  const ids = Array.isArray(access.allowed_steamids) ? access.allowed_steamids.slice() : [];
+  const enforced = access.mode === "steamid_allowlist";
+  if (note) note.textContent = enforced
+    ? `— enforced (${ids.length} allowed)`
+    : `— not enforced by access.mode`;
+  if (inactiveHint) inactiveHint.hidden = enforced;
+
+  await _refreshSteamProfiles();
+
+  body.innerHTML = "";
+  if (ids.length === 0) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="3" class="muted">No SteamIDs on this server yet.</td>`;
+    body.appendChild(tr);
+  } else {
+    for (const sid of ids) {
+      const name = STEAM_PROFILES.data[sid] || "";
+      const tr = document.createElement("tr");
+      const nameCell = name
+        ? `<td class="sid-name">${escape(name)}</td>`
+        : `<td class="sid-name muted"><em>(no name)</em></td>`;
+      tr.innerHTML =
+        nameCell +
+        `<td class="sid-id">${escape(sid)}</td>` +
+        `<td class="sid-actions">
+           <button class="btn btn-tiny sid-rename" data-sid="${escape(sid)}"
+                   title="Set / update the display name">Rename</button>
+           <button class="btn btn-tiny btn-danger sid-remove" data-sid="${escape(sid)}"
+                   title="Remove this SteamID from the server allowlist">Remove</button>
+         </td>`;
+      body.appendChild(tr);
+    }
+  }
+
+  // Wire per-row buttons every render (elements are new each time).
+  body.querySelectorAll(".sid-remove").forEach((btn) => {
+    btn.addEventListener("click", () => _sidRemove(btn.dataset.sid));
+  });
+  body.querySelectorAll(".sid-rename").forEach((btn) => {
+    btn.addEventListener("click", () => _sidRename(btn.dataset.sid));
+  });
+}
+
+async function _sidRemove(sid) {
+  if (!CURRENT || !sid) return;
+  if (!confirm(`Remove ${sid} from this server's Steam ID allowlist? (address book entry is kept)`)) return;
+  const r = await api(`/api/servers/${CURRENT}`);
+  const ids = ((r.def || {}).access?.allowed_steamids || []).filter((s) => s !== sid);
+  const patch = { access: Object.assign({}, r.def.access, { allowed_steamids: ids }) };
+  const sd = await _saveDefPatch(CURRENT, patch, $("#sid-status"));
+  if (sd) { IW_PREV_DEF = sd; loadSteamIdPanel(sd); }
+}
+
+async function _sidRename(sid) {
+  const current = STEAM_PROFILES.data[sid] || "";
+  const next = prompt(`Display name for ${sid}\n(empty removes the address-book entry)`, current);
+  if (next === null) return;
+  const status = $("#sid-status");
+  status.textContent = "saving…";
+  try {
+    await api("/api/steam-profiles", {
+      method: "POST",
+      body: JSON.stringify({ steamid: sid, name: next.trim() }),
+    });
+    status.textContent = "✓ saved";
+    setTimeout(() => { if (status.textContent === "✓ saved") status.textContent = ""; }, 2000);
+    await _refreshSteamProfiles();
+    if (IW_PREV_DEF) loadSteamIdPanel(IW_PREV_DEF);
+  } catch (e) {
+    status.textContent = "ERROR: " + e.message;
+  }
+}
+
+$("#sid-lookup")?.addEventListener("click", async () => {
+  const sid = $("#sid-add-id").value.trim();
+  const status = $("#sid-status");
+  if (!/^7656119\d{10}$/.test(sid)) {
+    status.textContent = "ERROR: enter a valid 17-digit SteamID64 first";
+    return;
+  }
+  status.textContent = "looking up…";
+  try {
+    const r = await api(`/api/steam-profiles/lookup?steamid=${encodeURIComponent(sid)}`);
+    if (r.name) {
+      $("#sid-add-name").value = r.name;
+      status.textContent = `✓ Steam says "${r.name}"`;
+    } else {
+      status.textContent = "no public name found (private profile or offline)";
+    }
+  } catch (e) {
+    status.textContent = "ERROR: " + e.message;
+  }
+});
+
+$("#sid-add")?.addEventListener("click", async () => {
+  if (!CURRENT) return;
+  const sid = $("#sid-add-id").value.trim();
+  const name = $("#sid-add-name").value.trim();
+  const status = $("#sid-status");
+  if (!/^7656119\d{10}$/.test(sid)) {
+    status.textContent = "ERROR: SteamID must be 17 digits starting with 7656119";
+    return;
+  }
+  status.textContent = "adding…";
+  try {
+    // Save the address-book entry FIRST so the row that appears next has
+    // the name filled in without a re-render race.
+    if (name) {
+      await api("/api/steam-profiles", {
+        method: "POST",
+        body: JSON.stringify({ steamid: sid, name }),
+      });
+    }
+    // Merge into the def's allowed_steamids without duplicating.
+    const r = await api(`/api/servers/${CURRENT}`);
+    const existing = (r.def && r.def.access && r.def.access.allowed_steamids) || [];
+    if (existing.includes(sid)) {
+      status.textContent = "already on this server's allowlist";
+    } else {
+      const patch = {
+        access: Object.assign({}, r.def.access, {
+          allowed_steamids: [...existing, sid],
+        }),
+      };
+      const sd = await _saveDefPatch(CURRENT, patch, status);
+      if (sd) IW_PREV_DEF = sd;
+    }
+    $("#sid-add-id").value = "";
+    $("#sid-add-name").value = "";
+    if (IW_PREV_DEF) loadSteamIdPanel(IW_PREV_DEF);
+  } catch (e) {
+    status.textContent = "ERROR: " + e.message;
+  }
 });
 
 // Firewall panel: reveal/hide the IP textarea + warning based on mode,
@@ -1312,7 +1531,9 @@ function showTab(name) {
     loadLogs();
     if ($("#logs-follow")?.checked) LOGS_TIMER = setInterval(loadLogs, 2000);
   }
-  if (name === "console") {
+  if (name === "control") {
+    // Console log + input now live at the bottom of Control. Fire the
+    // initial fetch and start the auto-refresh follower.
     loadConsoleLog();
     if ($("#console-follow")?.checked) CONSOLE_TIMER = setInterval(loadConsoleLog, 2000);
   }
@@ -1320,6 +1541,9 @@ function showTab(name) {
   if (name === "backups") loadBackups();
   if (name === "def") loadDef();
   if (name === "git") loadGit();
+  // Admin tab has no async load of its own — the shared idle/wake panel
+  // (loaded when the server detail opens) already populates its whitelist
+  // + SteamID sections.
 }
 $$(".subtab").forEach(b => b.onclick = () => showTab(b.dataset.tab));
 

@@ -39,7 +39,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from . import control, registry, uploads, updater, git_source, env_file, jobs, watchdog, wake_proxy, perf, firewall
+from . import control, registry, uploads, updater, git_source, env_file, jobs, watchdog, wake_proxy, perf, firewall, steam_profiles
 from .auth import require_token
 from .config import settings
 from .types import handler_for
@@ -271,6 +271,44 @@ def api_stats_history(minutes: int = 60) -> dict:
 
 # ---------- server registry ----------
 
+def _installed_state(sd) -> bool:
+    """Cheap "did install run successfully" heuristic.
+
+    Every handler writes ``install_dir/start.sh`` at the tail of its
+    install(), so the presence of that script — with non-trivial size
+    — is our marker. Custom servers ship start.sh by hand, in which
+    case this correctly still reports installed.
+    """
+    try:
+        p = Path(sd.install_dir) / "start.sh"
+        if not p.exists():
+            return False
+        # Any non-empty file counts; empty is treated as "install didn't
+        # actually run" so the card doesn't lie.
+        return p.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _job_snapshot(name: str) -> dict | None:
+    """Compact job status for the /api/servers card, or None if no job
+    is known for this server. Latest job replaces the previous one; if
+    the last known job is done and stale we still surface a summary so
+    the UI can flash "install failed" briefly."""
+    j = jobs.registry.get(name)
+    if not j:
+        return None
+    return {
+        "kind": j.kind,
+        "done": j.done,
+        "ok": j.ok,
+        "phase": j.progress.phase or ("" if j.done else "starting…"),
+        "percent": round(j.progress.percent, 1),
+        "error": j.error,
+        "elapsed_sec": int((j.finished_at or _time.time()) - j.started_at),
+    }
+
+
 @app.get("/api/servers", dependencies=[Depends(require_token)])
 def api_list_servers() -> list[dict]:
     out = []
@@ -285,9 +323,11 @@ def api_list_servers() -> list[dict]:
                 "pid": st.pid, "mem_bytes": st.mem_bytes,
                 "uptime_sec": st.uptime_sec,
                 "console_available": control.console_available(sd),
+                "installed": _installed_state(sd),
             },
             "watchdog": wd_snap.get(sd.name),
             "wake": wake_snap.get(sd.name),
+            "job": _job_snapshot(sd.name),
         })
     return out
 
@@ -303,9 +343,11 @@ def api_get_server(name: str) -> dict:
             "pid": st.pid, "mem_bytes": st.mem_bytes,
             "uptime_sec": st.uptime_sec,
             "console_available": control.console_available(sd),
+            "installed": _installed_state(sd),
         },
         "watchdog": watchdog.watchdog.snapshot().get(name),
         "wake": wake_proxy.wake_proxy.snapshot().get(name),
+        "job": _job_snapshot(name),
         "backups": uploads.list_backups(sd, settings.backup_root),
     }
 
@@ -330,6 +372,45 @@ def api_upsert_server(sd: registry.ServerDef) -> dict:
 def api_firewall_snapshot() -> dict:
     """Diagnostics for the firewall UI: which auto-managed rules are live."""
     return firewall.snapshot()
+
+
+# ---------- steam profiles (address book of steamID64 → display name) ----------
+
+class SteamProfileBody(BaseModel):
+    steamid: str
+    name: str = ""
+
+
+@app.get("/api/steam-profiles", dependencies=[Depends(require_token)])
+def api_steam_profiles() -> dict:
+    """Return the full manager-wide address book."""
+    return {"profiles": steam_profiles.load_all()}
+
+
+@app.post("/api/steam-profiles", dependencies=[Depends(require_token)])
+def api_steam_profile_upsert(body: SteamProfileBody) -> dict:
+    try:
+        profiles = steam_profiles.upsert(body.steamid, body.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "profiles": profiles}
+
+
+@app.delete("/api/steam-profiles/{steamid}", dependencies=[Depends(require_token)])
+def api_steam_profile_delete(steamid: str) -> dict:
+    return {"ok": True, "profiles": steam_profiles.delete(steamid)}
+
+
+@app.get("/api/steam-profiles/lookup", dependencies=[Depends(require_token)])
+def api_steam_profile_lookup(steamid: str) -> dict:
+    """Fetch a Steam display name via the public community XML endpoint.
+
+    Best-effort: returns ``name = null`` when the profile is private, the
+    ID is malformed, or the network is unreachable. The frontend uses
+    this to pre-fill the name field when adding a new SteamID.
+    """
+    name = steam_profiles.lookup_public_name(steamid)
+    return {"steamid": steamid, "name": name}
 
 
 @app.delete("/api/servers/{name}", dependencies=[Depends(require_token)])

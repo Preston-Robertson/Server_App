@@ -544,9 +544,23 @@ class SteamCmdHandler(TypeHandler):
         self.ensure_dirs()
         msgs: list[str] = []
 
+        # Locate steamcmd. Debian's package installs the binary at
+        # /usr/games/steamcmd, which isn't on the default systemd PATH,
+        # so shutil.which("steamcmd") returns None until the operator
+        # symlinks it or edits PATH. Fall back to the known Debian path
+        # so an unmodified apt-install "just works".
         steamcmd = shutil.which("steamcmd")
         if not steamcmd:
-            raise RuntimeError("steamcmd not installed — run: sudo apt install steamcmd (or see docs)")
+            for candidate in ("/usr/games/steamcmd", "/usr/local/bin/steamcmd", "/usr/bin/steamcmd"):
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    steamcmd = candidate
+                    break
+        if not steamcmd:
+            raise RuntimeError(
+                "steamcmd not installed — run: sudo apt install steamcmd "
+                "(and if `which steamcmd` still shows nothing after install, "
+                "symlink it: sudo ln -sf /usr/games/steamcmd /usr/local/bin/steamcmd)"
+            )
 
         # Look up the recipe up front so we know whether this is a Wine game
         # (which controls the steamcmd platform switch below).

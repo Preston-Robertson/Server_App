@@ -24,6 +24,7 @@ class Settings:
     install_root: Path        # /srv/gameservers/<name>
     worlds_root: Path         # bind mount → TrueNAS
     backup_root: Path
+    state_dir: Path           # manager-owned persistent state (steam profiles, etc.)
     unit_template: str        # "gamesrv@" -> gamesrv@<name>.service
     github_token: str
 
@@ -38,6 +39,7 @@ def load() -> Settings:
         install_root=Path(_env("GAMESRV_INSTALL_ROOT", "/srv/gameservers")),
         worlds_root=Path(_env("GAMESRV_WORLDS_ROOT", "/opt/gamesrv/worlds")),
         backup_root=Path(_env("GAMESRV_BACKUP_ROOT", "/opt/gamesrv/worlds/_backups")),
+        state_dir=Path(_env("GAMESRV_STATE_DIR", "/opt/gamesrv/state")),
         unit_template=_env("GAMESRV_UNIT_TEMPLATE", "gamesrv@"),
         github_token=_env("GAMESRV_GITHUB_TOKEN", ""),
     )

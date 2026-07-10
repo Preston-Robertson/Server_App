@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 venv/
 env/
+docs/
 
 # Env / secrets — NEVER commit
 .env

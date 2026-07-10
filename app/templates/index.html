@@ -113,7 +113,7 @@
         <div class="widget-body">
           <div class="subtabs">
             <button class="subtab" data-tab="control">Control</button>
-            <button class="subtab" data-tab="console">Console</button>
+            <button class="subtab" data-tab="admin">Admin</button>
             <button class="subtab" data-tab="logs">Logs</button>
             <button class="subtab" data-tab="files">Files</button>
             <button class="subtab" data-tab="git">Git</button>
@@ -155,11 +155,6 @@
               <button class="btn btn-ghost"   data-action="enable">Enable on Boot</button>
               <button class="btn btn-ghost"   data-action="disable">Disable on Boot</button>
             </div>
-            <hr />
-            <div class="row">
-              <button class="btn btn-primary" data-action="install">Install / Reprovision</button>
-              <button class="btn"             data-action="update-type">Update Game Software</button>
-            </div>
 
             <hr />
             <h3 style="margin: 6px 0;">Idle shutdown &amp; wake-on-demand</h3>
@@ -186,22 +181,19 @@
                 <button class="btn btn-tiny btn-primary" id="iw-save-wake">Save</button>
                 <span id="iw-wake-status" class="small muted"></span>
               </div>
-              <div class="iw-row iw-row-block" id="iw-wl-row" hidden>
-                <label style="flex:1; margin:0;">
-                  <span><strong>Wake whitelist</strong> <em>(Minecraft usernames, one per line — empty = anyone can wake)</em></span>
-                  <textarea id="iw-wl-names" rows="3" placeholder="Steve&#10;Alex" style="width:100%; margin-top:4px;"></textarea>
-                </label>
-                <div style="display:flex; gap:6px; align-items:center; margin-top:4px;">
-                  <button class="btn btn-tiny btn-primary" id="iw-save-wl">Save</button>
-                  <span id="iw-wl-status" class="small muted"></span>
-                </div>
-              </div>
               <div class="iw-row" id="iw-stop-row" hidden>
                 <span><strong>Stop wait</strong> <em>(seconds stop.sh holds for a clean save)</em></span>
                 <input type="number" id="iw-stop-sec" min="10" max="285" step="5" placeholder="240" />
                 <span class="muted">sec</span>
                 <button class="btn btn-tiny btn-primary" id="iw-save-stop">Save</button>
                 <span id="iw-stop-status" class="small muted"></span>
+              </div>
+              <div class="iw-row">
+                <span><strong>Memory cap</strong> <em>(Xmx for JVM, informational for Steam)</em></span>
+                <input type="number" id="iw-mem-mb" min="512" step="256" placeholder="4096" />
+                <span class="muted">MB</span>
+                <button class="btn btn-tiny btn-primary" id="iw-save-mem">Save</button>
+                <span id="iw-mem-status" class="small muted"></span>
               </div>
               <p class="small muted" id="iw-reinstall-hint" hidden>
                 <strong>Reinstall required</strong> — toggling wake-on-demand remaps the game to
@@ -211,6 +203,11 @@
               <p class="small muted" id="iw-stop-hint" hidden>
                 <strong>Reinstall required</strong> — click <strong>Install / Reprovision</strong>
                 above so the new wait duration gets baked into <code>stop.sh</code>.
+              </p>
+              <p class="small muted" id="iw-mem-hint" hidden>
+                <strong>Reinstall + restart required</strong> — the JVM Xmx and generated
+                <code>start.sh</code> pick up the new value only after
+                <strong>Install / Reprovision</strong> plus a Restart.
               </p>
             </div>
 
@@ -249,6 +246,28 @@
             </div>
 
             <hr />
+            <h3 style="margin: 6px 0;">Console <span id="console-source" class="small muted">source: —</span></h3>
+            <p class="muted small" style="margin-top:4px;">
+              Live game output (Minecraft's <code>logs/latest.log</code> when available, else the systemd journal).
+              Send a command below — routed via the tmux session
+              (Minecraft: <code>say hi</code>, <code>whitelist add Steve</code>, <code>op Steve</code>).
+            </p>
+            <div class="row">
+              <button class="btn btn-tiny" id="console-refresh">Refresh output</button>
+              <label class="row" style="margin:0;">
+                <input type="checkbox" id="console-follow" checked />
+                <span>follow (auto-refresh)</span>
+              </label>
+              <label>Lines: <input id="console-lines" type="number" value="120" min="10" max="1000" style="width:80px" /></label>
+            </div>
+            <pre id="console-log-out" class="log-view"></pre>
+            <div class="row">
+              <input id="console-cmd" placeholder="e.g. say hello  |  whitelist add Steve" style="flex:1" />
+              <button class="btn btn-primary" id="console-send">Send</button>
+            </div>
+            <pre id="console-out"></pre>
+
+            <hr />
             <h3 style="margin: 6px 0;">Performance</h3>
             <div id="perf-grid" class="perf-grid">
               <div class="perf-stat">
@@ -275,27 +294,75 @@
             <pre id="control-out"></pre>
           </div>
 
-          <div class="subtab-body" data-body="console" hidden>
-            <p class="muted">
-              Sends one command to the running server via its tmux session
-              (Minecraft: <code>say hi</code>, <code>whitelist add Steve</code>,
-              <code>op Steve</code>). Recent server output is shown above.
+          <div class="subtab-body" data-body="admin" hidden>
+            <p class="muted small">
+              Manager-owned lifecycle actions live here: (re)running the type handler's
+              install / update job, and curating the player allow-lists. Every action below
+              writes files or config that only take effect after the next start.
             </p>
+
+            <hr />
+            <h3 style="margin: 6px 0;">Install &amp; update</h3>
             <div class="row">
-              <button class="btn btn-tiny" id="console-refresh">Refresh output</button>
-              <label class="row" style="margin:0;">
-                <input type="checkbox" id="console-follow" checked />
-                <span>follow (auto-refresh)</span>
-              </label>
-              <label>Lines: <input id="console-lines" type="number" value="120" min="10" max="1000" style="width:80px" /></label>
-              <span id="console-source" class="small muted" style="margin-left:auto;">source: —</span>
+              <button class="btn btn-primary" data-action="install">Install / Reprovision</button>
+              <button class="btn"             data-action="update-type">Update Game Software</button>
             </div>
-            <pre id="console-log-out" class="log-view"></pre>
-            <div class="row">
-              <input id="console-cmd" placeholder="e.g. say hello  |  whitelist add Steve" style="flex:1" />
-              <button class="btn btn-primary" id="console-send">Send</button>
+            <p class="small muted" style="margin-top:4px;">
+              <strong>Install</strong> re-runs the type handler (SteamCMD download, script
+              regeneration, etc.). <strong>Update Game Software</strong> re-runs the game's own
+              update path (SteamCMD <code>app_update</code> for Steam games; verifies the jar for
+              Minecraft). Progress shows in the shared bar above.
+            </p>
+
+            <hr />
+            <h3 style="margin: 6px 0;">Wake whitelist <span class="small muted">— Minecraft only</span></h3>
+            <div class="iw-panel" id="admin-wl-panel">
+              <p class="small muted" id="admin-wl-inactive-hint" hidden>
+                Wake-on-demand isn't enabled for this server, so the whitelist has no effect.
+                Turn it on from the Control tab first.
+              </p>
+              <div class="iw-row iw-row-block" id="admin-wl-row">
+                <label style="flex:1; margin:0;">
+                  <span><strong>Allowed Minecraft usernames</strong> <em>(one per line — empty = anyone can wake)</em></span>
+                  <textarea id="iw-wl-names" rows="4" placeholder="Steve&#10;Alex" style="width:100%; margin-top:4px;"></textarea>
+                </label>
+                <div style="display:flex; gap:6px; align-items:center; margin-top:4px;">
+                  <button class="btn btn-tiny btn-primary" id="iw-save-wl">Save</button>
+                  <span id="iw-wl-status" class="small muted"></span>
+                </div>
+              </div>
             </div>
-            <pre id="console-out"></pre>
+
+            <hr />
+            <h3 style="margin: 6px 0;">Steam ID allowlist <span id="sid-note" class="small muted"></span></h3>
+            <div class="iw-panel" id="sid-panel">
+              <p class="small muted" id="sid-inactive-hint" hidden>
+                This server's <code>access.mode</code> isn't <code>steamid_allowlist</code>, so
+                nothing is enforced today. You can still curate the list here — flip access to
+                Steam-ID allowlist on the Definition tab whenever you want it enforced.
+              </p>
+              <table class="sid-table">
+                <thead>
+                  <tr><th>Name</th><th>SteamID64</th><th></th></tr>
+                </thead>
+                <tbody id="sid-list-body">
+                  <tr><td colspan="3" class="muted">loading…</td></tr>
+                </tbody>
+              </table>
+              <div class="iw-row" style="align-items:flex-end;">
+                <label style="flex: 0 0 180px;">
+                  <span>Display name</span>
+                  <input id="sid-add-name" type="text" placeholder="e.g. Preston" style="width:100%;" />
+                </label>
+                <label style="flex: 1;">
+                  <span>SteamID64 <em>(17 digits, starts with 7656)</em></span>
+                  <input id="sid-add-id" type="text" placeholder="76561198000000000" style="width:100%;" />
+                </label>
+                <button class="btn btn-tiny" id="sid-lookup" title="Fetch the display name from Steam's public profile XML">Fetch name</button>
+                <button class="btn btn-tiny btn-primary" id="sid-add">Add</button>
+              </div>
+              <p class="small muted" id="sid-status"></p>
+            </div>
           </div>
 
           <div class="subtab-body" data-body="logs" hidden>
