@@ -176,6 +176,19 @@ _APP_RECIPES: dict[int, dict] = {
             "SteamGameServer": "1",
             "SDL_VIDEODRIVER": "dummy",
             "SDL_AUDIODRIVER": "dummy",
+            # Disable Sentry Native crash reporter. Palworld bundles
+            # sentry-native (visible in /proc/PID/fd as Pal/.sentry-native/
+            # *.run.lock). Sentry Native init runs early in Palworld's
+            # boot and interacts with the Steamworks IPC event loop on
+            # the same thread. When SteamAPI_Init() blocks waiting for a
+            # Steam Client that isn't there, Sentry's crash-report path
+            # can compound the deadlock — Palworld posts to Sentry when
+            # a crash occurs, but the crash IS the SteamAPI deadlock, so
+            # the Sentry HTTPS upload blocks further progress. Clearing
+            # SENTRY_DSN tells sentry-native to skip network initialisation
+            # entirely; it becomes a no-op. Palworld itself is unaffected.
+            "SENTRY_DSN": "",
+            "SENTRY_ENABLE_BACKEND": "0",
         },
     },
     1690800: {  # Satisfactory dedicated

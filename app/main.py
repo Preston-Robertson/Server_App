@@ -909,6 +909,13 @@ def api_diagnose_stuck(name: str) -> dict:
 
     fds_dir = proc / "fd"
     fds: list[str] = []
+    # Build inode → socket-details map ONCE so we can annotate every
+    # socket:[N] fd with local/remote address and state. Without this,
+    # a `socket:[33474542]` line is opaque; with this, it becomes
+    # `socket:[33474542] TCP 0.0.0.0:8211 <- 0.0.0.0:* LISTEN` — enough
+    # to identify game ports, Steam outbound connections, IPC sockets,
+    # etc. at a glance.
+    socket_info = _read_socket_details()
     try:
         entries = sorted(fds_dir.iterdir(),
                          key=lambda p: int(p.name) if p.name.isdigit() else 999)
@@ -917,7 +924,17 @@ def api_diagnose_stuck(name: str) -> dict:
                 target = str(fd.readlink()) if fd.is_symlink() else "(not a link)"
             except OSError:
                 target = "(unreadable)"
-            fds.append(f"{fd.name} -> {target}")
+            # If it's a socket, look up the inode → endpoint details.
+            annotated = target
+            if target.startswith("socket:["):
+                try:
+                    inode = int(target[len("socket:["):-1])
+                    details = socket_info.get(inode)
+                    if details:
+                        annotated = f"{target}  {details}"
+                except ValueError:
+                    pass
+            fds.append(f"{fd.name} -> {annotated}")
     except OSError as e:
         fds.append(f"(cannot list fds: {e})")
     result["open_fds"] = fds
@@ -1037,6 +1054,105 @@ def _find_game_pid_under_unit(unit_prefix: str) -> Optional[int]:
                 continue
 
     return best_pid
+
+
+# TCP state codes from /proc/net/tcp (Linux kernel — see net/tcp_states.h)
+_TCP_STATES = {
+    "01": "ESTAB",  "02": "SYN_SENT",  "03": "SYN_RECV",  "04": "FIN_WAIT1",
+    "05": "FIN_WAIT2", "06": "TIME_WAIT", "07": "CLOSE",  "08": "CLOSE_WAIT",
+    "09": "LAST_ACK", "0A": "LISTEN",   "0B": "CLOSING",
+}
+
+
+def _read_socket_details() -> dict[int, str]:
+    """Map socket inode → human-readable endpoint info.
+
+    Reads /proc/net/{tcp,tcp6,udp,udp6,unix} and returns a dict keyed by
+    inode. Values look like:
+      "TCP  10.0.0.204:8211 -> 0.0.0.0:0 LISTEN"
+      "UDP  0.0.0.0:27015 -> 0.0.0.0:0"
+      "UNIX /tmp/.X11-unix/X0"
+    The diagnose endpoint uses this to annotate every ``socket:[N]``
+    entry in the game's open fd list so we can see what each socket is
+    actually connected to instead of just an opaque inode number.
+    """
+    out: dict[int, str] = {}
+
+    def _decode_hex_ipport_v4(s: str) -> str:
+        # /proc/net/tcp format: HEX_IP_REVERSED:HEX_PORT
+        # e.g. "0100007F:1F90" = 127.0.0.1:8080
+        try:
+            ip_hex, port_hex = s.split(":")
+            b = bytes.fromhex(ip_hex)
+            ip = f"{b[3]}.{b[2]}.{b[1]}.{b[0]}"
+            port = int(port_hex, 16)
+            return f"{ip}:{port}"
+        except (ValueError, IndexError):
+            return s
+
+    def _decode_hex_ipport_v6(s: str) -> str:
+        try:
+            ip_hex, port_hex = s.split(":")
+            # IPv6 addresses in /proc are 32 hex chars in host byte order groups of 4
+            b = bytes.fromhex(ip_hex)
+            groups = []
+            for i in range(0, 16, 2):
+                # Each 4-byte group is little-endian in /proc/net/tcp6
+                groups.append(f"{b[i+1]:02x}{b[i]:02x}")
+            ip = ":".join(groups)
+            port = int(port_hex, 16)
+            return f"[{ip}]:{port}"
+        except (ValueError, IndexError):
+            return s
+
+    def _read_ip_file(path: str, proto: str, decoder) -> None:
+        try:
+            with open(path, encoding="ascii") as f:
+                lines = f.readlines()
+        except OSError:
+            return
+        for line in lines[1:]:  # skip header
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+            local, remote, state, inode = parts[1], parts[2], parts[3], parts[9]
+            try:
+                ino = int(inode)
+            except ValueError:
+                continue
+            if ino == 0:
+                continue
+            state_str = _TCP_STATES.get(state, state) if proto == "TCP" else ""
+            entry = f"{proto:3s} {decoder(local)} -> {decoder(remote)}"
+            if state_str:
+                entry += f" {state_str}"
+            out[ino] = entry
+
+    _read_ip_file("/proc/net/tcp",  "TCP", _decode_hex_ipport_v4)
+    _read_ip_file("/proc/net/tcp6", "TCP", _decode_hex_ipport_v6)
+    _read_ip_file("/proc/net/udp",  "UDP", _decode_hex_ipport_v4)
+    _read_ip_file("/proc/net/udp6", "UDP", _decode_hex_ipport_v6)
+
+    # UNIX sockets — path column varies but usually last
+    try:
+        with open("/proc/net/unix", encoding="ascii") as f:
+            for line in f.readlines()[1:]:
+                parts = line.split()
+                if len(parts) < 7:
+                    continue
+                # inode is column 6 (0-indexed)
+                try:
+                    ino = int(parts[6])
+                except ValueError:
+                    continue
+                if ino == 0:
+                    continue
+                path = parts[7] if len(parts) > 7 else "(anon)"
+                out[ino] = f"UNIX {path}"
+    except OSError:
+        pass
+
+    return out
 
 
 @app.get("/api/servers/{name}/logs", response_class=PlainTextResponse, dependencies=[Depends(require_token)])
