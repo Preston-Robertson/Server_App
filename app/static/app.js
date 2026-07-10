@@ -1185,9 +1185,19 @@ async function _saveDefPatch(name, patch, statusEl) {
   try {
     const r = await api(`/api/servers/${name}`);
     const sd = Object.assign({}, r.def, patch);
-    await api("/api/servers", { method: "POST", body: JSON.stringify(sd) });
-    statusEl.textContent = "✓ saved";
-    setTimeout(() => { if (statusEl.textContent === "✓ saved") statusEl.textContent = ""; }, 2500);
+    const resp = await api("/api/servers", { method: "POST", body: JSON.stringify(sd) });
+    // Surface auto-restart feedback so the operator knows the running
+    // game was cycled to pick up changes to port/wake_on_demand/etc.
+    if (resp && resp.auto_restart && resp.auto_restart.attempted) {
+      statusEl.textContent = resp.auto_restart.ok
+        ? "✓ saved + restarted"
+        : "✓ saved (restart FAILED — see server logs)";
+    } else {
+      statusEl.textContent = "✓ saved";
+    }
+    setTimeout(() => {
+      if (statusEl.textContent.startsWith("✓")) statusEl.textContent = "";
+    }, 3500);
     refreshServers();
     return sd;
   } catch (e) {

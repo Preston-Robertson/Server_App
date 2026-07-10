@@ -356,17 +356,81 @@ def api_get_server(name: str) -> dict:
 
 @app.post("/api/servers", dependencies=[Depends(require_token)])
 def api_upsert_server(sd: registry.ServerDef) -> dict:
+    # Diff against the on-disk def BEFORE saving so we can detect whether
+    # any launch-affecting field changed. If it did AND the server is
+    # currently running, we auto-restart it — otherwise the operator ends
+    # up with a running game that no longer matches its own yaml (the
+    # classic "I toggled wake_on_demand and now nothing works because
+    # start.sh is stale AND the wake-proxy is fighting the game for the
+    # port" trap). This is aggressive on purpose: silently letting the
+    # runtime drift from the config is the #1 source of debugging pain.
+    prev: Optional[registry.ServerDef] = None
+    try:
+        prev = registry.load_def(sd.name)
+    except FileNotFoundError:
+        prev = None
+    except Exception:
+        prev = None
+
     registry.save_def(sd)
+
+    # Always regenerate launch scripts so start.sh reflects the new yaml.
+    # Non-fatal — a broken configure() shouldn't block a def save.
+    try:
+        handler_for(sd).configure()
+    except Exception:
+        pass
+
     # Reconcile firewall rules for this server. Non-fatal: even if UFW
     # isn't available (dev host, missing sudoers) the def still saves.
     try:
         fw_result = firewall.reconcile_server(sd)
     except Exception as e:
         fw_result = {"ok": False, "detail": f"exception: {e}"}
+
+    # Fields that require the game process to be restarted for the change
+    # to take effect (start.sh port, wake_on_demand toggle, memory cap,
+    # per-game access/password launch flags, etc). Cosmetic fields
+    # (auto_start_on_boot, backup, git_*) are excluded — they don't
+    # affect the running process.
+    _LAUNCH_AFFECTING = (
+        "type", "port", "memory_mb", "java_args", "start_cmd", "stop_cmd",
+        "steam_app_id", "steam_beta", "extra_env", "stop_timeout_sec",
+        "wake_on_demand", "wake_timeout_sec", "wake_whitelist",
+        "mc_version", "forge_version",
+    )
+    changed_fields: list[str] = []
+    if prev is not None:
+        for f in _LAUNCH_AFFECTING:
+            if getattr(prev, f, None) != getattr(sd, f, None):
+                changed_fields.append(f)
+        # Nested pydantic models — compare via model_dump for structural equality.
+        for f in ("access", "passwords", "rcon"):
+            if getattr(prev, f, None).model_dump() != getattr(sd, f, None).model_dump():
+                changed_fields.append(f)
+
+    auto_restart: dict = {"attempted": False, "ok": False, "detail": ""}
+    if changed_fields:
+        try:
+            st = control.status(sd)
+            if st.active == "active":
+                auto_restart["attempted"] = True
+                r = control.restart(sd)
+                auto_restart["ok"] = r.returncode == 0
+                auto_restart["detail"] = (
+                    f"restarted to apply changes to {', '.join(changed_fields)}"
+                    if r.returncode == 0
+                    else f"restart failed (rc={r.returncode}): {(r.stderr or r.stdout or '').strip()[:400]}"
+                )
+        except Exception as e:
+            auto_restart["detail"] = f"restart skipped: {e}"
+
     return {
         "ok": True,
         "path": str((settings.defs_dir / f'{sd.name}.yml')),
         "firewall": fw_result,
+        "changed_launch_fields": changed_fields,
+        "auto_restart": auto_restart,
     }
 
 
