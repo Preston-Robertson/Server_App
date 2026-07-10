@@ -145,15 +145,38 @@ _APP_RECIPES: dict[int, dict] = {
         # viewed via the Files tab even if console.log gets truncated.
         "run": "./PalServer.sh -port={port} -useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS -log",
         "saves_rel": "Pal/Saved",
-        # Pin HOME to install_dir so Palworld's Steam Runtime state
+        # HOME pinned to install_dir so Palworld's Steam Runtime state
         # (~/.steam/{sdk32,sdk64,registry.vdf}, ~/Steam/logs/) lands
         # somewhere gamesrv definitely owns and survives reinstalls
-        # cleanly. Without this, HOME defaults to gamesrv's shell home
-        # (/home/gamesrv per /etc/passwd) which is not always writable
-        # on tmpfs'd LXCs and pollutes /home across servers. The
-        # post-install hook _apply_palworld_steam_runtime populates the
-        # required Steamworks SDK shim files under this pinned HOME.
-        "env": {"HOME": "{install_dir}"},
+        # cleanly. The post-install hook _apply_palworld_steam_runtime
+        # populates the required Steamworks SDK shim files under this
+        # pinned HOME.
+        #
+        # The remaining env vars address a known headless-server hang:
+        # Palworld's build calls SteamAPI_Init() (the client-side init)
+        # AS WELL AS SteamGameServer_Init() (server-side). The former
+        # tries to talk to a running Steam Client via
+        # /dev/shm/u999-ValveIPCSharedObj-Steam and blocks its
+        # IPC:CSteamEngin thread in do_epoll_wait forever when no client
+        # is present. Main thread sits in hrtimer_nanosleep polling for
+        # SteamAPI_Init to finish, world load never starts, card shows
+        # "starting" indefinitely with RAM stuck ~1 GB. Confirmed via
+        # /proc/PID/wchan diagnostics.
+        #
+        # * SteamAppId — tells the SDK the target app up front, skipping
+        #   the "which app am I" discovery step that pokes Steam Client.
+        # * SteamGameServer=1 — hints server-mode init path; some
+        #   Steamworks builds honor this to skip Steam Client rendezvous.
+        # * SDL_VIDEODRIVER / SDL_AUDIODRIVER=dummy — belt-and-suspenders
+        #   for Unreal Engine, which can otherwise try to init graphics/
+        #   audio libs headlessly and hang if they're not present.
+        "env": {
+            "HOME": "{install_dir}",
+            "SteamAppId": "2394010",
+            "SteamGameServer": "1",
+            "SDL_VIDEODRIVER": "dummy",
+            "SDL_AUDIODRIVER": "dummy",
+        },
     },
     1690800: {  # Satisfactory dedicated
         # Post-1.0 quirks (learned the hard way — see
