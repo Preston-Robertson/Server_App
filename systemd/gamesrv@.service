@@ -52,7 +52,25 @@ KillMode=mixed
 
 # Hardening
 NoNewPrivileges=true
-PrivateTmp=true
+# PrivateTmp intentionally NOT set. Steam Runtime (used by any SteamCMD
+# game that links against libsteam_api.so — Palworld, Satisfactory, ARK,
+# Valheim, Enshrouded) writes crash dumps, IPC pipes, and Steam runtime
+# state into /tmp/dumps/ and /tmp/steam_pipe_*, and its SteamAPI_Init()
+# expects those paths to be shared with other Steam processes on the
+# same host. With PrivateTmp=true, systemd gives the unit a private /tmp
+# namespace which silently breaks Steam networking init:
+#   [S_API FAIL] Tried to access Steam interface SteamUser021 before SteamAPI_Init succeeded.
+#   [S_API FAIL] Tried to access Steam interface SteamFriends017 ...
+#   [S_API FAIL] Tried to access Steam interface STEAMAPPS_INTERFACE_VERSION008 ...
+#   [S_API FAIL] Tried to access Steam interface SteamNetworkingUtils004 ...
+# The game still binds its game port and prints "Running <game> on :PORT",
+# but its Steam GameNetworkingSockets layer never comes up — so incoming
+# client connections are silently dropped at the game layer and A2S
+# queries queue on 27015 with a growing Recv-Q because Steam's built-in
+# A2S handler isn't running. Result: dashboard stays "◐ starting" forever
+# and clients see "Connection timed out". Removing PrivateTmp costs
+# nothing (games don't leak sensitive data via /tmp) and unblocks every
+# SteamCMD game on this template.
 
 [Install]
 WantedBy=multi-user.target
