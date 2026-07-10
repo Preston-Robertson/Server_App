@@ -1808,9 +1808,17 @@ async function listFiles() {
           <td>-</td><td>${fmtTime(r.mtime)}</td>
           <td><button class="btn btn-tiny btn-danger" data-del="${escape(full)}">delete</button></td>`;
       } else {
+        // Show the Edit button only for files that look like text and
+        // aren't huge. This is a purely UX gate — the server still refuses
+        // anything absurd.
+        const editable = _isEditableText(r.name, r.size);
+        const editBtn = editable
+          ? `<button class="btn btn-tiny" data-edit="${escape(full)}">edit</button>`
+          : "";
         tr.innerHTML = `<td>${escape(r.name)}</td><td>${fmtBytes(r.size)}</td>
           <td>${fmtTime(r.mtime)}</td>
           <td>
+            ${editBtn}
             <button class="btn btn-tiny" data-dl="${escape(full)}">download</button>
             <button class="btn btn-tiny btn-danger" data-del="${escape(full)}">delete</button>
           </td>`;
@@ -1821,6 +1829,85 @@ async function listFiles() {
 }
 $("#files-list-btn").onclick = listFiles;
 $("#files-area").onchange = () => { $("#files-path").value = ""; listFiles(); };
+
+// ---------- File editor ----------
+//
+// Cheap Files-tab editor for the small config files (Game.ini, server.env,
+// server.properties, whitelist.json, etc.) an operator constantly needs to
+// tweak. Anything that looks like text and is under ~512 KB gets an Edit
+// button; the modal fetches with the existing /files/download endpoint and
+// saves with /files (overwrite=true).
+
+const _EDITABLE_EXT_RE =
+  /\.(txt|ini|cfg|conf|env|json|jsonc|yml|yaml|toml|properties|xml|md|log|sh|py|lua|rb|js|css|html|htm|service|list)$/i;
+const _EDITABLE_MAX_BYTES = 512 * 1024;
+
+function _isEditableText(name, size) {
+  if (size != null && size > _EDITABLE_MAX_BYTES) return false;
+  if (_EDITABLE_EXT_RE.test(name)) return true;
+  // Also allow the common no-extension file the manager writes.
+  if (/^server\.env$/i.test(name)) return true;
+  return false;
+}
+
+const EDITOR_STATE = { area: null, path: null };
+
+async function openFileEditor(fullPath) {
+  const area = $("#files-area").value;
+  EDITOR_STATE.area = area;
+  EDITOR_STATE.path = fullPath;
+  $("#editor-title").textContent = `${area} / ${fullPath}`;
+  $("#editor-status").textContent = "loading…";
+  $("#editor-textarea").value = "";
+  $("#editor-modal").hidden = false;
+  try {
+    const url = `/api/servers/${CURRENT}/files/download`
+      + `?area=${encodeURIComponent(area)}&path=${encodeURIComponent(fullPath)}`;
+    const resp = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const txt = await resp.text();
+    $("#editor-textarea").value = txt;
+    $("#editor-status").textContent = `${txt.length.toLocaleString()} chars`;
+  } catch (e) {
+    $("#editor-status").textContent = "ERROR: " + e.message;
+  }
+}
+
+async function saveFileEditor() {
+  if (!EDITOR_STATE.path) return;
+  const statusEl = $("#editor-status");
+  statusEl.textContent = "saving…";
+  try {
+    const txt = $("#editor-textarea").value;
+    // Build a synthetic File so the server-side upload path is unchanged.
+    // Type is text/plain — extension-driven decisions live on the client.
+    const filename = EDITOR_STATE.path.split("/").pop();
+    const blob = new File([txt], filename, { type: "text/plain" });
+    const fd = new FormData();
+    fd.append("file", blob);
+    fd.append("area", EDITOR_STATE.area);
+    fd.append("path", EDITOR_STATE.path);
+    fd.append("overwrite", "true");
+    const r = await api(`/api/servers/${CURRENT}/files`, { method: "POST", body: fd });
+    statusEl.textContent = `✓ saved (${r.bytes} bytes at ${r.saved || EDITOR_STATE.path})`;
+    setTimeout(() => { $("#editor-modal").hidden = true; listFiles(); }, 900);
+  } catch (e) {
+    statusEl.textContent = "ERROR: " + e.message;
+  }
+}
+
+$("#editor-save")?.addEventListener("click", saveFileEditor);
+$("#editor-cancel")?.addEventListener("click", () => { $("#editor-modal").hidden = true; });
+// Ctrl+S saves; Escape closes.
+document.addEventListener("keydown", (ev) => {
+  if ($("#editor-modal")?.hidden) return;
+  if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") {
+    ev.preventDefault();
+    saveFileEditor();
+  } else if (ev.key === "Escape") {
+    $("#editor-modal").hidden = true;
+  }
+});
 
 document.addEventListener("click", async (ev) => {
   const t = ev.target;
@@ -1833,6 +1920,8 @@ document.addEventListener("click", async (ev) => {
     const cur = $("#files-path").value.replace(/\/$/, "");
     $("#files-path").value = cur.includes("/") ? cur.slice(0, cur.lastIndexOf("/")) : "";
     listFiles();
+  } else if (t.dataset.edit && CURRENT) {
+    openFileEditor(t.dataset.edit);
   } else if (t.dataset.del && CURRENT) {
     if (!confirm(`Delete ${t.dataset.del}?`)) return;
     try {
@@ -1991,8 +2080,13 @@ async function uploadCollected(items) {
   for (const it of items) {
     const rowId = addProgressRow(it.relPath);
     try {
-      await uploadSingle(it.file, it.relPath, { rowId });
-      setRowResult(rowId, "ok", "uploaded");
+      const resp = await uploadSingle(it.file, it.relPath, { rowId });
+      // Show the resolved absolute path so the operator can see exactly
+      // where the file landed on the LXC. Previous behavior said "uploaded"
+      // with no destination, so files uploaded to the wrong area/subdir
+      // looked successful but the game never saw them.
+      const saved = (resp && resp.saved) ? resp.saved : "uploaded";
+      setRowResult(rowId, "ok", saved);
       ok++;
     } catch (e) {
       setRowResult(rowId, "err", e.message);
@@ -2421,6 +2515,42 @@ function renderInitFileList() {
   });
   summary.hidden = false;
   summary.textContent = `${initFiles.length} file(s) queued · ${fmtBytes(totalBytes)} total`;
+
+  // Smart routing: if the operator queued a .sav file and hasn't hand-set
+  // the destination, auto-target the game's real save directory. This is
+  // the single most common footgun — save files uploaded to install_dir
+  // are lost as far as the game is concerned (Satisfactory reads from
+  // ".config/Epic/FactoryGame/Saved/SaveGames/server", which the manager
+  // symlinks to world_dir). Setting Area=world + Save under=SaveGames/server
+  // is the right target for the games we know about today.
+  const hasSav = initFiles.some((it) => /\.sav$/i.test(it.relPath));
+  const areaEl = $("#init-upload-area");
+  const pathEl = $("#init-upload-path");
+  const hintEl = $("#init-file-hint");
+  if (hasSav && areaEl && pathEl) {
+    // Only auto-set if the operator hasn't customised them. We record the
+    // most-recent auto value in a data attribute so a subsequent auto-set
+    // doesn't clobber an intentional hand edit.
+    const priorAutoArea = areaEl.dataset.autoSet || "";
+    const priorAutoPath = pathEl.dataset.autoSet || "";
+    if (areaEl.value === "" || areaEl.value === "install" || areaEl.value === priorAutoArea) {
+      areaEl.value = "world";
+      areaEl.dataset.autoSet = "world";
+    }
+    if (pathEl.value === "" || pathEl.value === priorAutoPath) {
+      pathEl.value = "SaveGames/server";
+      pathEl.dataset.autoSet = "SaveGames/server";
+    }
+    if (hintEl) {
+      hintEl.hidden = false;
+      hintEl.innerHTML =
+        `<strong>Auto-routing:</strong> Detected a <code>.sav</code> — set Area to `
+        + `<code>world_dir</code> and Save under to <code>SaveGames/server</code>. `
+        + `Override the fields above if this isn't right for your game.`;
+    }
+  } else if (hintEl) {
+    hintEl.hidden = true;
+  }
 }
 
 // One delegated handler for both "×" clicks in the list.
@@ -2652,8 +2782,13 @@ $("#new-server-form").addEventListener("submit", async (ev) => {
         });
         if (li) {
           li.className = "ok";
+          // Show the resolved server path so the operator immediately
+          // sees WHERE the file landed. For an archive extract we don't
+          // get a single path back, so keep the files-written summary.
           li.querySelector(".init-status").textContent =
-            it.kind === "archive" ? `${r.files_written || 0} files` : "ok";
+            it.kind === "archive"
+              ? `${r.files_written || 0} files extracted`
+              : (r.saved || "ok");
         }
         ok++;
       } catch (e) {

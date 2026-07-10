@@ -710,6 +710,26 @@
       </article>
     </div>
 
+    <!-- ============================== FILE EDITOR MODAL ============================== -->
+    <div id="editor-modal" class="modal-backdrop" hidden>
+      <div class="modal editor-modal" role="dialog" aria-labelledby="editor-title">
+        <header class="modal-header">
+          <h2 id="editor-title">Editor</h2>
+          <button class="modal-close" id="editor-cancel" title="Close (Esc)">&times;</button>
+        </header>
+        <div class="modal-body editor-body">
+          <textarea id="editor-textarea" spellcheck="false" autocomplete="off"
+                    wrap="off" placeholder="Loading…"></textarea>
+        </div>
+        <footer class="modal-footer">
+          <span id="editor-status" class="small muted"></span>
+          <span style="flex:1"></span>
+          <button class="btn btn-ghost" id="editor-cancel-2" onclick="document.getElementById('editor-modal').hidden=true">Cancel</button>
+          <button class="btn btn-primary" id="editor-save" title="Ctrl+S">Save</button>
+        </footer>
+      </div>
+    </div>
+
     <!-- ============================== NEW SERVER MODAL ============================== -->
     <div id="modal-backdrop" class="modal-backdrop" hidden>
       <div class="modal" role="dialog" aria-labelledby="modal-title">
@@ -989,6 +1009,7 @@
               </div>
               <ul id="init-file-list" class="init-file-list"></ul>
               <p class="small" id="init-file-summary" hidden></p>
+              <p class="small muted" id="init-file-hint" hidden></p>
             </fieldset>
 
             <div id="form-error" class="form-error" hidden></div>

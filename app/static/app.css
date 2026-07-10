@@ -564,6 +564,36 @@ dl.kv dd {
 }
 .modal-close:hover { color: var(--text); }
 .modal-body { padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
+
+/* Text editor modal — takes over most of the viewport and gives the
+   textarea nearly all of it. Used for editing small config files without
+   a shell (Game.ini, server.env, server.properties, etc.). */
+.editor-modal {
+  max-width: min(90vw, 1100px);
+  width: 90vw;
+  max-height: 88vh;
+  display: flex; flex-direction: column;
+}
+.editor-body {
+  padding: 0;
+  flex: 1;
+  min-height: 60vh;
+  display: flex;
+}
+.editor-body textarea {
+  flex: 1;
+  width: 100%;
+  border: none;
+  outline: none;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono, ui-monospace, "SFMono-Regular", Menlo, monospace);
+  font-size: 13px;
+  line-height: 1.45;
+  padding: 12px 14px;
+  resize: none;
+  tab-size: 2;
+}
 .modal-footer {
   padding: 12px 18px; border-top: 1px solid var(--border);
   display: flex; justify-content: flex-end; gap: 8px;

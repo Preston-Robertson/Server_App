@@ -442,29 +442,62 @@ class WakeProxy:
                 out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 out.setblocking(False)
                 out.connect(("127.0.0.1", p.internal_port))
-            except OSError:
+            except OSError as e:
+                # Rare but worth surfacing — UDP connect() shouldn't fail
+                # unless the kernel is out of local ports or ephemeral
+                # ranges are exhausted.
+                print(
+                    f"[wake_proxy] {p.name}: outbound socket create/connect "
+                    f"to 127.0.0.1:{p.internal_port} failed: {e!r}",
+                    file=sys.stderr, flush=True,
+                )
                 return
             cm = _ClientMap(outbound=out, last_activity=now)
             with self._lock:
                 p.clients[client_addr] = cm
+            # Log the first packet of a new client flow so operators can
+            # confirm forwarding is happening without needing a tcpdump.
+            print(
+                f"[wake_proxy] {p.name}: new client {client_addr[0]}:{client_addr[1]} "
+                f"→ 127.0.0.1:{p.internal_port} ({len(data)} bytes)",
+                file=sys.stderr, flush=True,
+            )
         try:
             cm.outbound.send(data)
             cm.last_activity = now
-        except OSError:
-            # ECONNREFUSED / EAGAIN — game may be mid-shutdown. Drop and
-            # let the client retry.
-            pass
+        except OSError as e:
+            # ECONNREFUSED (ICMP unreachable on prior send) / EAGAIN
+            # (kernel buffer full) / EMSGSIZE (packet too large). All get
+            # surfaced now instead of silently dropped — previously this
+            # class of failure was invisible and looked like "game just
+            # doesn't respond" from the client's POV.
+            print(
+                f"[wake_proxy] {p.name}: send to 127.0.0.1:{p.internal_port} "
+                f"failed for client {client_addr[0]}:{client_addr[1]}: {e!r}",
+                file=sys.stderr, flush=True,
+            )
 
     def _handle_game_response(self, p: _ServerProxy, client_addr, cm: _ClientMap, now: float) -> None:
         try:
             data = cm.outbound.recv(65535)
-        except (BlockingIOError, OSError):
+        except (BlockingIOError, OSError) as e:
+            # BlockingIOError is normal (spurious wakeup); OSError worth surfacing.
+            if not isinstance(e, BlockingIOError):
+                print(
+                    f"[wake_proxy] {p.name}: recv from game failed for "
+                    f"client {client_addr[0]}:{client_addr[1]}: {e!r}",
+                    file=sys.stderr, flush=True,
+                )
             return
         try:
             p.listen_sock.sendto(data, client_addr)
             cm.last_activity = now
-        except OSError:
-            pass
+        except OSError as e:
+            print(
+                f"[wake_proxy] {p.name}: reply to client "
+                f"{client_addr[0]}:{client_addr[1]} failed: {e!r}",
+                file=sys.stderr, flush=True,
+            )
 
     # -- TCP (Minecraft) ------------------------------------------------
 
