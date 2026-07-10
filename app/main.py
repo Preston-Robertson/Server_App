@@ -895,6 +895,17 @@ def api_diagnose_stuck(name: str) -> dict:
     )
 
     result["kernel_stack"] = _read(f"/proc/{target_pid}/stack", limit=4096)
+    # /proc/PID/stack requires CAP_SYS_ADMIN or kernel.kptr_restrict=0. The
+    # manager runs as gamesrv (neither), so this often reads back as
+    # "Permission denied". Rewrite the field so the UI shows a clear note
+    # instead of a scary permission error. wchan + thread_wchans + open_fds
+    # don't need these privileges and are usually enough to diagnose.
+    if "Permission denied" in result["kernel_stack"] or result["kernel_stack"].startswith("(unreadable)"):
+        result["kernel_stack"] = (
+            "(not readable — kernel stack requires CAP_SYS_ADMIN or "
+            "sysctl kernel.kptr_restrict=0. Use wchan + thread_wchans "
+            "+ open_fds fields below for diagnosis.)"
+        )
 
     fds_dir = proc / "fd"
     fds: list[str] = []
@@ -949,14 +960,38 @@ def api_diagnose_stuck(name: str) -> dict:
 
 
 def _find_game_pid_under_unit(unit_prefix: str) -> Optional[int]:
-    """Walk /proc looking for a game-ish PID under the given systemd unit.
+    """Walk /proc looking for the actual game PID under the given systemd unit.
 
-    Reads /proc/<pid>/cgroup and returns the first PID whose cgroup path
-    contains the systemd unit AND whose comm isn't shell/sleep/tmux (i.e.
-    the actual game binary, not start.sh or its `sleep 1` loop).
+    A game unit's process tree is:
+      systemd -> start.sh -> tmux -> PalServer.sh (or similar) -> GAME BINARY
+
+    All of those are in the unit's cgroup. My earlier version returned the
+    FIRST non-shell match, which was often the wrapper script — those sit
+    in ``do_wait`` waiting for their child, and reporting THAT as "stuck"
+    is misleading. We really want the leaf game binary — 20+ threads,
+    hundreds of MB RSS.
+
+    Strategy: collect every PID in the cgroup, score them, return the
+    highest-scoring one. Score = number of threads (biggest signal — a
+    UE binary has 30+, a shell has 1) + a small bump for known-game
+    binary names.
     """
     from pathlib import Path
-    shell_ish = {"sh", "bash", "sleep", "tmux", "tmux: server", "start.sh"}
+    KNOWN_GAME_BINARIES = {
+        "PalServer-Linux",           # Palworld (truncated to 15 chars in comm)
+        "PalServer-Linu",            # kernel /proc/*/comm 15-char cap
+        "FactoryServer",             # Satisfactory
+        "ShooterGameSer",            # ARK (truncated)
+        "valheim_server",
+        "enshrouded_ser",
+        "java",                      # Minecraft
+    }
+    SHELL_ISH = {"sh", "bash", "sleep", "tmux", "tmux: server", "start.sh",
+                 "stop.sh", "PalServer.sh", "FactoryServer.s"}
+
+    best_pid: Optional[int] = None
+    best_score: int = -1
+
     for pid_dir in Path("/proc").iterdir():
         if not pid_dir.name.isdigit():
             continue
@@ -966,17 +1001,42 @@ def _find_game_pid_under_unit(unit_prefix: str) -> Optional[int]:
             continue
         if unit_prefix not in cg:
             continue
+
         try:
             comm = (pid_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             comm = ""
-        if comm in shell_ish:
-            continue
+
+        # Read thread count from /proc/PID/status (Threads: line). Highest
+        # thread count wins because game binaries are heavily multi-threaded
+        # while shell wrappers have exactly 1 thread.
+        threads = 1
         try:
-            return int(pid_dir.name)
-        except ValueError:
-            continue
-    return None
+            status = (pid_dir / "status").read_text(encoding="utf-8", errors="replace")
+            for line in status.splitlines():
+                if line.startswith("Threads:"):
+                    try:
+                        threads = int(line.split()[1])
+                    except (IndexError, ValueError):
+                        pass
+                    break
+        except OSError:
+            pass
+
+        score = threads
+        if comm in KNOWN_GAME_BINARIES:
+            score += 1000
+        if comm in SHELL_ISH:
+            score -= 100
+
+        if score > best_score:
+            best_score = score
+            try:
+                best_pid = int(pid_dir.name)
+            except ValueError:
+                continue
+
+    return best_pid
 
 
 @app.get("/api/servers/{name}/logs", response_class=PlainTextResponse, dependencies=[Depends(require_token)])
