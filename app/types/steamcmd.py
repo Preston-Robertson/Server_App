@@ -134,70 +134,28 @@ fi
 _APP_RECIPES: dict[int, dict] = {
     2394010: {  # Palworld dedicated
         "name": "palworld",
-        # Launch args match the OFFICIAL Pocketpair Linux docs EXACTLY:
+        # Launch and env match the OFFICIAL Pocketpair Linux docs:
         # https://docs.palworldgame.com/getting-started/deploy-dedicated-server/
-        # (Linux with SteamCMD tab)
+        # (Linux with SteamCMD tab) — literally just `./PalServer.sh`.
+        # Also mirror Satisfactory's minimal recipe (which works on this
+        # same LXC): pin HOME, set nothing else. Every extra env var
+        # this recipe used to have (SteamAppId, SteamGameServer,
+        # SDL_*_DRIVER, SENTRY_DSN) was a speculative "maybe this fixes
+        # the hang" that turned out to change nothing. Keeping the
+        # surface minimal matches what other working Steamworks games
+        # in this manager use.
         #
-        # The docs show simply `./PalServer.sh` — no arguments at all.
-        # Port defaults to 8211, controlled by PalWorldSettings.ini if
-        # needed. Passing -useperfthreads / -NoAsyncLoadingThread /
-        # -UseMultithreadForDS is explicitly discouraged on v1.0+ per
-        # https://docs.palworldgame.com/settings-and-operation/arguments:
-        #   "In v1.0 and later, leaving this parameter unset may improve
-        #    performance."
-        # Even -port= is skipped by the docs' example — the port comes
-        # from PalWorldSettings.ini defaults (8211). To use a non-default
-        # port, edit PublicPort in the ini via the Files tab. The
-        # manager's _apply_palworld_passwords() already syncs PublicPort
-        # from the server def's `port` field, so the def's port DOES
-        # take effect via the ini path.
+        # PREREQUISITE for Palworld to actually run in an unprivileged
+        # LXC: the LXC config MUST have `features: nesting=1,keyctl=1`
+        # on the Proxmox host. Palworld's Steam auth path calls the
+        # keyctl() syscall which unprivileged LXCs block by default —
+        # that block causes the classic silent hang after "Running
+        # Palworld dedicated server on :PORT". Satisfactory doesn't hit
+        # that syscall path so it works without keyctl. See the manager's
+        # /api/diagnostics/keyctl endpoint (Admin page) for a live check.
         "run": "./PalServer.sh",
         "saves_rel": "Pal/Saved",
-        # HOME pinned to install_dir so Palworld's Steam Runtime state
-        # (~/.steam/{sdk32,sdk64,registry.vdf}, ~/Steam/logs/) lands
-        # somewhere gamesrv definitely owns and survives reinstalls
-        # cleanly. The post-install hook _apply_palworld_steam_runtime
-        # populates the required Steamworks SDK shim files under this
-        # pinned HOME.
-        #
-        # The remaining env vars address a known headless-server hang:
-        # Palworld's build calls SteamAPI_Init() (the client-side init)
-        # AS WELL AS SteamGameServer_Init() (server-side). The former
-        # tries to talk to a running Steam Client via
-        # /dev/shm/u999-ValveIPCSharedObj-Steam and blocks its
-        # IPC:CSteamEngin thread in do_epoll_wait forever when no client
-        # is present. Main thread sits in hrtimer_nanosleep polling for
-        # SteamAPI_Init to finish, world load never starts, card shows
-        # "starting" indefinitely with RAM stuck ~1 GB. Confirmed via
-        # /proc/PID/wchan diagnostics.
-        #
-        # * SteamAppId — tells the SDK the target app up front, skipping
-        #   the "which app am I" discovery step that pokes Steam Client.
-        # * SteamGameServer=1 — hints server-mode init path; some
-        #   Steamworks builds honor this to skip Steam Client rendezvous.
-        # * SDL_VIDEODRIVER / SDL_AUDIODRIVER=dummy — belt-and-suspenders
-        #   for Unreal Engine, which can otherwise try to init graphics/
-        #   audio libs headlessly and hang if they're not present.
-        "env": {
-            "HOME": "{install_dir}",
-            "SteamAppId": "2394010",
-            "SteamGameServer": "1",
-            "SDL_VIDEODRIVER": "dummy",
-            "SDL_AUDIODRIVER": "dummy",
-            # Disable Sentry Native crash reporter. Palworld bundles
-            # sentry-native (visible in /proc/PID/fd as Pal/.sentry-native/
-            # *.run.lock). Sentry Native init runs early in Palworld's
-            # boot and interacts with the Steamworks IPC event loop on
-            # the same thread. When SteamAPI_Init() blocks waiting for a
-            # Steam Client that isn't there, Sentry's crash-report path
-            # can compound the deadlock — Palworld posts to Sentry when
-            # a crash occurs, but the crash IS the SteamAPI deadlock, so
-            # the Sentry HTTPS upload blocks further progress. Clearing
-            # SENTRY_DSN tells sentry-native to skip network initialisation
-            # entirely; it becomes a no-op. Palworld itself is unaffected.
-            "SENTRY_DSN": "",
-            "SENTRY_ENABLE_BACKEND": "0",
-        },
+        "env": {"HOME": "{install_dir}"},
     },
     1690800: {  # Satisfactory dedicated
         # Post-1.0 quirks (learned the hard way — see

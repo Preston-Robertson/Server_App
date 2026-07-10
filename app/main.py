@@ -461,6 +461,90 @@ def api_firewall_snapshot() -> dict:
     return firewall.snapshot()
 
 
+@app.get("/api/diagnostics/keyctl", dependencies=[Depends(require_token)])
+def api_diagnostics_keyctl() -> dict:
+    """Detect whether the keyctl() syscall is usable in this container.
+
+    Palworld and many other Steamworks SDK games call the Linux kernel's
+    keyctl() syscall during Steam session-auth init. Unprivileged Proxmox
+    LXCs block this syscall by default; the syscall returns EPERM and
+    Steam SDK hangs waiting for a keyring operation that will never
+    complete. Symptoms: game process runs, binds its port, prints
+    "Running <game> on :PORT", then RAM freezes at ~800 MB - 1 GB
+    forever with no crash, no error, no progress.
+
+    Games that DON'T hit this syscall path (Minecraft — JVM, no Steam;
+    Satisfactory — custom HTTPS API, minimal Steam usage) work fine even
+    without the keyctl feature. Games that DO (Palworld and probably ARK,
+    Enshrouded, Valheim under load) hang silently.
+
+    Fix must be applied on the Proxmox HOST (not inside the LXC):
+      1. Edit /etc/pve/lxc/<CTID>.conf on the host.
+      2. Change the `features:` line to include ``keyctl=1``, e.g.
+         ``features: nesting=1,keyctl=1``.
+      3. Run ``pct restart <CTID>`` on the host.
+
+    This endpoint tests keyctl via a harmless syscall (KEYCTL_JOIN_SESSION
+    with a no-op name). Success = feature enabled; EPERM = feature missing.
+    """
+    import ctypes
+    import ctypes.util
+    import errno
+
+    result: dict = {
+        "keyctl_available": False,
+        "syscall_errno": None,
+        "syscall_error_name": None,
+        "detail": "",
+        "fix_instructions": "",
+    }
+
+    # keyctl(2) syscall: long keyctl(int cmd, ...). We use KEYCTL_GET_KEYRING_ID
+    # (cmd=0) on the process keyring (id=-2, KEY_SPEC_PROCESS_KEYRING), which is
+    # a read-only lookup that either returns a key ID or fails EPERM.
+    KEYCTL_GET_KEYRING_ID = 0
+    KEY_SPEC_PROCESS_KEYRING = -2
+
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+        # syscall number for keyctl on x86_64 = 250, on aarch64 = 219.
+        # Rather than hardcode, use libc's keyctl() wrapper if available;
+        # falls back to raw syscall.
+        libc.keyctl.restype = ctypes.c_long
+        libc.keyctl.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        ret = libc.keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_PROCESS_KEYRING, 0)
+        err = ctypes.get_errno()
+        if ret >= 0:
+            result["keyctl_available"] = True
+            result["detail"] = (
+                "keyctl() syscall succeeded — SteamCMD games that use "
+                "session-keyring auth (Palworld etc.) should be able to "
+                "complete Steam init."
+            )
+        else:
+            result["syscall_errno"] = err
+            result["syscall_error_name"] = errno.errorcode.get(err, f"errno={err}")
+            if err == errno.EPERM:
+                result["detail"] = (
+                    "keyctl() returned EPERM — the LXC's syscall filter is "
+                    "blocking keyring operations. Palworld and other Steam-"
+                    "session-auth games will hang silently after 'Running "
+                    "<game> on :PORT' with RAM stuck ~1 GB."
+                )
+                result["fix_instructions"] = (
+                    "On the Proxmox HOST (not this LXC), edit "
+                    "/etc/pve/lxc/<CTID>.conf and add keyctl=1 to the "
+                    "features line, e.g.: features: nesting=1,keyctl=1 — "
+                    "then run: pct restart <CTID>"
+                )
+            else:
+                result["detail"] = f"keyctl() failed unexpectedly with {result['syscall_error_name']}"
+    except (OSError, AttributeError) as e:
+        result["detail"] = f"could not test keyctl syscall: {e}"
+
+    return result
+
+
 @app.get("/api/diagnostics/network", dependencies=[Depends(require_token)])
 def api_diagnostics_network() -> dict:
     """Detect the "server bound locally but unreachable from LAN" failure mode.

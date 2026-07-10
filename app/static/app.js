@@ -258,6 +258,11 @@ async function loadNetworkDiagnostics() {
   summaryChip.className = "chip chip-warn";
   results.innerHTML = "";
   hostFix.hidden = true;
+
+  // Kick off keyctl check in parallel with the network check — different
+  // failure modes, both diagnosable, both host-config fixable.
+  loadKeyctlDiagnostic();
+
   try {
     const d = await api("/api/diagnostics/network");
     if (!d.servers || d.servers.length === 0) {
@@ -324,6 +329,46 @@ async function loadNetworkDiagnostics() {
   }
 }
 $("#netdiag-refresh")?.addEventListener("click", loadNetworkDiagnostics);
+
+// keyctl syscall availability check. Palworld and other Steam-session-auth
+// games hang silently if keyctl is blocked by the LXC's syscall filter.
+// Detects it, tells the operator how to fix on the Proxmox host.
+async function loadKeyctlDiagnostic() {
+  const chip = $("#keyctl-summary");
+  const detail = $("#keyctl-detail");
+  if (!chip || !detail) return;   // panel not present in older templates
+  chip.textContent = "checking…";
+  chip.className = "chip chip-warn";
+  detail.hidden = true;
+  try {
+    const d = await api("/api/diagnostics/keyctl");
+    if (d.keyctl_available) {
+      chip.textContent = "keyctl available";
+      chip.className = "chip chip-ok";
+      detail.hidden = true;
+    } else {
+      chip.textContent = `⚠ keyctl blocked (${d.syscall_error_name || "?"})`;
+      chip.className = "chip chip-err";
+      detail.hidden = false;
+      detail.innerHTML = `
+        <p><strong>keyctl() syscall is blocked in this LXC.</strong>
+        Palworld and other Steamworks games that use session-keyring auth
+        will hang silently after "Running &lt;game&gt; on :PORT" with RAM
+        stuck around 1 GB, no crash, no error. Satisfactory / Minecraft /
+        games that don't use that specific Steam code path are unaffected.</p>
+        <p><strong>Fix on the Proxmox HOST</strong> (not this LXC):</p>
+        <pre style="background:#0004;padding:8px;border-radius:4px;"># On the Proxmox host as root, replace 106 with your CT ID:
+grep '^features:' /etc/pve/lxc/106.conf || echo "no features line"
+# If missing:  echo 'features: nesting=1,keyctl=1' &gt;&gt; /etc/pve/lxc/106.conf
+# If present:  edit the line to add ,keyctl=1 (e.g. features: nesting=1,keyctl=1)
+pct restart 106</pre>
+        <p class="small muted">${(d.detail || "").replace(/</g, "&lt;")}</p>`;
+    }
+  } catch (e) {
+    chip.textContent = "keyctl check failed";
+    chip.className = "chip chip-muted";
+  }
+}
 
 // ---------- Runtime widget ----------
 

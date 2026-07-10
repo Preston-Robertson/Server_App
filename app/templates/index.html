@@ -731,6 +731,23 @@
             When flagged, the fix is a one-shot script you run on the
             Proxmox host, not the LXC.
           </p>
+
+          <div style="margin: 10px 0; padding: 8px; border-left: 3px solid var(--accent);">
+            <div class="row" style="gap: 8px;">
+              <strong>LXC syscall check:</strong>
+              <span class="chip chip-muted" id="keyctl-summary">not run</span>
+            </div>
+            <p class="muted small" style="margin: 4px 0 0;">
+              Palworld and other Steam-session-auth games call the kernel
+              <code>keyctl</code> syscall. Unprivileged Proxmox LXCs block
+              it by default → games hang silently after "Running &lt;game&gt;
+              on :PORT" with RAM stuck ~1 GB. Satisfactory, Minecraft, and
+              games that don't hit that specific Steam code path aren't
+              affected. This check runs alongside the network check below.
+            </p>
+            <div id="keyctl-detail" class="form-error" hidden style="margin-top: 8px;"></div>
+          </div>
+
           <div class="row" style="margin-bottom:8px;">
             <button class="btn" id="netdiag-refresh">Run check</button>
           </div>
