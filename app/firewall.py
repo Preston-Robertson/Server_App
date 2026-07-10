@@ -73,25 +73,18 @@ def _extra_ports_for(sd) -> list[tuple[int, str, str]]:
     a one-line addition.
     """
     if sd.type == "steamcmd" and getattr(sd, "steam_app_id", None) == 1690800:
-        # Satisfactory 1.0+ (verified against Update 8 / 1.0 dedicated):
-        #   UDP <port>         — game traffic (primary; handled by _proto_for)
-        #   TCP <port>         — HTTPS Server API (normal case)
-        #   TCP <port + 1>     — HTTPS Server API (Unreal port-shift fallback
-        #                        when TCP:<port> is in TIME_WAIT at bind time)
-        #   TCP 8888           — Reliable messaging (save streaming; FIXED)
+        # Satisfactory 1.0+ port layout, with the recipe's
+        # ``-ServerQueryPort={port}`` flag pinning the API to the game port:
+        #   UDP <port>   — game traffic (primary; handled by _proto_for)
+        #   TCP <port>   — HTTPS Server API (pinned by -ServerQueryPort;
+        #                  otherwise Unreal defaults to <port + 1>)
+        #   TCP 8888     — Reliable messaging (FIXED, save streaming)
         #
-        # Both TCP <port> and TCP <port+1> are opened because Unreal Engine
-        # silently port-shifts if TCP:<port> can't be bound (bind() is done
-        # without SO_REUSEADDR, so a lingering TIME_WAIT socket from the
-        # previous instance blocks it). Opening both is harmless and means
-        # the Server Manager panel keeps working across restarts regardless
-        # of which one the game ended up on. (The manager's start hook also
-        # actively waits for TCP:<port> to be free before starting to keep
-        # the shift from happening in the first place — see
-        # control.wait_tcp_port_free.)
+        # Only ONE TCP port needs to be forwarded on the operator's router
+        # in addition to 8888 — matches the operator's mental model of
+        # "the port I typed into the server def".
         return [
             (int(sd.port), "tcp", "satisfactory-api"),
-            (int(sd.port) + 1, "tcp", "satisfactory-api-shifted"),
             (8888, "tcp", "satisfactory-reliable"),
         ]
     return []

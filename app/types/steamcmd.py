@@ -95,10 +95,20 @@ _APP_RECIPES: dict[int, dict] = {
     1690800: {  # Satisfactory dedicated
         # Post-1.0 quirks (learned the hard way — see
         # docs/SATISFACTORY_NOTES.md and this class's install() hook):
-        #   * Server needs THREE ports: game UDP + HTTPS API TCP on
-        #     ``sd.port`` (both), PLUS a fixed TCP 8888 for reliable
-        #     messaging (save/asset streaming when clients join).
-        #     firewall.py's _extra_ports_for() opens all three.
+        #   * Server needs THREE ports: game UDP on ``sd.port``, HTTPS API
+        #     TCP on ``sd.port`` (forced by -ServerQueryPort; see below),
+        #     and a fixed TCP 8888 for reliable messaging (save/asset
+        #     streaming when clients join).  firewall.py's
+        #     _extra_ports_for() opens all three.
+        #   * ``-ServerQueryPort={port}`` is REQUIRED. Without it,
+        #     FactoryServer's HTTPS Server API defaults to ``-Port + 1``
+        #     (e.g. 15778 when -Port=15777) — the in-game Server Manager
+        #     panel then shows "Offline" because it queries the same port
+        #     as the game and gets nothing. Passing this flag pins the
+        #     API to the same TCP port as the game's UDP port, so only
+        #     one port ever needs to be forwarded on the router.
+        #     Confirmed empirically 2026-07-10 after chasing an "API on
+        #     15778" ghost for hours.
         #   * Direct-Connect ("Join Game") always fails with
         #     "Encryption token missing" — the client MUST use Server
         #     Manager to auth first and receive a session token.
@@ -114,7 +124,7 @@ _APP_RECIPES: dict[int, dict] = {
         #     → LoadGame). See docs/SATISFACTORY_NOTES.md for the exact
         #     sequence.
         "name": "satisfactory",
-        "run": "./FactoryServer.sh -Port={port} -log -unattended",
+        "run": "./FactoryServer.sh -Port={port} -ServerQueryPort={port} -log -unattended",
         # HOME is pinned so Epic/FactoryGame/Saved lands inside install_dir,
         # which we then symlink to world_dir below.
         "saves_rel": ".config/Epic/FactoryGame/Saved",

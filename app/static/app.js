@@ -940,11 +940,19 @@ function renderServerGrid(rows) {
     // the countdown to auto-shutdown. Suppressed while the server is
     // still starting — the "◐ starting" badge already tells the operator
     // there's no player data yet.
+    //
+    // pl === null while probe_ok is true means "readiness confirmed but
+    // player count unavailable" (e.g. Satisfactory HealthCheck succeeded
+    // but the admin_password needed for QueryServerState wasn't set).
+    // Render a distinct hint chip so the operator knows exactly what to
+    // fix without confusing it with "probe is still trying".
     let idleChip = "";
     if (d.idle_shutdown_min && s.active === "active" && wd && ready) {
       const pl = wd.players;
-      if (pl == null || !wd.probe_ok) {
-        idleChip = `<span class="chip" title="Waiting for A2S/SLP probe response">👥 —</span>`;
+      if (!wd.probe_ok) {
+        idleChip = `<span class="chip" title="Waiting for A2S/SLP/HTTPS probe response">👥 —</span>`;
+      } else if (pl == null) {
+        idleChip = `<span class="chip" title="Ready — player count needs passwords.admin_password in server YAML">👥 ?</span>`;
       } else if (pl > 0) {
         const max = wd.max_players ? `/${wd.max_players}` : "";
         idleChip = `<span class="chip chip-ok" title="Players online">👥 ${pl}${max}</span>`;

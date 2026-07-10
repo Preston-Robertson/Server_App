@@ -62,7 +62,13 @@ _A2S_QUERY = _A2S_HEADER + b"TSource Engine Query\x00"
 
 @dataclass
 class ProbeResult:
-    players: int
+    # ``players`` is Optional because some game APIs let us cheaply confirm
+    # the server is READY without giving us a player count (Satisfactory's
+    # unauthenticated HealthCheck is the canonical case). A None here is
+    # the "server is ready but I can't tell you how many are on it" signal
+    # — the dashboard can still flip from "starting" to "running" and the
+    # idle-shutdown countdown just doesn't run.
+    players: Optional[int]
     max_players: int
     name: str = ""
 
@@ -268,41 +274,71 @@ def _sf_login(host: str, port: int, admin_password: str,
 
 def probe_satisfactory_https(host: str, port: int, admin_password: str = "",
                               timeout: float = PROBE_TIMEOUT_SEC) -> Optional[ProbeResult]:
-    """Query player count via the Satisfactory Server API.
+    """Two-stage Satisfactory readiness + player-count probe.
 
-    Returns None on any failure — including "no admin password configured
-    AND server won't accept anonymous Client login". In that case the
-    operator needs to set ``passwords.admin_password`` in the server YAML."""
+    Stage 1 (readiness, no auth): ``HealthCheck``. Returns
+    ``{"data":{"health":"healthy",...}}`` once the world has finished
+    loading. This is what flips the dashboard's "starting" badge to
+    "running" — no admin_password required, works on any Satisfactory
+    server as long as its API is reachable on ``port``.
+
+    Stage 2 (player count, needs auth): ``QueryServerState``. Only
+    attempted if Stage 1 succeeded. Requires either the operator's
+    ``admin_password`` in the yaml, or the server allows anonymous
+    Client login. If Stage 2 fails, we still return a ProbeResult with
+    ``players=None`` — the server is confirmed ready, just no player
+    count. Idle-shutdown countdown skips these cases (see _tick).
+
+    Returns None only when even Stage 1 fails — i.e. the server API is
+    not reachable at all on this port. That keeps the "starting" badge
+    lit until the game actually accepts HTTPS."""
+    # Stage 1 — always try. No auth needed.
+    j = _sf_api(
+        host, port,
+        {"function": "HealthCheck", "data": {"clientCustomData": ""}},
+        None, timeout,
+    )
+    if j is None:
+        return None
+    health = (j.get("data", {}) or {}).get("health", "")
+    if health != "healthy":
+        # "slow" during world load, missing on cold start — treat as not
+        # ready yet. Don't fall through to QueryServerState (it'd fail too).
+        return None
+
+    # Stage 2 — best-effort player count. Failure is OK; we still return
+    # a ProbeResult indicating readiness with players=None.
     key = (host, port)
     for attempt in range(2):
         token = _sf_token_cache.get(key)
         if not token:
             token = _sf_login(host, port, admin_password, timeout)
             if not token:
-                return None
+                # Can't auth. Return readiness-only result.
+                return ProbeResult(players=None, max_players=0)
             _sf_token_cache[key] = token
 
-        j = _sf_api(
+        j2 = _sf_api(
             host, port,
             {"function": "QueryServerState"},
             token, timeout,
         )
-        if j is None:
+        if j2 is None:
             # 401 or transport error — drop the token and retry once.
             _sf_token_cache.pop(key, None)
             if attempt == 0:
                 continue
-            return None
+            return ProbeResult(players=None, max_players=0)
 
-        state = (j.get("data", {}) or {}).get("serverGameState", {}) or {}
+        state = (j2.get("data", {}) or {}).get("serverGameState", {}) or {}
         try:
             return ProbeResult(
                 players=int(state.get("numConnectedPlayers", 0) or 0),
                 max_players=int(state.get("playerLimit", 0) or 0),
             )
         except (TypeError, ValueError):
-            return None
-    return None
+            return ProbeResult(players=None, max_players=0)
+    return ProbeResult(players=None, max_players=0)
 
 
 # ---------- probe strategy per server type -----------------------------
@@ -331,23 +367,20 @@ def _probe_for(sd) -> Optional[ProbeResult]:
         if not sd.steam_app_id:
             return None
         # Satisfactory: A2S is broken (always reports 0 players). Route to
-        # the HTTPS Server API instead. Under normal operation the API
-        # lives on TCP:port (same as -Port); if the game had to Unreal-
-        # port-shift on bind (previous instance's TIME_WAIT lingered),
-        # it lands on TCP:port+1 instead. We try both so the dashboard
-        # doesn't lie when the shift happens on some edge-case restart.
-        # Wake-on-demand also offsets both.
+        # the HTTPS Server API instead. The API lives on TCP:port (pinned
+        # by the recipe's -ServerQueryPort={port} launch flag — without
+        # that flag Unreal defaults it to port+1, which was a long-running
+        # source of "the SM panel says offline but the game is fine" bugs).
+        # Wake-on-demand offsets the port when active.
         if sd.steam_app_id in _SATISFACTORY_APPS:
-            offset = _WAKE_INTERNAL_OFFSET if getattr(sd, "wake_on_demand", False) else 0
+            api_port = sd.port
+            if getattr(sd, "wake_on_demand", False):
+                api_port = sd.port + _WAKE_INTERNAL_OFFSET
             admin_pw = ""
             pw_cfg = getattr(sd, "passwords", None)
             if pw_cfg is not None:
                 admin_pw = getattr(pw_cfg, "admin_password", "") or ""
-            for candidate in (sd.port + offset, sd.port + offset + 1):
-                r = probe_satisfactory_https(host, candidate, admin_pw)
-                if r is not None:
-                    return r
-            return None
+            return probe_satisfactory_https(host, api_port, admin_pw)
         query_port = sd.port if sd.steam_app_id in _SINGLE_PORT_STEAM_APPS else 27015
         # Single-port Steam games (Satisfactory) share the game socket with
         # A2S — remap to the internal port when wake is on.
@@ -484,8 +517,15 @@ class Watchdog:
                 # "running".
                 state.first_ready_ms = now_ms
 
-            # Idle-shutdown countdown only runs when configured.
+            # Idle-shutdown countdown only runs when configured AND when
+            # we actually got a player count. A readiness-only probe
+            # (e.g. Satisfactory HealthCheck succeeded but auth for
+            # QueryServerState failed) leaves players=None; we can't
+            # tell if the server is empty so we never start the countdown.
             if not sd.idle_shutdown_min or sd.idle_shutdown_min <= 0:
+                state.empty_since_ms = None
+                continue
+            if result.players is None:
                 state.empty_since_ms = None
                 continue
 

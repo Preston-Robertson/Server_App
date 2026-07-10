@@ -505,49 +505,6 @@ def api_action(name: str, body: ActionBody) -> dict:
                     "if the install_dir is missing."
                 ),
             ) from e
-
-        # ---- TCP port free-check (Satisfactory / Unreal Engine defence) ----
-        # Some game engines (Unreal, notably Satisfactory) bind their TCP
-        # sockets WITHOUT ``SO_REUSEADDR``. If the previous instance's
-        # TCP sockets are still lingering in ``TIME_WAIT`` (60–120 s after
-        # graceful close) when we hand off to systemd, the game's bind()
-        # fails silently and Unreal port-shifts (`port` → `port+1` → …).
-        # The shifted port isn't in the operator's router forward, so
-        # WAN clients can no longer reach the Server API panel — a bug
-        # that appears out of thin air on "just a restart, no changes".
-        #
-        # We prevent it by waiting up to 90 s for the primary TCP port
-        # (and other known TCP ports the game uses) to actually be
-        # bindable before ``systemctl start``. If they aren't free in
-        # time, we return a helpful 503 instead of starting the game
-        # into a broken/shifted state.
-        #
-        # Only applies to games with a TCP primary port or a known-fixed
-        # TCP port set. For UDP-only games this is a no-op.
-        if body.action in ("start", "restart") and not getattr(sd, "wake_on_demand", False):
-            tcp_ports_to_check: list[int] = []
-            if sd.type in ("minecraft-java", "minecraft-forge"):
-                tcp_ports_to_check.append(int(sd.port))
-            if sd.type == "steamcmd" and getattr(sd, "steam_app_id", None) == 1690800:
-                # Satisfactory: TCP:port (HTTPS Server API — first choice
-                # before Unreal port-shift kicks in) and TCP:8888 (fixed
-                # Reliable Messaging).
-                tcp_ports_to_check += [int(sd.port), 8888]
-            busy = [p for p in tcp_ports_to_check
-                    if not control.wait_tcp_port_free(p, timeout=90.0)]
-            if busy:
-                busy_s = ", ".join(str(p) for p in busy)
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        f"TCP port(s) {busy_s} still in TIME_WAIT/LISTEN 90 s "
-                        f"after a previous instance closed. Wait another "
-                        f"~60 s and retry. Starting now would cause the game "
-                        f"to bind to a shifted port (e.g. {busy[0]+1}) and "
-                        f"break WAN clients whose router forwards target "
-                        f"the original ports."
-                    ),
-                )
     try:
         r = fn(sd)
     except subprocess.TimeoutExpired as e:
