@@ -88,7 +88,13 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
   tmux ufw \
   openjdk-17-jre-headless \
   lib32gcc-s1 \
+  libatomic1 libnss3 libpulse0 libasound2 zlib1g libncurses5 libtinfo5 \
   || true
+# ^ libatomic1..libtinfo5: Unreal Engine 5.1 dedicated servers (Palworld,
+# ARK: SA, Enshrouded, etc.) reference these at runtime and hang silently
+# during initialization if they're missing — no error message, just stuck
+# after "Running <game> on :PORT" with RAM stuck at ~800 MB. Debian 12's
+# minimal set doesn't include some of them by default.
 # steamcmd is in non-free/contrib — try both names.
 DEBIAN_FRONTEND=noninteractive apt-get install -y steamcmd || \
   DEBIAN_FRONTEND=noninteractive apt-get install -y steamcmd-jessie || \
