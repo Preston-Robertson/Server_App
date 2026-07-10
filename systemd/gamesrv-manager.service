@@ -18,7 +18,14 @@ Restart=always
 RestartSec=5
 
 # Hardening — Preston runs this LAN-only behind UFW, but defense in depth.
-NoNewPrivileges=true
+# NoNewPrivileges must be OFF: the manager shells out to `sudo ufw` for
+# the per-server firewall reconciler (see app/firewall.py + the sudoers
+# drop-in that bootstrap.sh installs at /etc/sudoers.d/gamesrv-ufw).
+# With NNP=1, sudo refuses to run at all — "sudo: The 'no new privileges'
+# flag is set, which prevents sudo from running as root." The sudoers
+# grant is deliberately narrow (only /usr/sbin/ufw), so re-allowing
+# privilege elevation for this single binary is an acceptable tradeoff.
+NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
