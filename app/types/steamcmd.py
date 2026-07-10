@@ -134,7 +134,16 @@ fi
 _APP_RECIPES: dict[int, dict] = {
     2394010: {  # Palworld dedicated
         "name": "palworld",
-        "run": "./PalServer.sh -port={port} -useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS",
+        # ``-log`` makes Unreal print verbose engine output to stdout so
+        # the Console tab surfaces what the game is actually doing (world
+        # load progress, save I/O, module init, hangs). Without it,
+        # Palworld goes silent right after "Running Palworld dedicated
+        # server on :PORT" and any post-boot hang looks like "it's just
+        # stuck" with zero signal. Cost is a chattier console.log — worth
+        # it. Palworld also writes its own log to Pal/Saved/Logs/Pal.log
+        # once -log is set, which persists across restarts and can be
+        # viewed via the Files tab even if console.log gets truncated.
+        "run": "./PalServer.sh -port={port} -useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS -log",
         "saves_rel": "Pal/Saved",
         # NO env overrides. An earlier version of this recipe pinned
         # HOME=install_dir alongside a post-install hook that symlinked
