@@ -115,13 +115,22 @@ class ServerStatus:
     mem_bytes: int | None
     cpu_usec: int | None
     uptime_sec: int | None
+    # NRestarts is systemd's counter for how many times this unit has
+    # been restarted (by Restart=on-failure). Non-zero across successive
+    # snapshots — especially with a low uptime — is the fingerprint of a
+    # crash-restart loop the operator can't otherwise see from the UI
+    # (each restart truncates console.log via start.sh, so the Console
+    # tab shows the identical first-boot lines forever). We surface this
+    # so the dashboard can display "restart loop (N)" instead of just
+    # "◐ starting" and mislead the operator into waiting.
+    n_restarts: int | None
 
 
 def status(sd: ServerDef) -> ServerStatus:
     unit = _unit(sd.name)
     props = _run([
         "systemctl", "show", unit,
-        "--property=ActiveState,SubState,UnitFileState,MainPID,MemoryCurrent,CPUUsageNSec,ActiveEnterTimestampMonotonic",
+        "--property=ActiveState,SubState,UnitFileState,MainPID,MemoryCurrent,CPUUsageNSec,ActiveEnterTimestampMonotonic,NRestarts",
     ])
     kv: dict[str, str] = {}
     for line in props.stdout.splitlines():
@@ -146,6 +155,13 @@ def status(sd: ServerDef) -> ServerStatus:
     mem = _int_or_none(kv.get("MemoryCurrent", "0"))
     cpu = _int_or_none(kv.get("CPUUsageNSec", "0"))
 
+    # NRestarts is a plain integer (0 for a healthy unit). _int_or_none
+    # would swallow 0 as None; use a straight parse and default to 0.
+    try:
+        n_restarts = int(kv.get("NRestarts", "0"))
+    except (ValueError, TypeError):
+        n_restarts = 0
+
     uptime = None
     if active == "active":
         # Rough uptime from monotonic timestamp (usec since boot)
@@ -168,6 +184,7 @@ def status(sd: ServerDef) -> ServerStatus:
         mem_bytes=mem,
         cpu_usec=cpu,
         uptime_sec=uptime,
+        n_restarts=n_restarts,
     )
 
 

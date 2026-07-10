@@ -108,9 +108,24 @@ function fmtTime(ts) { return ts ? new Date(ts * 1000).toLocaleString() : "-"; }
 //   * stuck_start  → "◐ starting? check Console" in error color. The
 //                    game process likely crashed or is hung — visible
 //                    signal instead of an amber chip forever.
-function stateChip(active, sub, ready, probeSupported, wd) {
+function stateChip(active, sub, ready, probeSupported, wd, statusExtra) {
   const s = (active || "unknown").toLowerCase();
   if (s === "active") {
+    // Crash-restart loop: systemd has restarted this unit N>0 times AND
+    // the current uptime is short (<2 min). This is the fingerprint that
+    // catches the "console.log shows the same first-boot lines forever"
+    // trap, where each restart truncates console.log via start.sh so the
+    // operator can't see anything after the boot banner. Surface it
+    // prominently so waiting for "starting → running" isn't the answer.
+    const nRestarts = (statusExtra && statusExtra.n_restarts) || 0;
+    const uptimeSec = (statusExtra && statusExtra.uptime_sec) || 0;
+    if (nRestarts > 0 && uptimeSec < 120) {
+      return {
+        cls: "chip-err",
+        label: `↻ restart loop (${nRestarts})`,
+        title: `The systemd unit has restarted ${nRestarts} times. Uptime is only ${uptimeSec}s — the game process is crashing shortly after launch. Check journalctl -u gamesrv@<name> --since '5 min ago' for the exit reason (common causes: OOM kill, missing library, bad config).`,
+      };
+    }
     if (probeSupported && !ready) {
       const startingSec = (wd && wd.starting_sec) || 0;
       if (wd && wd.stuck_start) {
@@ -1020,7 +1035,7 @@ function renderServerGrid(rows) {
     // server went active. If the game type has no supported probe we
     // trust systemd and treat "active" as ready.
     const ready = !s.probe_supported || !!(wd && wd.ready);
-    const chip = stateChip(s.active, s.sub, ready, !!s.probe_supported, wd);
+    const chip = stateChip(s.active, s.sub, ready, !!s.probe_supported, wd, s);
 
     // RAM % of the cap.
     const capBytes = (d.memory_mb || 0) * 1024 * 1024;

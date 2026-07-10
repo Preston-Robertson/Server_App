@@ -45,9 +45,19 @@ if ! command -v tmux >/dev/null; then
   exit 1
 fi
 
-# Truncate the tmux pane capture so it doesn't grow unbounded across
-# restarts. See the pipe-pane call below for why we capture at all.
-: > console.log
+# Truncate the tmux pane capture ONLY if the previous run left it huge
+# (>10 MB — a full-day session of a chatty game like Palworld or ARK can
+# reach that easily). Do NOT unconditionally truncate: if the process is
+# crash-looping via systemd Restart=on-failure, every restart runs start.sh
+# again, and blindly truncating here means the operator's only window into
+# WHY it crashed (the last exit trace) gets wiped seconds later. Preserve
+# it so the Console tab shows the accumulated log across restarts.
+if [[ -f console.log ]] && [[ $(stat -c%s console.log 2>/dev/null || echo 0) -gt 10485760 ]]; then
+  # Keep the last ~2 MB — enough for one or two crash traces.
+  tail -c 2000000 console.log > console.log.tmp && mv console.log.tmp console.log
+fi
+# Marker so the operator can find where THIS launch begins in the log.
+{ echo ""; echo "===== $(date -Iseconds) start.sh launching (session $SESSION) ====="; } >> console.log
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 

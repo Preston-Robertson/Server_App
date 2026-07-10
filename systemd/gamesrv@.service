@@ -32,11 +32,23 @@ TimeoutStopSec=300
 Restart=on-failure
 RestartSec=10
 KillMode=mixed
-# Per-server RAM backstop — per §2 the game must have a Java -Xmx or similar
-# already; MemoryMax is the *last* line of defense so one server can't kill
-# its neighbors. Tune via the manager (memory_mb) then re-run the template
-# regeneration (bootstrap ensure-units).
-MemoryMax=8G
+# NO hardcoded MemoryMax here on purpose. A blanket cgroup memory cap in
+# the template ignored the per-server memory_mb field entirely and hard-
+# killed larger games (Palworld 16 GB, ARK 20+ GB) with an OOM signal
+# the moment world-load exceeded the template default. The manager
+# instead budgets RAM via a pre-flight check in app/main.py::api_action
+# ("start" / "restart"): if the sum of active servers' memory_mb + the
+# one being started would exceed the LXC's cgroup limit, the API refuses
+# with 507 BEFORE systemctl is called. That protects the LXC from
+# overcommit without silently killing individual games mid-run.
+#
+# If you want a per-server hard cap as belt-and-suspenders backstop,
+# drop a systemd override alongside this template (Proxmox host, as
+# root, adjust for your CT):
+#   mkdir -p /etc/systemd/system/gamesrv@palworld.service.d
+#   printf '[Service]\nMemoryMax=18G\n' > \
+#     /etc/systemd/system/gamesrv@palworld.service.d/memory.conf
+#   systemctl daemon-reload
 
 # Hardening
 NoNewPrivileges=true
