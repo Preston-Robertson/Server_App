@@ -10,7 +10,9 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import time
+import traceback
 from dataclasses import dataclass
 
 from .config import settings
@@ -34,6 +36,7 @@ def _run(cmd: list[str], *, timeout: int = 15, check: bool = False) -> subproces
 # ---------- lifecycle ----------
 
 def start(sd: ServerDef) -> subprocess.CompletedProcess:
+    _log_lifecycle("START", sd.name)
     return _run(["systemctl", "start", _unit(sd.name)])
 
 
@@ -47,10 +50,12 @@ _STOP_TIMEOUT_SEC = 330
 
 def stop(sd: ServerDef) -> subprocess.CompletedProcess:
     # Graceful stop is handled by the unit's ExecStop (sends stop_cmd via tmux).
+    _log_lifecycle("STOP", sd.name)
     return _run(["systemctl", "stop", _unit(sd.name)], timeout=_STOP_TIMEOUT_SEC)
 
 
 def restart(sd: ServerDef) -> subprocess.CompletedProcess:
+    _log_lifecycle("RESTART", sd.name)
     return _run(["systemctl", "restart", _unit(sd.name)], timeout=_STOP_TIMEOUT_SEC)
 
 
@@ -60,6 +65,39 @@ def enable(sd: ServerDef) -> subprocess.CompletedProcess:
 
 def disable(sd: ServerDef) -> subprocess.CompletedProcess:
     return _run(["systemctl", "disable", _unit(sd.name)])
+
+
+def _log_lifecycle(action: str, name: str) -> None:
+    """Emit a compact caller-stack line to the manager's own stderr (→ journal).
+
+    Why: we've been chasing "who stopped my server?" bugs where a background
+    thread (watchdog idle-shutdown, wake_proxy demotion path, auto-restart on
+    config change, some future feature) calls control.stop(sd) without the
+    operator triggering it — the game gets Ctrl-C via stop.sh and dies, and
+    the operator only sees "starting" in the UI plus a `console.log` full of
+    boot messages. Naming the caller in the journal is the cheapest possible
+    fix. One line per invocation, no state, no external deps.
+
+    View with:
+      journalctl -u gamesrv-manager.service --since '10 min ago' | grep gamesrv-lifecycle
+    """
+    try:
+        # Walk up the stack collecting non-control-py frames (i.e. the actual
+        # caller and its caller). Skip our own frame and _run.
+        frames = traceback.extract_stack()[:-2]
+        interesting: list[str] = []
+        for fr in reversed(frames):
+            # Keep only the tail path segment so lines stay short.
+            fname = fr.filename.replace("\\", "/").rsplit("/", 1)[-1]
+            interesting.append(f"{fname}:{fr.lineno}:{fr.name}()")
+            if len(interesting) >= 3:
+                break
+        caller_chain = " ← ".join(interesting) if interesting else "(no stack)"
+        print(f"[gamesrv-lifecycle] {action} {name} caller: {caller_chain}",
+              file=sys.stderr, flush=True)
+    except Exception:
+        # Logging must never break the actual action.
+        pass
 
 
 # ---------- port bind readiness ---------------------------------------------
