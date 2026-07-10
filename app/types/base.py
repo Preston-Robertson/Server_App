@@ -51,6 +51,21 @@ class TypeHandler:
     def update(self) -> list[str]:
         raise NotImplementedError
 
+    def configure(self) -> list[str]:
+        """Regenerate launch scripts + env from the current ServerDef.
+
+        Called by the manager before every Start/Restart so that
+        launch-affecting fields (``port``, ``wake_on_demand``,
+        ``memory_mb``, ``java_args``, passwords, access, ``extra_env``,
+        ``stop_timeout_sec``, …) always take effect on the very next
+        launch — no Install click required just to sync config.
+
+        MUST NOT download anything or run steamcmd. MUST be idempotent
+        and safe to call on every start, including when the server is
+        already partially installed. Default: no-op (used by the custom
+        type where the operator owns start.sh)."""
+        return []
+
     # -- progress plumbing (opt-in for handlers that stream) --
     def set_progress_cb(self, cb: Optional[ProgressCallback]) -> None:
         self._progress_cb = cb

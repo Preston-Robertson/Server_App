@@ -636,6 +636,33 @@ class SteamCmdHandler(TypeHandler):
 
         self._emit(phase="finalising", percent=100.0, line="writing start.sh + stop.sh")
 
+        # Everything past this point regenerates launch scripts, env files,
+        # save-dir symlinks and per-game config from the current ServerDef.
+        # It's factored out so `configure()` can re-run it on every Start
+        # without re-downloading via steamcmd — that's what makes toggling
+        # e.g. `wake_on_demand` take effect immediately.
+        msgs.extend(self.configure())
+        return msgs
+
+    def configure(self) -> list[str]:
+        """Regenerate scripts + env + symlinks from the current def.
+
+        Idempotent; safe to call on every Start. Does NOT run steamcmd,
+        so it's fast (subsecond). Called both at the tail of install()
+        and by the manager's start/restart action so config changes like
+        toggling wake_on_demand always take effect on the next launch."""
+        if not self.sd.steam_app_id:
+            raise ValueError("steamcmd type requires steam_app_id in the definition")
+        self.ensure_dirs()
+        msgs: list[str] = []
+
+        recipe = _APP_RECIPES.get(self.sd.steam_app_id, {
+            "name": "generic",
+            "run": self.sd.start_cmd or "./start.sh",
+            "saves_rel": None,
+        })
+        uses_wine = bool(recipe.get("wine"))
+
         game_port = _effective_game_port(self.sd)
         run_cmd = recipe["run"].format(name=self.sd.name, port=game_port)
         if self.sd.wake_on_demand:

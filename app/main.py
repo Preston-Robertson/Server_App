@@ -477,6 +477,34 @@ def api_action(name: str, body: ActionBody) -> dict:
                     "or lower this server's memory_mb."
                 ),
             )
+
+        # Regenerate launch scripts (start.sh / stop.sh / server.env /
+        # server.properties) from the current ServerDef BEFORE handing off
+        # to systemctl. This makes launch-affecting fields — port,
+        # wake_on_demand, memory_mb, java_args, passwords, extra_env,
+        # stop_timeout_sec — take effect on the very next start without
+        # requiring the operator to click Install.
+        #
+        # Does NOT re-download anything (no steamcmd, no jar fetch) — this
+        # is pure file-writing from the YAML. Only game-type handlers that
+        # implement configure() do anything; the custom type is a no-op.
+        # Failures here are fatal for the start: a broken configure() would
+        # mean starting the game with a stale/incorrect script, which is
+        # exactly the class of bug this hook exists to prevent.
+        try:
+            handler = handler_for(sd)
+            handler.configure()
+        except NotImplementedError:
+            pass   # older handler without a configure() override — skip.
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Regenerating launch scripts for {sd.name} failed: {e}. "
+                    "Fix the server definition and try again, or click Install "
+                    "if the install_dir is missing."
+                ),
+            ) from e
     try:
         r = fn(sd)
     except subprocess.TimeoutExpired as e:

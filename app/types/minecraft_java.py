@@ -87,6 +87,18 @@ fi
 
 class MinecraftJavaHandler(TypeHandler):
     def install(self) -> list[str]:
+        msgs = self.configure()
+        jar = self.install_dir / "server.jar"
+        if not jar.exists():
+            msgs.append("NOTE: upload server.jar (area=install, path=server.jar) before starting")
+        return msgs
+
+    def configure(self) -> list[str]:
+        """Regenerate launch scripts + env from the current def.
+
+        Idempotent; called on every Start so launch-affecting fields
+        (memory_mb, java_args, port, wake_on_demand, extra_env,
+        stop_timeout_sec) take effect without a full Install click."""
         self.ensure_dirs()
         msgs: list[str] = []
 
@@ -128,10 +140,6 @@ class MinecraftJavaHandler(TypeHandler):
         if not link.exists():
             link.symlink_to(self.world_dir)
             msgs.append(f"symlinked world -> {self.world_dir}")
-
-        jar = self.install_dir / "server.jar"
-        if not jar.exists():
-            msgs.append("NOTE: upload server.jar (area=install, path=server.jar) before starting")
 
         return msgs
 

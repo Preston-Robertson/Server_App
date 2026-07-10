@@ -153,6 +153,42 @@ def _required_java(mc_version: str | None) -> int | None:
 
 class MinecraftForgeHandler(TypeHandler):
     def install(self) -> list[str]:
+        msgs = self.configure()
+
+        # 5. EULA reminder — do NOT auto-accept for the user.
+        eula = self.install_dir / "eula.txt"
+        if not eula.exists() or "eula=true" not in eula.read_text(encoding="utf-8", errors="ignore"):
+            msgs.append("NOTE: eula.txt is not set to true — Forge will exit on first start.")
+            msgs.append("      Accept Mojang's EULA (edit install_dir/eula.txt: eula=true) before starting.")
+
+        # 6. run.sh presence + java version sanity check.
+        run_sh = self.install_dir / "run.sh"
+        if not run_sh.exists():
+            msgs.append("NOTE: run.sh is missing — upload the Forge server tree (mods/, config/,")
+            msgs.append("      libraries/, run.sh, user_jvm_args.txt) via the Files tab or SFTP.")
+            msgs.append("      If you only have run.bat, use scripts/convert_bat_to_sh.py to generate one.")
+
+        required = _required_java(self.sd.mc_version)
+        found = _java_major_version()
+        if required is not None:
+            if found is None:
+                msgs.append(f"WARNING: could not detect installed java — Forge {self.sd.mc_version} needs Java {required}.")
+            elif found != required:
+                msgs.append(
+                    f"WARNING: system java is {found}, but Minecraft {self.sd.mc_version} Forge requires Java {required}. "
+                    f"Install openjdk-{required}-jre-headless and ensure it is the default `java`."
+                )
+            else:
+                msgs.append(f"java {found} matches required {required} for MC {self.sd.mc_version} ✓")
+
+        return msgs
+
+    def configure(self) -> list[str]:
+        """Regenerate launch scripts + JVM args + env from the current def.
+
+        Idempotent; called on every Start so launch-affecting fields
+        (memory_mb, java_args, wake_on_demand, extra_env,
+        stop_timeout_sec) take effect without a full Install click."""
         self.ensure_dirs()
         msgs: list[str] = []
 
@@ -207,32 +243,6 @@ class MinecraftForgeHandler(TypeHandler):
             internal_port = self.sd.port + 10000
             msgs.append("wake-on-demand: " + self.patch_server_properties("server-port", str(internal_port)))
             msgs.append(f"wake-on-demand: game will bind :{internal_port}; proxy owns public :{self.sd.port}")
-
-        # 5. EULA reminder — do NOT auto-accept for the user.
-        eula = self.install_dir / "eula.txt"
-        if not eula.exists() or "eula=true" not in eula.read_text(encoding="utf-8", errors="ignore"):
-            msgs.append("NOTE: eula.txt is not set to true — Forge will exit on first start.")
-            msgs.append("      Accept Mojang's EULA (edit install_dir/eula.txt: eula=true) before starting.")
-
-        # 6. run.sh presence + java version sanity check.
-        run_sh = self.install_dir / "run.sh"
-        if not run_sh.exists():
-            msgs.append("NOTE: run.sh is missing — upload the Forge server tree (mods/, config/,")
-            msgs.append("      libraries/, run.sh, user_jvm_args.txt) via the Files tab or SFTP.")
-            msgs.append("      If you only have run.bat, use scripts/convert_bat_to_sh.py to generate one.")
-
-        required = _required_java(self.sd.mc_version)
-        found = _java_major_version()
-        if required is not None:
-            if found is None:
-                msgs.append(f"WARNING: could not detect installed java — Forge {self.sd.mc_version} needs Java {required}.")
-            elif found != required:
-                msgs.append(
-                    f"WARNING: system java is {found}, but Minecraft {self.sd.mc_version} Forge requires Java {required}. "
-                    f"Install openjdk-{required}-jre-headless and ensure it is the default `java`."
-                )
-            else:
-                msgs.append(f"java {found} matches required {required} for MC {self.sd.mc_version} ✓")
 
         return msgs
 
