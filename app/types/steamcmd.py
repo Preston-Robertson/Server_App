@@ -134,16 +134,27 @@ fi
 _APP_RECIPES: dict[int, dict] = {
     2394010: {  # Palworld dedicated
         "name": "palworld",
-        # Launch args match LinuxGSM's tested config exactly. We had
-        # been adding ``-port={port}`` and ``-log``, both of which
-        # reasoned to be safe but which we can't rule out as
-        # contributing to the SteamAPI-init hang we've been chasing.
-        # LinuxGSM's version omits both — port comes from
-        # PalWorldSettings.ini (PublicPort= field), and Palworld's
-        # verbose logging works via the config file too. Keep this
-        # aligned with LinuxGSM until we understand why Palworld's
-        # internal Steam Client emulator refuses to complete init.
-        "run": "./PalServer.sh -useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS",
+        # Launch args per the OFFICIAL Pocketpair docs
+        # (https://docs.palworldgame.com/settings-and-operation/arguments):
+        #
+        #   "-useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS
+        #    In v1.0 and later, leaving this parameter unset may improve
+        #    performance."
+        #
+        # Every existing Linux-Palworld guide on the internet (LinuxGSM,
+        # Docker recipes, VPS howtos) still passes those three because
+        # they were required pre-v1.0 — but they now HURT v1.0+ and are
+        # a suspected cause of the SteamAPI-init hang we spent an
+        # afternoon chasing (main thread in hrtimer_nanosleep loop,
+        # IPC:CSteamEngin blocked in do_epoll_wait forever, world load
+        # never starts, RAM stuck ~1 GB). LinuxGSM reproduces the
+        # identical hang because it ALSO uses those flags — the community
+        # hasn't yet updated to match Pocketpair's post-v1.0 guidance.
+        #
+        # Keep this minimal. -port= sets the listening port (documented
+        # as valid). Additional flags belong per-user in extra_env or
+        # a manual PalServer.sh edit, not baked into the recipe.
+        "run": "./PalServer.sh -port={port}",
         "saves_rel": "Pal/Saved",
         # HOME pinned to install_dir so Palworld's Steam Runtime state
         # (~/.steam/{sdk32,sdk64,registry.vdf}, ~/Steam/logs/) lands
