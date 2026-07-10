@@ -73,12 +73,17 @@ def _extra_ports_for(sd) -> list[tuple[int, str, str]]:
     a one-line addition.
     """
     if sd.type == "steamcmd" and getattr(sd, "steam_app_id", None) == 1690800:
-        # Satisfactory 1.0+:
-        #   UDP <port>  — game traffic (primary; handled by _proto_for)
-        #   TCP <port>  — HTTPS Server API (Server Manager uses this)
-        #   TCP 8888    — Reliable messaging (save streaming during joins)
+        # Satisfactory 1.0+ (verified against Update 8 / 1.0 dedicated):
+        #   UDP <port>     — game traffic (primary; handled by _proto_for)
+        #   TCP <port+1>   — HTTPS Server API (Server Manager uses this)
+        #   TCP 8888       — Reliable messaging (save streaming during joins)
+        #
+        # The API port is *derived* from -Port as `port + 1`, NOT the same
+        # as the game port. Confirmed empirically via `ss -tlnp` against
+        # a running server launched with `-Port=15777`: it binds
+        # UDP:15777, TCP:15778, TCP:8888.
         return [
-            (int(sd.port), "tcp", "satisfactory-api"),
+            (int(sd.port) + 1, "tcp", "satisfactory-api"),
             (8888, "tcp", "satisfactory-reliable"),
         ]
     return []

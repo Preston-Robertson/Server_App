@@ -331,13 +331,13 @@ def _probe_for(sd) -> Optional[ProbeResult]:
         if not sd.steam_app_id:
             return None
         # Satisfactory: A2S is broken (always reports 0 players). Route to
-        # the HTTPS Server API instead. The API listens on the same TCP
-        # port as the game; wake-on-demand remaps that to the internal
-        # port just like the UDP game socket.
+        # the HTTPS Server API instead. The API listens on `port + 1` (the
+        # game socket itself is UDP-only); wake-on-demand remaps that to
+        # the internal port +1 just like the UDP game socket.
         if sd.steam_app_id in _SATISFACTORY_APPS:
-            api_port = sd.port
+            api_port = sd.port + 1
             if getattr(sd, "wake_on_demand", False):
-                api_port = sd.port + _WAKE_INTERNAL_OFFSET
+                api_port = sd.port + _WAKE_INTERNAL_OFFSET + 1
             admin_pw = ""
             pw_cfg = getattr(sd, "passwords", None)
             if pw_cfg is not None:
