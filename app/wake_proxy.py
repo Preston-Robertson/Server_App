@@ -95,6 +95,22 @@ class _ServerProxy:
     # list = no filtering (any login attempt wakes the server). Only used
     # for TCP wake (Minecraft); ignored for the UDP paths.
     wake_whitelist: list = field(default_factory=list)
+    # Optional secondary TCP listener for games that need BOTH UDP (game
+    # traffic) AND TCP (management/API) on the same port — Satisfactory
+    # 1.0+ is the current case: game protocol is UDP but the "Server
+    # Manager" tool talks HTTPS on the same port over TCP. When populated,
+    # this is a raw-splice listener (no protocol-specific peek — the
+    # traffic is TLS-encrypted from packet 1).
+    listen_sock_tcp: Optional[socket.socket] = None
+    tcp_extra_conn_count: int = 0                  # in-flight raw TCP splices
+
+
+# Steam app IDs whose dedicated servers need dual-protocol wake (UDP+TCP
+# on the same public port). Keep in sync with the recipe registry — this
+# is duplicated here so wake_proxy stays independent of the types module.
+_DUAL_PROTOCOL_STEAM_APPS = {
+    1690800,   # Satisfactory (UDP game + HTTPS TCP API on the same port)
+}
 
 
 # ---------- Minecraft protocol helpers --------------------------------------
@@ -209,17 +225,30 @@ class WakeProxy:
             out = {}
             for name, p in self._proxies.items():
                 waking_for = int(now - p.waking_since) if p.waking_since else 0
+                dual_tcp = p.listen_sock_tcp is not None
+                # Effective protocol label — "udp+tcp" for dual-protocol
+                # (Satisfactory) so the dashboard can distinguish it from
+                # single-protocol UDP wake.
+                proto_label = "udp+tcp" if dual_tcp else p.protocol
+                # Total active clients spans both UDP nat entries and any
+                # in-flight TCP splices (main TCP path + dual-protocol raw
+                # TCP path).
+                if p.protocol == "udp":
+                    active = len(p.clients) + p.tcp_extra_conn_count
+                else:
+                    active = p.tcp_conn_count
                 out[name] = {
                     "public_port": p.public_port,
                     "internal_port": p.internal_port,
-                    "protocol": p.protocol,
+                    "protocol": proto_label,
+                    "dual_tcp": dual_tcp,
                     "bound": True,
                     "bind_error": "",
                     "is_running": p.is_running,
                     "waking": p.waking_since is not None,
                     "waking_sec": waking_for,
                     "buffered_packets": len(p.buffered),
-                    "active_clients": len(p.clients) if p.protocol == "udp" else p.tcp_conn_count,
+                    "active_clients": active,
                     "wake_timeout_sec": p.wake_timeout_sec,
                     "last_wake_error": p.last_wake_error,
                 }
@@ -230,6 +259,7 @@ class WakeProxy:
                     "public_port": pub,
                     "internal_port": pub + WAKE_INTERNAL_OFFSET,
                     "protocol": proto,
+                    "dual_tcp": False,
                     "bound": False,
                     "bind_error": err,
                     "is_running": False,
@@ -262,8 +292,8 @@ class WakeProxy:
 
     def _sync_proxies(self) -> None:
         """Add/remove per-server sockets to match current YAML defs."""
-        # name -> (pub, internal, wake_timeout, protocol, wake_whitelist)
-        wanted: dict[str, tuple[int, int, int, str, list]] = {}
+        # name -> (pub, internal, wake_timeout, protocol, wake_whitelist, dual_tcp)
+        wanted: dict[str, tuple[int, int, int, str, list, bool]] = {}
         try:
             for sd in registry.list_defs():
                 if not getattr(sd, "wake_on_demand", False):
@@ -274,12 +304,20 @@ class WakeProxy:
                     continue
                 proto = "tcp" if sd.type in ("minecraft-java", "minecraft-forge") else "udp"
                 whitelist = list(getattr(sd, "wake_whitelist", None) or [])
+                # Dual-protocol games (Satisfactory) need a second TCP listen
+                # socket on the same public port alongside the primary UDP.
+                dual_tcp = (
+                    proto == "udp"
+                    and getattr(sd, "type", "") == "steamcmd"
+                    and getattr(sd, "steam_app_id", None) in _DUAL_PROTOCOL_STEAM_APPS
+                )
                 wanted[sd.name] = (
                     sd.port,
                     sd.port + WAKE_INTERNAL_OFFSET,
                     max(10, int(sd.wake_timeout_sec or 90)),
                     proto,
                     whitelist,
+                    dual_tcp,
                 )
         except Exception:
             return
@@ -299,7 +337,7 @@ class WakeProxy:
             # Bind new proxies. Bind can fail if the game currently holds
             # the port (operator toggled wake_on_demand on but hasn't
             # reinstalled + restarted yet); we retry on the next sync.
-            for name, (pub, internal, wto, proto, whitelist) in wanted.items():
+            for name, (pub, internal, wto, proto, whitelist, dual_tcp) in wanted.items():
                 if name in self._proxies:
                     # Update mutable settings without rebinding.
                     self._proxies[name].wake_timeout_sec = wto
@@ -355,6 +393,40 @@ class WakeProxy:
                     wake_whitelist=whitelist,
                 )
 
+                # Dual-protocol games: also bind a TCP listener on the same
+                # public port. Runs alongside the UDP socket; each is
+                # forwarded independently by the main loop.
+                if dual_tcp:
+                    try:
+                        s_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        s_tcp.setblocking(False)
+                        s_tcp.bind(("0.0.0.0", pub))
+                        s_tcp.listen(32)
+                    except OSError as e:
+                        # UDP bound but TCP didn't — surface as a bind
+                        # error, and roll back the UDP bind so we retry
+                        # both together next sync.
+                        print(
+                            f"[wake_proxy] {name}: secondary TCP bind :{pub} "
+                            f"failed: {e} — Server Manager API will be "
+                            "unreachable until this succeeds",
+                            file=sys.stderr, flush=True,
+                        )
+                        self._bind_errors[name] = (pub, "udp+tcp", str(e))
+                        try:
+                            s.close()
+                        except OSError:
+                            pass
+                        self._proxies.pop(name, None)
+                        continue
+                    self._proxies[name].listen_sock_tcp = s_tcp
+                    print(
+                        f"[wake_proxy] {name}: dual-protocol bound "
+                        f"(UDP+TCP :{pub} → backend :{internal})",
+                        file=sys.stderr, flush=True,
+                    )
+
     def _close_proxy_locked(self, name: str) -> None:
         p = self._proxies.pop(name, None)
         if not p:
@@ -363,6 +435,12 @@ class WakeProxy:
             p.listen_sock.close()
         except OSError:
             pass
+        # Secondary TCP listener (dual-protocol games).
+        if p.listen_sock_tcp is not None:
+            try:
+                p.listen_sock_tcp.close()
+            except OSError:
+                pass
         for cm in p.clients.values():
             try:
                 cm.outbound.close()
@@ -381,6 +459,10 @@ class WakeProxy:
         for p in proxies:
             rfds.append(p.listen_sock.fileno())
             fd_map[p.listen_sock.fileno()] = ("listen", p, None)
+            # Dual-protocol games have a second TCP listener alongside UDP.
+            if p.listen_sock_tcp is not None:
+                rfds.append(p.listen_sock_tcp.fileno())
+                fd_map[p.listen_sock_tcp.fileno()] = ("listen_tcp_extra", p, None)
             for addr, cm in p.clients.items():
                 rfds.append(cm.outbound.fileno())
                 fd_map[cm.outbound.fileno()] = ("outbound", p, (addr, cm))
@@ -402,6 +484,11 @@ class WakeProxy:
                     self._handle_client_packet(p, now)
                 else:
                     self._handle_tcp_accept(p, now)
+            elif kind == "listen_tcp_extra":
+                # Dual-protocol: TCP alongside UDP (Satisfactory HTTPS API).
+                # Uses a raw-splice handler because we can't peek the
+                # protocol — HTTPS/TLS is encrypted from packet 1.
+                self._handle_tcp_raw_accept(entry[1], now)
             else:
                 p = entry[1]
                 addr, cm = entry[2]
@@ -554,6 +641,108 @@ class WakeProxy:
             target=self._handle_tcp_conn, args=(p, conn),
             name=f"gs-tcp-{p.name}", daemon=True,
         ).start()
+
+    def _handle_tcp_raw_accept(self, p: _ServerProxy, now: float) -> None:
+        """Accept a connection on the dual-protocol TCP listener.
+
+        No protocol peek — the traffic on this listener is HTTPS/TLS
+        (Satisfactory Server Manager API) and encrypted from packet 1.
+        We just wake if needed and splice raw bytes.
+        """
+        if p.listen_sock_tcp is None:
+            return
+        try:
+            conn, addr = p.listen_sock_tcp.accept()
+        except (BlockingIOError, OSError):
+            return
+        threading.Thread(
+            target=self._handle_tcp_raw_conn, args=(p, conn),
+            name=f"gs-tcp-raw-{p.name}", daemon=True,
+        ).start()
+
+    def _handle_tcp_raw_conn(self, p: _ServerProxy, conn: socket.socket) -> None:
+        """Dual-protocol raw-splice TCP path.
+
+        Used by games like Satisfactory whose Server Manager API runs on
+        the same public port as the game (UDP) but over HTTPS. We can't
+        buffer/replay because we can't inspect encrypted TLS traffic —
+        instead we hold the accepted TCP connection open while the wake
+        completes, then open a backend socket and splice bytes bidirectionally.
+
+        The client's TCP stack transparently retransmits any data sent
+        before we complete the splice, so the connection just looks slow
+        (waking) rather than broken.
+        """
+        try:
+            conn.setblocking(True)
+            # Kick a wake if the game isn't up yet and no one else has.
+            if not p.is_running:
+                with self._lock:
+                    if p.waking_since is None:
+                        p.waking_since = time.monotonic()
+                        p.last_wake_error = ""
+                        threading.Thread(
+                            target=self._wake_target, args=(p.name,),
+                            name=f"gs-wake-{p.name}", daemon=True,
+                        ).start()
+                # Wait for is_running to flip. Client's TCP stack will
+                # queue anything it sends during this window.
+                deadline = time.monotonic() + p.wake_timeout_sec
+                while time.monotonic() < deadline and not self._stop.is_set():
+                    if p.is_running:
+                        break
+                    time.sleep(0.3)
+                if not p.is_running:
+                    # Give up — close and let the client retry.
+                    return
+
+            # Connect to backend with a short retry burst: even after
+            # is_running flipped, the game's TCP accept-backlog can
+            # momentarily reject a fresh connection.
+            backend = None
+            last_err: Optional[OSError] = None
+            connect_deadline = time.monotonic() + 8.0
+            while time.monotonic() < connect_deadline and not self._stop.is_set():
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(3.0)
+                    s.connect(("127.0.0.1", p.internal_port))
+                    s.settimeout(None)
+                    backend = s
+                    break
+                except OSError as e:
+                    last_err = e
+                    try:
+                        s.close()
+                    except (OSError, UnboundLocalError):
+                        pass
+                    time.sleep(0.4)
+            if backend is None:
+                print(
+                    f"[wake_proxy] {p.name}: raw-tcp backend connect failed "
+                    f"after retries: {last_err!r}",
+                    file=sys.stderr, flush=True,
+                )
+                return
+
+            with self._lock:
+                p.tcp_extra_conn_count += 1
+            try:
+                conn.setblocking(True)
+                conn.settimeout(None)
+                _tcp_splice(conn, backend)
+            finally:
+                try:
+                    backend.close()
+                except OSError:
+                    pass
+                with self._lock:
+                    p.tcp_extra_conn_count = max(0, p.tcp_extra_conn_count - 1)
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     def _handle_tcp_conn(self, p: _ServerProxy, conn: socket.socket) -> None:
         """Peek at the Minecraft handshake and route to status / login."""
