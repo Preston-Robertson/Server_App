@@ -134,16 +134,16 @@ fi
 _APP_RECIPES: dict[int, dict] = {
     2394010: {  # Palworld dedicated
         "name": "palworld",
-        # ``-log`` makes Unreal print verbose engine output to stdout so
-        # the Console tab surfaces what the game is actually doing (world
-        # load progress, save I/O, module init, hangs). Without it,
-        # Palworld goes silent right after "Running Palworld dedicated
-        # server on :PORT" and any post-boot hang looks like "it's just
-        # stuck" with zero signal. Cost is a chattier console.log — worth
-        # it. Palworld also writes its own log to Pal/Saved/Logs/Pal.log
-        # once -log is set, which persists across restarts and can be
-        # viewed via the Files tab even if console.log gets truncated.
-        "run": "./PalServer.sh -port={port} -useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS -log",
+        # Launch args match LinuxGSM's tested config exactly. We had
+        # been adding ``-port={port}`` and ``-log``, both of which
+        # reasoned to be safe but which we can't rule out as
+        # contributing to the SteamAPI-init hang we've been chasing.
+        # LinuxGSM's version omits both — port comes from
+        # PalWorldSettings.ini (PublicPort= field), and Palworld's
+        # verbose logging works via the config file too. Keep this
+        # aligned with LinuxGSM until we understand why Palworld's
+        # internal Steam Client emulator refuses to complete init.
+        "run": "./PalServer.sh -useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS",
         "saves_rel": "Pal/Saved",
         # HOME pinned to install_dir so Palworld's Steam Runtime state
         # (~/.steam/{sdk32,sdk64,registry.vdf}, ~/Steam/logs/) lands
@@ -495,8 +495,15 @@ def _effective_game_port(sd) -> int:
     return sd.port
 
 
-def _apply_palworld_passwords(install_dir, server_pw: str, admin_pw: str) -> str:
-    """Copy DefaultPalWorldSettings.ini if needed and set the passwords."""
+def _apply_palworld_passwords(install_dir, port: int, server_pw: str, admin_pw: str) -> str:
+    """Copy DefaultPalWorldSettings.ini if needed and set port + passwords.
+
+    Since the Palworld recipe no longer passes ``-port=`` on the command
+    line (it was one variable we couldn't rule out in the SteamAPI-init
+    hang debugging), the port MUST be set here in ``PalWorldSettings.ini``
+    via the ``PublicPort`` field. Palworld reads this to decide what UDP
+    port to bind.
+    """
     default_ini = install_dir / "DefaultPalWorldSettings.ini"
     target_ini = install_dir / "Pal" / "Saved" / "Config" / "LinuxServer" / "PalWorldSettings.ini"
 
@@ -508,35 +515,46 @@ def _apply_palworld_passwords(install_dir, server_pw: str, admin_pw: str) -> str
     else:
         return (
             "WARNING: Palworld DefaultPalWorldSettings.ini not found; "
-            "passwords NOT applied. Complete the install first, then set "
-            "passwords manually in Pal/Saved/Config/LinuxServer/PalWorldSettings.ini."
+            "port + passwords NOT applied. Complete the install first, then set "
+            "them manually in Pal/Saved/Config/LinuxServer/PalWorldSettings.ini."
         )
 
     changed: list[str] = []
 
-    def _set(text: str, key: str, val: str) -> str:
-        # Substitute an existing key=value pair (quoted); leaves other keys
-        # untouched. Palworld quotes even numeric strings so we require the
-        # existing pattern to be `Key="..."`.
+    def _set_quoted(text: str, key: str, val: str) -> str:
+        """Replace ``Key="..."`` — Palworld's quoted string fields."""
         safe = val.replace('"', "'")   # Palworld disallows inline double quotes
         pattern = re.compile(rf'({re.escape(key)}=)"([^"]*)"')
         if not pattern.search(text):
             return text
         return pattern.sub(lambda m: f'{m.group(1)}"{safe}"', text)
 
+    def _set_number(text: str, key: str, val: int) -> str:
+        """Replace ``Key=NNNN`` — Palworld's numeric fields (port, etc)."""
+        pattern = re.compile(rf'({re.escape(key)}=)(\d+)')
+        if not pattern.search(text):
+            return text
+        return pattern.sub(lambda m: f'{m.group(1)}{val}', text)
+
+    # Port — always applied so the server binds where the def says.
+    new_text = _set_number(text, "PublicPort", int(port))
+    if new_text != text:
+        changed.append(f"PublicPort={port}")
+        text = new_text
+
     if server_pw:
-        new_text = _set(text, "ServerPassword", server_pw)
+        new_text = _set_quoted(text, "ServerPassword", server_pw)
         if new_text != text:
             changed.append("ServerPassword")
             text = new_text
     if admin_pw:
-        new_text = _set(text, "AdminPassword", admin_pw)
+        new_text = _set_quoted(text, "AdminPassword", admin_pw)
         if new_text != text:
             changed.append("AdminPassword")
             text = new_text
 
     if not changed:
-        return "NOTE: Palworld password keys not found in settings template; nothing changed."
+        return "NOTE: Palworld config file keys not found; nothing changed."
 
     target_ini.write_text(text, encoding="utf-8")
     return f"Palworld: wrote {target_ini.name} with updated {', '.join(changed)}"
@@ -932,11 +950,17 @@ class SteamCmdHandler(TypeHandler):
         # Per-game injection. Each helper mutates run_cmd (returning the new
         # value) and appends a message describing what it did.
         pw = self.sd.passwords
+        # Palworld always needs a config-file write to set PublicPort, since
+        # the recipe no longer passes -port= on the command line. Run the
+        # helper unconditionally for Palworld — passwords are optional.
+        if self.sd.steam_app_id == 2394010:
+            m = _apply_palworld_passwords(
+                self.install_dir, game_port,
+                pw.server_password, pw.admin_password,
+            )
+            if m: msgs.append(m)
         if pw.server_password or pw.admin_password:
-            if self.sd.steam_app_id == 2394010:
-                m = _apply_palworld_passwords(self.install_dir, pw.server_password, pw.admin_password)
-                if m: msgs.append(m)
-            elif self.sd.steam_app_id in (376030, 2430930):
+            if self.sd.steam_app_id in (376030, 2430930):
                 run_cmd, m = _apply_ark_passwords(run_cmd, pw.server_password, pw.admin_password)
                 if m: msgs.append(m)
             elif self.sd.steam_app_id == 896660:
