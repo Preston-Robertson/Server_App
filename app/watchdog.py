@@ -432,6 +432,18 @@ class _State:
     active_since_ms: Optional[int] = None
     empty_since_ms: Optional[int] = None
     consecutive_probe_fails: int = 0
+    # True the first time we've observed at least one connected player
+    # on this server (players >= 1 in a probe result) since it last went
+    # active. Idle-shutdown never fires until this flips to True — a
+    # freshly-started server with zero players should not be auto-killed
+    # right after boot just because nobody has joined yet. Without this
+    # gate, a Palworld / Satisfactory / etc. server that answers A2S
+    # with players=0 (because Steam-auth is broken or no clients CAN
+    # connect due to a firewall/network issue upstream) gets stopped
+    # every N minutes on a loop the operator can't see the source of —
+    # this bug ate an entire afternoon. See git history for the smoking
+    # gun.
+    ever_saw_player: bool = False
 
 
 # Thresholds for flagging a server as taking unusually long to become
@@ -561,6 +573,21 @@ class Watchdog:
                 continue
 
             if result.players > 0:
+                state.empty_since_ms = None
+                state.ever_saw_player = True
+                continue
+
+            # players == 0. Only start (or continue) the idle-shutdown
+            # countdown if we've observed at least one connected player
+            # at some point during this run. Otherwise, a freshly-booted
+            # server with an idle_shutdown_min set gets auto-killed N
+            # minutes after start every time — even though "0 players
+            # for N minutes since boot" is the NORMAL initial state
+            # while waiting for the first player to connect. This gate
+            # makes idle-shutdown behave the way operators actually
+            # want: "shut down after N min of NO ONE PLAYING", not
+            # "shut down N min after boot no matter what".
+            if not state.ever_saw_player:
                 state.empty_since_ms = None
                 continue
 
