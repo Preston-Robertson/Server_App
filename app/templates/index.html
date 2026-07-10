@@ -261,8 +261,13 @@
                 <span>follow (auto-refresh)</span>
               </label>
               <label>Lines: <input id="console-lines" type="number" value="120" min="10" max="1000" style="width:80px" /></label>
+              <button class="btn btn-tiny btn-ghost" id="diagnose-stuck"
+                title="Read /proc introspection to see EXACTLY where the game process is stuck (wchan, kernel stack, open fds). Use when the card shows 'starting' forever.">
+                Diagnose stuck process
+              </button>
             </div>
             <pre id="console-log-out" class="log-view"></pre>
+            <pre id="diagnose-out" class="log-view" hidden style="border:1px solid #f88; padding:8px;"></pre>
             <div class="row">
               <input id="console-cmd" placeholder="e.g. say hello  |  whitelist add Steve" style="flex:1" />
               <button class="btn btn-primary" id="console-send">Send</button>

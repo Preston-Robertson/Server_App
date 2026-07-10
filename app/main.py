@@ -810,6 +810,175 @@ def api_console(name: str, body: ConsoleBody) -> dict:
     return {"ok": True, "sent": body.command}
 
 
+@app.get("/api/servers/{name}/diagnose", dependencies=[Depends(require_token)])
+def api_diagnose_stuck(name: str) -> dict:
+    """Read /proc introspection for a stuck game process.
+
+    When a server's chip stays "◐ starting" forever, the game is either
+    (a) exited but systemd is restart-looping (n_restarts > 0), (b) doing
+    real work (RAM growing), or (c) blocked on a syscall and going
+    nowhere. Case (c) is the trap: process is alive, no crash, no error —
+    but nothing is happening. This endpoint gives X-ray vision into (c)
+    by reading /proc fields for the game's PID.
+
+    Kernel-provided fields we read:
+      * wchan  — the function the process (main thread) is blocked in.
+                 Names like ``futex_wait_queue_me`` (lock contention),
+                 ``poll_schedule_timeout`` (network/IO wait),
+                 ``io_schedule`` (disk IO), ``sk_wait_data`` (socket
+                 recv). This alone usually names the culprit.
+      * stack  — kernel-space call stack. Frames all the way from the
+                 syscall entry down to the blocking point.
+      * status — State line (R/S/D/Z), VmRSS, thread count. "D" is the
+                 fingerprint of a syscall stuck in the kernel (usually
+                 disk IO or NFS).
+      * open_fds — first ~40 open file descriptors + their targets.
+                   Reveals whether the process is waiting on a specific
+                   file, socket, or pipe.
+      * thread_wchans — same for the first ~15 threads. Palworld has
+                        ~40 threads and the blocking one may not be
+                        the main.
+    """
+    from pathlib import Path
+    sd = registry.load_def(name)
+    try:
+        st = control.status(sd)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"status failed: {e}") from e
+
+    if st.active != "active" or not st.pid:
+        return {
+            "ok": False,
+            "reason": "not-active",
+            "detail": f"unit is {st.active!r}, MainPID={st.pid}. Diagnose is only "
+                      "meaningful when the unit is active — start the server first.",
+            "unit_state": st.active,
+        }
+
+    # start.sh is the MainPID; the actual game is a descendant. Walk
+    # /proc looking for a real game binary under this systemd unit's
+    # cgroup. Falls back to MainPID if we can't find a better one.
+    unit_prefix = f"gamesrv@{sd.name}.service"
+    target_pid = _find_game_pid_under_unit(unit_prefix) or st.pid
+
+    def _read(path: str, default: str = "(unreadable)", limit: int = 8192) -> str:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return f.read(limit)
+        except (OSError, PermissionError) as e:
+            return f"{default}: {e}"
+
+    proc = Path(f"/proc/{target_pid}")
+    if not proc.exists():
+        return {
+            "ok": False,
+            "reason": "pid-gone",
+            "detail": f"PID {target_pid} vanished between status check and diagnose. Try again.",
+        }
+
+    result: dict = {
+        "ok": True,
+        "server": name,
+        "unit_active": st.active,
+        "systemd_main_pid": st.pid,
+        "game_pid": target_pid,
+        "wchan": _read(f"/proc/{target_pid}/wchan", limit=256).strip(),
+        "comm": _read(f"/proc/{target_pid}/comm", limit=64).strip(),
+    }
+
+    status_text = _read(f"/proc/{target_pid}/status", limit=4096)
+    interesting_keys = ("Name:", "State:", "VmRSS:", "VmSize:", "Threads:",
+                        "voluntary_ctxt_switches:", "nonvoluntary_ctxt_switches:")
+    result["status"] = "\n".join(
+        line for line in status_text.splitlines()
+        if any(line.startswith(k) for k in interesting_keys)
+    )
+
+    result["kernel_stack"] = _read(f"/proc/{target_pid}/stack", limit=4096)
+
+    fds_dir = proc / "fd"
+    fds: list[str] = []
+    try:
+        entries = sorted(fds_dir.iterdir(),
+                         key=lambda p: int(p.name) if p.name.isdigit() else 999)
+        for fd in entries[:40]:
+            try:
+                target = str(fd.readlink()) if fd.is_symlink() else "(not a link)"
+            except OSError:
+                target = "(unreadable)"
+            fds.append(f"{fd.name} -> {target}")
+    except OSError as e:
+        fds.append(f"(cannot list fds: {e})")
+    result["open_fds"] = fds
+
+    thread_wchans: list[str] = []
+    try:
+        task_dir = proc / "task"
+        for tid_dir in sorted(task_dir.iterdir())[:15]:
+            wc = _read(f"{tid_dir}/wchan", limit=128).strip()
+            cm = _read(f"{tid_dir}/comm", limit=64).strip()
+            thread_wchans.append(f"tid={tid_dir.name} comm={cm} wchan={wc}")
+    except OSError:
+        pass
+    result["thread_wchans"] = thread_wchans
+
+    wchan = result["wchan"]
+    hint = ""
+    if not wchan or wchan == "0":
+        hint = ("wchan is empty/0 — the process is either RUNNING (not blocked) "
+                "or in a state without a wait channel. If RAM is growing, it's "
+                "working. Check thread_wchans below to see if ANY thread is "
+                "blocked — Palworld has ~40 threads and only one may be stuck.")
+    elif "futex" in wchan:
+        hint = ("Main thread is blocked on a futex (user-space lock). Usually "
+                "waiting for another thread to release a mutex. Look at "
+                "thread_wchans below to find WHICH other thread is stuck.")
+    elif "poll" in wchan or "epoll" in wchan or "select" in wchan:
+        hint = ("Blocked in an event loop waiting for I/O. Check open_fds for a "
+                "socket/pipe. Common for network stalls (Steam login, master "
+                "server registration).")
+    elif "io_schedule" in wchan or "wait_on_page" in wchan:
+        hint = "Blocked on DISK I/O. If any FD is on a slow/NFS mount, that's the cause."
+    elif "sk_wait_data" in wchan or "tcp_recvmsg" in wchan or "udp_recvmsg" in wchan:
+        hint = ("Blocked waiting for network data. Check open_fds for the socket. "
+                "Usually means an outbound service (Steam, Sentry, master server) "
+                "isn't responding.")
+    result["hint"] = hint
+
+    return result
+
+
+def _find_game_pid_under_unit(unit_prefix: str) -> Optional[int]:
+    """Walk /proc looking for a game-ish PID under the given systemd unit.
+
+    Reads /proc/<pid>/cgroup and returns the first PID whose cgroup path
+    contains the systemd unit AND whose comm isn't shell/sleep/tmux (i.e.
+    the actual game binary, not start.sh or its `sleep 1` loop).
+    """
+    from pathlib import Path
+    shell_ish = {"sh", "bash", "sleep", "tmux", "tmux: server", "start.sh"}
+    for pid_dir in Path("/proc").iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        try:
+            cg = (pid_dir / "cgroup").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if unit_prefix not in cg:
+            continue
+        try:
+            comm = (pid_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            comm = ""
+        if comm in shell_ish:
+            continue
+        try:
+            return int(pid_dir.name)
+        except ValueError:
+            continue
+    return None
+
+
 @app.get("/api/servers/{name}/logs", response_class=PlainTextResponse, dependencies=[Depends(require_token)])
 def api_logs(name: str, lines: int = 200) -> str:
     sd = registry.load_def(name)

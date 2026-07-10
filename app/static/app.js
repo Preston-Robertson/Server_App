@@ -1951,6 +1951,48 @@ $("#console-follow")?.addEventListener("change", (ev) => {
   if (ev.target.checked) CONSOLE_TIMER = setInterval(loadConsoleLog, 2000);
 });
 
+// Diagnose stuck process — reads /proc/<PID>/wchan, kernel stack, open fds,
+// per-thread wchans for the game binary under gamesrv@<name>.service. This
+// is the button to press when the card shows "starting" forever and the
+// console output has been silent past "Running ... on :PORT". The kernel
+// tells us EXACTLY which function the process is blocked in.
+$("#diagnose-stuck")?.addEventListener("click", async () => {
+  const out = $("#diagnose-out");
+  out.hidden = false;
+  out.textContent = "reading /proc...";
+  try {
+    const d = await api(`/api/servers/${CURRENT}/diagnose`);
+    if (!d.ok) {
+      out.textContent = `diagnose failed: ${d.reason || "unknown"}\n${d.detail || ""}`;
+      return;
+    }
+    const lines = [
+      `=== Stuck-process diagnosis for ${d.server} ===`,
+      `unit_active:       ${d.unit_active}`,
+      `systemd MainPID:   ${d.systemd_main_pid}`,
+      `game PID:          ${d.game_pid}   (comm: ${d.comm})`,
+      ``,
+      `Main thread wchan: ${d.wchan || "(empty)"}`,
+      `HINT: ${d.hint || "(no hint)"}`,
+      ``,
+      `--- /proc/${d.game_pid}/status (selected fields) ---`,
+      d.status || "(empty)",
+      ``,
+      `--- /proc/${d.game_pid}/stack (kernel call stack) ---`,
+      (d.kernel_stack || "(empty)").trim(),
+      ``,
+      `--- Thread wchans (first ~15) ---`,
+      (d.thread_wchans || []).join("\n") || "(none)",
+      ``,
+      `--- Open file descriptors (first ~40) ---`,
+      (d.open_fds || []).join("\n") || "(none)",
+    ];
+    out.textContent = lines.join("\n");
+  } catch (e) {
+    out.textContent = "diagnose ERROR: " + e.message;
+  }
+});
+
 // Files
 async function listFiles() {
   const area = $("#files-area").value;
