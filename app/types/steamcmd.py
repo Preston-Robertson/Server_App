@@ -134,27 +134,24 @@ fi
 _APP_RECIPES: dict[int, dict] = {
     2394010: {  # Palworld dedicated
         "name": "palworld",
-        # Launch args per the OFFICIAL Pocketpair docs
-        # (https://docs.palworldgame.com/settings-and-operation/arguments):
+        # Launch args match the OFFICIAL Pocketpair Linux docs EXACTLY:
+        # https://docs.palworldgame.com/getting-started/deploy-dedicated-server/
+        # (Linux with SteamCMD tab)
         #
-        #   "-useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS
-        #    In v1.0 and later, leaving this parameter unset may improve
+        # The docs show simply `./PalServer.sh` — no arguments at all.
+        # Port defaults to 8211, controlled by PalWorldSettings.ini if
+        # needed. Passing -useperfthreads / -NoAsyncLoadingThread /
+        # -UseMultithreadForDS is explicitly discouraged on v1.0+ per
+        # https://docs.palworldgame.com/settings-and-operation/arguments:
+        #   "In v1.0 and later, leaving this parameter unset may improve
         #    performance."
-        #
-        # Every existing Linux-Palworld guide on the internet (LinuxGSM,
-        # Docker recipes, VPS howtos) still passes those three because
-        # they were required pre-v1.0 — but they now HURT v1.0+ and are
-        # a suspected cause of the SteamAPI-init hang we spent an
-        # afternoon chasing (main thread in hrtimer_nanosleep loop,
-        # IPC:CSteamEngin blocked in do_epoll_wait forever, world load
-        # never starts, RAM stuck ~1 GB). LinuxGSM reproduces the
-        # identical hang because it ALSO uses those flags — the community
-        # hasn't yet updated to match Pocketpair's post-v1.0 guidance.
-        #
-        # Keep this minimal. -port= sets the listening port (documented
-        # as valid). Additional flags belong per-user in extra_env or
-        # a manual PalServer.sh edit, not baked into the recipe.
-        "run": "./PalServer.sh -port={port}",
+        # Even -port= is skipped by the docs' example — the port comes
+        # from PalWorldSettings.ini defaults (8211). To use a non-default
+        # port, edit PublicPort in the ini via the Files tab. The
+        # manager's _apply_palworld_passwords() already syncs PublicPort
+        # from the server def's `port` field, so the def's port DOES
+        # take effect via the ini path.
+        "run": "./PalServer.sh",
         "saves_rel": "Pal/Saved",
         # HOME pinned to install_dir so Palworld's Steam Runtime state
         # (~/.steam/{sdk32,sdk64,registry.vdf}, ~/Steam/logs/) lands
@@ -910,6 +907,13 @@ class SteamCmdHandler(TypeHandler):
 
         game_port = _effective_game_port(self.sd)
         run_cmd = recipe["run"].format(name=self.sd.name, port=game_port)
+        # Palworld special case: docs show `./PalServer.sh` with no args;
+        # port defaults to 8211. If the operator picked a different port,
+        # we still need to override via `-port=N` (docs list this arg as
+        # valid). Appending it only when non-default keeps the launch
+        # line matching Pocketpair's example verbatim in the common case.
+        if self.sd.steam_app_id == 2394010 and game_port != 8211:
+            run_cmd = f"{run_cmd} -port={game_port}"
         if self.sd.wake_on_demand:
             msgs.append(
                 f"wake-on-demand: game will bind :{game_port} internally; "
