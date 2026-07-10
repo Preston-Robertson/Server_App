@@ -738,8 +738,20 @@ class WakeProxy:
                     p.last_wake_error = f"start failed: {e}"
             return
 
-        # Poll: is the game answering its native protocol on the internal
-        # port? A2S for Steam games, SLP for Minecraft.
+        # Poll: is the game up?
+        #
+        # For TCP wake (Minecraft) we require the SLP probe to return a
+        # positive result before promoting — a JVM that's systemd-active
+        # but hasn't opened its TCP port yet would cause backend.connect()
+        # in _handle_mc_login_wake to fail with ECONNREFUSED.
+        #
+        # For UDP wake (Steam games) many dedicated servers don't answer
+        # the standard A2S_INFO probe on the game port (Satisfactory is
+        # the notable case — Unreal's beacon layer swallows the query).
+        # Trust systemctl-active instead: UDP is stateless so a client
+        # packet forwarded a couple hundred ms before the game's socket
+        # is fully bound gets dropped by the kernel and the client retries
+        # transparently.
         with self._lock:
             p = self._proxies.get(name)
             if not p:
@@ -752,12 +764,21 @@ class WakeProxy:
             time.sleep(_WAKE_PROBE_INTERVAL_SEC)
             if protocol == "tcp":
                 result = probe_mc_slp("127.0.0.1", internal_port, timeout=1.5)
+                if result is not None:
+                    self._promote_running(name)
+                    return
             else:
-                result = probe_a2s("127.0.0.1", internal_port, timeout=1.5)
-            if result is not None:
-                # Game is up — flip is_running + flush buffered packets.
-                self._promote_running(name)
-                return
+                # UDP: check systemctl. Once active, promote immediately.
+                # A2S probe would be a courtesy but for games like
+                # Satisfactory it never succeeds.
+                try:
+                    sd_now = registry.load_def(name)
+                    st = control.status(sd_now)
+                except Exception:
+                    continue
+                if st.active == "active":
+                    self._promote_running(name)
+                    return
 
         # Timed out — abort the wake. Client sees a dropped session and
         # will typically try to reconnect on its own.
@@ -823,19 +844,40 @@ class WakeProxy:
 
         # systemd-active but we haven't promoted yet: the game was started
         # outside our knowledge (operator hit Start, auto-start on boot,
-        # or a manual `systemctl start`). Probe the native protocol before
-        # flipping is_running — a modded Forge server can be systemd-active
-        # for 60-120s of mod loading before it actually binds the port.
-        # If we promoted on ActiveState alone, the next login-wake would
-        # race into a backend.connect() and get ECONNREFUSED, which the
-        # player sees as "Backend unavailable: [Errno 111] Connection
-        # refused" (see the login-disconnect path in _handle_mc_login_wake).
+        # or a manual `systemctl start`).
+        #
+        # Split by protocol here. For TCP (Minecraft) a `backend.connect()`
+        # racing the JVM's boot gives ECONNREFUSED, which the player sees
+        # as "Backend unavailable: [Errno 111] Connection refused" — so we
+        # require an SLP probe to succeed before promoting.
+        #
+        # For UDP (Steam-based games) the situation is inverse: UDP is
+        # stateless, packets sent to a not-yet-ready port are silently
+        # dropped and the client retries, so premature promotion is
+        # harmless. And insisting on an A2S probe here breaks games whose
+        # dedicated servers don't implement `TSource Engine Query` on the
+        # game port — Satisfactory being the canonical case (Unreal treats
+        # each probe as a beacon connection but never replies with A2S_INFO,
+        # so probe_a2s returns None forever and every client packet gets
+        # buffered instead of forwarded). Trust systemctl for UDP.
         if p.protocol == "tcp":
             result = probe_mc_slp("127.0.0.1", p.internal_port, timeout=1.5)
+            if result is not None:
+                p.is_running = True
         else:
-            result = probe_a2s("127.0.0.1", p.internal_port, timeout=1.5)
-        if result is not None:
+            # UDP: trust systemctl-active. Downside is at most a few
+            # dropped client packets during the game's port-bind window,
+            # which the client retries through instantly.
             p.is_running = True
+
+        # If we just promoted and there are packets that arrived while
+        # is_running was False, flush them now so the client's initial
+        # attempt makes it through instead of relying on a retry.
+        if p.is_running and p.buffered:
+            buffered = p.buffered
+            p.buffered = []
+            for addr, data in buffered:
+                self._forward_to_game(p, addr, data, now)
 
     def _prune_idle_clients(self, p: _ServerProxy, now: float) -> None:
         stale = [addr for addr, cm in p.clients.items()

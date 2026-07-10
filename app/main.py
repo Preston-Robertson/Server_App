@@ -39,7 +39,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from . import control, registry, uploads, updater, git_source, env_file, jobs, watchdog, wake_proxy, perf, firewall, steam_profiles
+from . import control, registry, uploads, updater, git_source, git_backup, env_file, jobs, watchdog, wake_proxy, perf, firewall, steam_profiles
 from .auth import require_token
 from .config import settings
 from .types import handler_for
@@ -630,9 +630,11 @@ def _game_log_path(sd) -> Optional[Path]:
     """
     if sd.type in ("minecraft-java", "minecraft-forge"):
         return Path(sd.install_dir) / "logs" / "latest.log"
-    # SteamCMD / custom: many games either don't write a stable log file
-    # or use different names per install. Leaving None means the frontend
-    # falls back to the journal view.
+    # Satisfactory (steam_app_id 1690800) — the Unreal Engine log.
+    if sd.type == "steamcmd" and sd.steam_app_id == 1690800:
+        return Path(sd.install_dir) / "FactoryGame" / "Saved" / "Logs" / "FactoryGame.log"
+    # Other SteamCMD / custom types have no standard log location — the
+    # frontend falls back to the systemd journal view when this returns None.
     return None
 
 
@@ -761,6 +763,31 @@ def api_git_status_get(name: str) -> dict:
 def api_git_clear_cache(name: str) -> dict:
     sd = registry.load_def(name)
     return git_source.clear_cache(sd)
+
+
+# ---------- git backup (push .tgz snapshots to a private git remote) ----------
+
+class GitBackupPushBody(BaseModel):
+    token: str = ""
+
+
+@app.post("/api/servers/{name}/git-backup/push", dependencies=[Depends(require_token)])
+def api_git_backup_push(name: str, body: GitBackupPushBody | None = None) -> dict:
+    """Commit every .tgz snapshot under ``worlds/_backups/<name>/`` and push
+    it to the configured git remote. If ``git_backup.repo_url`` is empty
+    and the provider is GitHub, a private ``gamesrv-backup-<name>`` repo
+    is auto-created under the token owner on the first push.
+
+    Body may include a one-shot ``token`` override for testing new PATs
+    without editing ``/etc/gamesrv.env``; otherwise the manager uses
+    ``git_backup.token_env`` or the ``GAMESRV_GITHUB_TOKEN`` fallback.
+    """
+    sd = registry.load_def(name)
+    override = (body.token if body else "") or None
+    try:
+        return git_backup.push(sd, override_token=override)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 # ---------- backups ----------

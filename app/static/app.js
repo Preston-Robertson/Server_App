@@ -2084,8 +2084,81 @@ async function loadBackups() {
         <td><button class="btn btn-tiny" data-restore="${escape(r.name)}">restore</button></td>`;
       tbody.appendChild(tr);
     }
+    // Populate the git-backup panel from the current def (this endpoint
+    // returns the full ServerDef under .def, including git_backup).
+    await _loadGitBackupPanel();
   } catch (e) { $("#backups-out").textContent = "ERROR: " + e.message; }
 }
+
+async function _loadGitBackupPanel() {
+  if (!CURRENT) return;
+  const r = await api(`/api/servers/${CURRENT}`);
+  const gb = (r.def && r.def.git_backup) || {};
+  $("#gb-enabled").checked = !!gb.enabled;
+  $("#gb-branch").value = gb.branch || "main";
+  $("#gb-repo-url").value = gb.repo_url || "";
+  $("#gb-token-env").value = gb.token_env || "";
+  $("#gb-status").textContent = "";
+
+  const chip = $("#gb-status-chip");
+  if (gb.enabled) {
+    chip.textContent = gb.repo_url ? "enabled" : "enabled · auto-provision on next push";
+    chip.className = "chip chip-accent";
+  } else {
+    chip.textContent = "disabled";
+    chip.className = "chip chip-muted";
+  }
+
+  const last = $("#gb-last-push");
+  if (gb.last_push_at) {
+    last.hidden = false;
+    const shaShort = gb.last_push_sha ? gb.last_push_sha.slice(0, 7) : "?";
+    last.innerHTML = `Last push: <code>${escape(shaShort)}</code> at ${escape(gb.last_push_at)}`;
+  } else {
+    last.hidden = true;
+  }
+}
+
+$("#gb-save")?.addEventListener("click", async () => {
+  if (!CURRENT) return;
+  const statusEl = $("#gb-status");
+  try {
+    const r = await api(`/api/servers/${CURRENT}`);
+    const gb = Object.assign({}, r.def.git_backup || {}, {
+      enabled: $("#gb-enabled").checked,
+      branch: ($("#gb-branch").value || "main").trim(),
+      repo_url: $("#gb-repo-url").value.trim(),
+      token_env: $("#gb-token-env").value.trim(),
+    });
+    const sd = Object.assign({}, r.def, { git_backup: gb });
+    await api("/api/servers", { method: "POST", body: JSON.stringify(sd) });
+    statusEl.textContent = "✓ saved";
+    setTimeout(() => { if (statusEl.textContent === "✓ saved") statusEl.textContent = ""; }, 2000);
+    _loadGitBackupPanel();
+  } catch (e) {
+    statusEl.textContent = "ERROR: " + e.message;
+  }
+});
+
+$("#gb-push")?.addEventListener("click", async () => {
+  if (!CURRENT) return;
+  const statusEl = $("#gb-status");
+  statusEl.textContent = "pushing… (may take a bit on first run)";
+  try {
+    const r = await api(`/api/servers/${CURRENT}/git-backup/push`, {
+      method: "POST", body: JSON.stringify({}),
+    });
+    const parts = [];
+    if (r.auto_created) parts.push("repo auto-created");
+    parts.push(r.committed ? "new snapshot(s) committed" : "no new snapshots");
+    parts.push(`branch=${r.branch}`);
+    if (r.sha) parts.push(`sha=${r.sha.slice(0, 7)}`);
+    statusEl.textContent = "✓ " + parts.join(" · ");
+    _loadGitBackupPanel();
+  } catch (e) {
+    statusEl.textContent = "ERROR: " + e.message;
+  }
+});
 $("#backups-refresh").onclick = loadBackups;
 $("#backup-now").onclick = async () => {
   if (!CURRENT) return;

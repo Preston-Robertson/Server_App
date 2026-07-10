@@ -537,6 +537,44 @@
               <tbody></tbody>
             </table>
             <pre id="backups-out"></pre>
+
+            <hr />
+            <h3 style="margin: 6px 0;">Git backup (offsite)
+              <span id="gb-status-chip" class="chip chip-muted" style="margin-left:8px;">disabled</span>
+            </h3>
+            <p class="small muted">
+              Pushes every <code>.tgz</code> in <code>worlds/_backups/&lt;name&gt;/</code> to a
+              private git repo so a lost LXC can be rebuilt from GitHub. When enabled with an
+              empty <strong>Repo URL</strong> and a GitHub PAT available (via
+              <code>token_env</code> or <code>GAMESRV_GITHUB_TOKEN</code>), the manager creates
+              <code>gamesrv-backup-&lt;name&gt;</code> under the token owner on the first push.
+            </p>
+            <div class="iw-panel">
+              <div class="iw-row">
+                <label class="inline">
+                  <input type="checkbox" id="gb-enabled" />
+                  <span><strong>Enable git backup</strong></span>
+                </label>
+                <label>
+                  <span>Branch</span>
+                  <input type="text" id="gb-branch" placeholder="main" style="width:100px;" />
+                </label>
+                <label style="flex: 1; min-width: 260px;">
+                  <span>Repo URL <em>(empty → auto-create on first push)</em></span>
+                  <input type="text" id="gb-repo-url" placeholder="https://github.com/you/gamesrv-backup-server" style="width:100%;" />
+                </label>
+              </div>
+              <div class="iw-row">
+                <label style="flex: 0 0 220px;">
+                  <span>Token env var <em>(blank = GAMESRV_GITHUB_TOKEN)</em></span>
+                  <input type="text" id="gb-token-env" placeholder="GAMESRV_GITHUB_TOKEN" style="width:100%;" />
+                </label>
+                <button class="btn btn-tiny btn-primary" id="gb-save">Save settings</button>
+                <button class="btn btn-tiny" id="gb-push" title="Commit + push every .tgz right now">Push now</button>
+                <span id="gb-status" class="small muted"></span>
+              </div>
+              <p class="small muted" id="gb-last-push" hidden></p>
+            </div>
           </div>
 
           <div class="subtab-body" data-body="def" hidden>

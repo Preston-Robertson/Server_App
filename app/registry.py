@@ -80,6 +80,40 @@ class GitSourceCfg(BaseModel):
     deployed_at: str = ""               # ISO timestamp
 
 
+class GitBackupCfg(BaseModel):
+    """Optional git remote for pushing local ``worlds/_backups/<name>/`` snapshots.
+
+    Complements local ``.tgz`` backups: after each backup, the operator can
+    push the .tgz(s) to a private git repo for offsite retention. When
+    ``enabled`` is true and ``repo_url`` is empty on the first push, the
+    manager auto-creates a private GitHub repo named ``gamesrv-backup-<name>``
+    under the token owner (requires ``token_env`` set to a PAT with the
+    ``repo`` scope, or ``GAMESRV_GITHUB_TOKEN`` in the env file).
+
+    Designed so the ``repo_url`` field can later point at a self-hosted
+    Gitea/Forgejo (host of your choice) — the auto-create path only runs
+    when ``repo_url`` is blank AND ``provider == "github"``.
+    """
+    enabled: bool = False
+    repo_url: str = ""                  # https://host/user/repo(.git); blank = auto-create
+    branch: str = "main"
+    token_env: str = ""                 # env var with a git PAT; blank = GAMESRV_GITHUB_TOKEN
+    provider: str = "github"            # only "github" today; "gitea"/"forgejo" later
+    # Populated by the manager on first successful auto-create so subsequent
+    # pushes reuse the same repo without re-hitting the create API.
+    provisioned_at: str = ""
+    last_push_at: str = ""
+    last_push_sha: str = ""
+
+    @field_validator("provider")
+    @classmethod
+    def _valid_provider(cls, v: str) -> str:
+        allowed = {"github", "gitea", "forgejo"}
+        if v not in allowed:
+            raise ValueError(f"git_backup.provider must be one of {sorted(allowed)}")
+        return v
+
+
 class AccessCfg(BaseModel):
     """Per-server access control.
 
@@ -206,6 +240,7 @@ class ServerDef(BaseModel):
     rcon: RconCfg = Field(default_factory=RconCfg)
     backup: BackupCfg = Field(default_factory=BackupCfg)
     git_source: GitSourceCfg = Field(default_factory=GitSourceCfg)
+    git_backup: GitBackupCfg = Field(default_factory=GitBackupCfg)
     access: AccessCfg = Field(default_factory=AccessCfg)
     firewall: FirewallCfg = Field(default_factory=FirewallCfg)
     passwords: PasswordsCfg = Field(default_factory=PasswordsCfg)
