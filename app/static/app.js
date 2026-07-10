@@ -44,6 +44,11 @@ function showPage(name) {
       // Only load these if we have a token — otherwise the calls 401 loudly.
       loadRuntimeInfo();
       loadEnvEditor();
+      // Auto-run the network diagnostic so operators see "likely blocked
+      // upstream" verdicts without having to click Refresh — the whole
+      // point is that the Admin page is where you go when a server is
+      // misbehaving, so surface the diagnosis immediately.
+      loadNetworkDiagnostics();
     }
     if ($("#follow-update-log").checked) startFollowUpdateLog();
   }
@@ -224,6 +229,86 @@ $("#check-health").onclick = async () => {
     badge.className = "muted err";
   }
 };
+
+// ---------- Network diagnostics (host firewall / bridge-nf) ----------
+// Detects the specific failure mode where a game server is bound locally
+// and healthy but LAN clients can't reach it — usually because the
+// Proxmox host's bridge-nf-call-iptables is dropping the packets. See
+// scripts/proxmox-host-fix.sh for the one-shot host-side fix.
+async function loadNetworkDiagnostics() {
+  const summaryChip = $("#netdiag-summary");
+  const results = $("#netdiag-results");
+  const hostFix = $("#netdiag-hostfix");
+  summaryChip.textContent = "checking…";
+  summaryChip.className = "chip chip-warn";
+  results.innerHTML = "";
+  hostFix.hidden = true;
+  try {
+    const d = await api("/api/diagnostics/network");
+    if (!d.servers || d.servers.length === 0) {
+      summaryChip.textContent = "no servers to check";
+      summaryChip.className = "chip chip-muted";
+      results.innerHTML = "<p class='muted small'>Create a server first, then re-run the check.</p>";
+      return;
+    }
+    let unreachableCount = 0;
+    const rows = d.servers.map((s) => {
+      const flagged = s.looks_externally_unreachable;
+      if (flagged) unreachableCount++;
+      const secStr = s.starting_sec ? `${Math.floor(s.starting_sec / 60)}m ${s.starting_sec % 60}s` : "-";
+      const recvStr = s.recv_q == null ? "n/a" : `${s.recv_q} B`;
+      const cls = flagged
+        ? "chip-err"
+        : (s.ready ? "chip-ok" : (s.active === "active" ? "chip-warn" : "chip-muted"));
+      const label = flagged
+        ? "⚠ likely blocked upstream"
+        : (s.ready ? "✔ probe OK" : (s.active === "active" ? "◐ still starting" : "○ not running"));
+      return `
+        <tr>
+          <td><code>${s.name}</code></td>
+          <td><code>:${s.port}</code></td>
+          <td>${s.active}</td>
+          <td>${secStr}</td>
+          <td>${recvStr}</td>
+          <td><span class="chip ${cls}">${label}</span></td>
+        </tr>`;
+    }).join("");
+    results.innerHTML = `
+      <table class="kv" style="width:100%;">
+        <thead>
+          <tr>
+            <th style="text-align:left;">Server</th>
+            <th style="text-align:left;">Port</th>
+            <th style="text-align:left;">Active</th>
+            <th style="text-align:left;">Starting for</th>
+            <th style="text-align:left;">Recv-Q</th>
+            <th style="text-align:left;">Verdict</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <p class="small muted" style="margin-top:8px;">
+        <strong>Recv-Q</strong> is the number of bytes queued on the game's UDP socket
+        waiting to be read. If it's 0 while the server has been "starting" for &gt;5 minutes,
+        that means no packets are arriving on the port — which is diagnostic of a block
+        upstream of the LXC (Proxmox host firewall, bridge iptables, or the client's
+        outbound firewall).
+      </p>`;
+    if (unreachableCount > 0) {
+      summaryChip.textContent = `${unreachableCount} likely blocked upstream`;
+      summaryChip.className = "chip chip-err";
+      hostFix.hidden = false;
+    } else {
+      summaryChip.textContent = "all clear";
+      summaryChip.className = "chip chip-ok";
+    }
+  } catch (e) {
+    summaryChip.textContent = "check failed";
+    summaryChip.className = "chip chip-err";
+    results.innerHTML = `<p class='form-error'>${e.message}</p>`;
+  }
+}
+$("#netdiag-refresh")?.addEventListener("click", loadNetworkDiagnostics);
 
 // ---------- Runtime widget ----------
 

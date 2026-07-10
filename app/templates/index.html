@@ -710,6 +710,40 @@
           </div>
         </div>
       </article>
+
+      <article class="widget">
+        <header class="widget-header">
+          <h2>Network Diagnostics</h2>
+          <span class="chip chip-muted" id="netdiag-summary">not run</span>
+        </header>
+        <div class="widget-body">
+          <p class="muted">
+            Runs a "server bound locally but nothing arriving from the LAN"
+            check on every configured server. This catches the class of
+            failure where the Proxmox HOST's firewall or bridge-nf-call-iptables
+            silently drops UDP packets on the way to the LXC — a state the
+            manager itself can't fix, because it lives inside the container.
+            When flagged, the fix is a one-shot script you run on the
+            Proxmox host, not the LXC.
+          </p>
+          <div class="row" style="margin-bottom:8px;">
+            <button class="btn" id="netdiag-refresh">Run check</button>
+          </div>
+          <div id="netdiag-results"></div>
+          <div id="netdiag-hostfix" class="form-error" hidden style="margin-top:10px;">
+            <strong>One or more servers look externally unreachable.</strong>
+            The manager runs inside the LXC and can't touch host-level
+            networking. Fix on the Proxmox HOST (SSH into the host, NOT this
+            container):
+            <pre style="margin:8px 0 0;background:#0004;padding:8px;border-radius:4px;">sudo bash /opt/gamesrv/scripts/proxmox-host-fix.sh</pre>
+            <p class="small muted" style="margin:6px 0 0;">
+              (If <code>/opt/gamesrv</code> isn't mounted on the host, copy
+              <code>scripts/proxmox-host-fix.sh</code> from this repo to the
+              Proxmox host and run it there.)
+            </p>
+          </div>
+        </div>
+      </article>
     </div>
 
     <!-- ============================== FILE EDITOR MODAL ============================== -->

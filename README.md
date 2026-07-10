@@ -106,7 +106,26 @@ IP, and (recommended) a TrueNAS bind mount at `/opt/gamesrv/worlds` so saves
 land on ZFS-snapshot-protected storage. See the plan §12 handoff and the Bot
 Manager runbook for the `pct create` + fstab recipe.
 
-Inside the LXC, as root:
+### Step 0 — one-time Proxmox HOST setup
+
+Run this ONCE on the **Proxmox VE host** (not inside the LXC). Skip it and
+game clients on the LAN will silently fail to reach your servers even
+though the ports are open in UFW and the game process is bound — because
+Proxmox's default `bridge-nf-call-iptables=1` routes bridge-forwarded UDP
+through the host's iptables filter, and pve-firewall (or a stray host
+rule) drops it there.
+
+```bash
+# On the Proxmox HOST, from a clone of this repo:
+sudo bash scripts/proxmox-host-fix.sh
+```
+
+The script is idempotent and reports what it changed. If you skipped it
+and are already seeing "server bound but LAN can't connect", the
+manager's **Admin → Network Diagnostics** panel will flag this exact
+state and point you at the same script.
+
+### Step 1 — inside the LXC, as root
 
 ```bash
 # 1. Clone the app into /opt/gamesrv

@@ -459,6 +459,128 @@ def api_firewall_snapshot() -> dict:
     return firewall.snapshot()
 
 
+@app.get("/api/diagnostics/network", dependencies=[Depends(require_token)])
+def api_diagnostics_network() -> dict:
+    """Detect the "server bound locally but unreachable from LAN" failure mode.
+
+    The manager runs INSIDE an unprivileged LXC, so it can't fix — or even
+    directly see — the Proxmox HOST's firewall / bridge-nf-call-iptables
+    config that most often eats UDP packets. What it CAN see is a
+    fingerprint that only matches this scenario:
+
+      * A server has been in systemd ``active`` state for >5 min AND
+      * its readiness probe (A2S/SLP/HTTPS) has never succeeded, AND
+      * the game socket has Recv-Q == 0 in ``ss`` (nothing has arrived
+        on the port to be read).
+
+    That combination is diagnostic of "packets never reached the LXC",
+    which points at the host firewall / bridge-nf. Any OTHER failure
+    mode (game crashed, wrong port, config broken) would either flip
+    the systemd state to failed OR would show packets queuing in
+    Recv-Q as the game reads them and drops.
+
+    Returns per-server flags so the UI can highlight the ones that
+    look externally-unreachable and point the operator at
+    ``scripts/proxmox-host-fix.sh``.
+    """
+    from .watchdog import watchdog as _wd
+    wd_snap = _wd.snapshot()
+    sockets = _read_udp_socket_recv_q()
+
+    results = []
+    for sd in registry.list_defs():
+        try:
+            st = control.status(sd)
+        except Exception:
+            continue
+        wd = wd_snap.get(sd.name, {})
+        probe_supported = watchdog.probe_supported(sd)
+        starting_sec = int(wd.get("starting_sec") or 0)
+        ready = bool(wd.get("ready"))
+
+        # Recv-Q on the game's primary port. If we can't see the port,
+        # we skip the diagnostic (custom types / unknown ports).
+        recv_q = sockets.get(int(sd.port))
+
+        # "Externally unreachable" fingerprint. All three must hold:
+        looks_unreachable = (
+            st.active == "active"
+            and probe_supported
+            and not ready
+            and starting_sec >= 5 * 60
+            and recv_q == 0
+        )
+
+        results.append({
+            "name": sd.name,
+            "port": int(sd.port),
+            "active": st.active,
+            "ready": ready,
+            "starting_sec": starting_sec,
+            "recv_q": recv_q,
+            "looks_externally_unreachable": looks_unreachable,
+        })
+
+    return {
+        "servers": results,
+        # Static, single source of truth for the fix instructions the
+        # UI can render as a copy-paste block.
+        "host_fix_script": "scripts/proxmox-host-fix.sh",
+        "host_fix_hint": (
+            "SSH into the Proxmox VE host (NOT this LXC) and run: "
+            "sudo bash /opt/gamesrv/scripts/proxmox-host-fix.sh — "
+            "the manager can't touch host firewall/bridge settings from "
+            "inside an unprivileged container."
+        ),
+    }
+
+
+def _read_udp_socket_recv_q() -> dict[int, int]:
+    """Parse /proc/net/udp{,6} for our own veth's UDP sockets.
+
+    Returns ``{local_port: recv_q_bytes}`` for every UDP socket bound on
+    the local host (any interface). Used by
+    ``api_diagnostics_network`` to detect the "port bound but nothing
+    arriving" fingerprint.
+
+    Format reference: kernel exposes hex-encoded fields. Column 5 is
+    ``rx_queue:tx_queue`` (bytes queued to be read : bytes queued to be
+    written). We only care about rx_queue.
+    """
+    out: dict[int, int] = {}
+    for path in ("/proc/net/udp", "/proc/net/udp6"):
+        try:
+            with open(path, encoding="ascii") as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        # Skip header row.
+        for line in lines[1:]:
+            fields = line.split()
+            if len(fields) < 5:
+                continue
+            # local_address is HEX_IP:HEX_PORT — we only need the port.
+            local = fields[1]
+            if ":" not in local:
+                continue
+            try:
+                port = int(local.split(":", 1)[1], 16)
+            except ValueError:
+                continue
+            queues = fields[4]
+            try:
+                rx_hex = queues.split(":", 1)[0]
+                rx = int(rx_hex, 16)
+            except (ValueError, IndexError):
+                continue
+            # If the same port shows up in both udp and udp6, prefer the
+            # larger recv-q so a single lively socket wins over an idle one.
+            prev = out.get(port)
+            if prev is None or rx > prev:
+                out[port] = rx
+    return out
+
+
 # ---------- steam profiles (address book of steamID64 → display name) ----------
 
 class SteamProfileBody(BaseModel):
