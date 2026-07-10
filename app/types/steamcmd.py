@@ -57,7 +57,7 @@ if [[ -f console.log ]] && [[ $(stat -c%s console.log 2>/dev/null || echo 0) -gt
   tail -c 2000000 console.log > console.log.tmp && mv console.log.tmp console.log
 fi
 # Marker so the operator can find where THIS launch begins in the log.
-{ echo ""; echo "===== $(date -Iseconds) start.sh launching (session $SESSION) ====="; } >> console.log
+{{ echo ""; echo "===== $(date -Iseconds) start.sh launching (session $SESSION) ====="; }} >> console.log
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
