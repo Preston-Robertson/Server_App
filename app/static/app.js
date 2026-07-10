@@ -85,9 +85,23 @@ function fmtDur(s) {
 function fmtTime(ts) { return ts ? new Date(ts * 1000).toLocaleString() : "-"; }
 
 // Map systemd ActiveState to a chip class + friendly label.
-function stateChip(active, sub) {
+//
+// When the systemd unit is `active` but the manager has a game-specific
+// readiness probe (Steam A2S / Minecraft SLP / Satisfactory HTTPS API)
+// AND that probe hasn't succeeded yet since the server started, we show
+// a "starting" chip instead of "running" — the game process is up but
+// still loading the world and is NOT yet accepting client connections.
+// This closes the "the dashboard says running but the client times out"
+// UX gap on games with multi-minute world-load times (Satisfactory
+// especially).
+function stateChip(active, sub, ready, probeSupported) {
   const s = (active || "unknown").toLowerCase();
-  if (s === "active")     return { cls: "chip-ok",    label: `● ${sub || "running"}` };
+  if (s === "active") {
+    if (probeSupported && !ready) {
+      return { cls: "chip-warn", label: "◐ starting" };
+    }
+    return { cls: "chip-ok", label: `● ${sub || "running"}` };
+  }
   if (s === "activating") return { cls: "chip-warn",  label: `◐ ${sub || "starting"}` };
   if (s === "deactivating") return { cls: "chip-warn", label: `◑ ${sub || "stopping"}` };
   if (s === "failed")     return { cls: "chip-err",   label: `✕ failed` };
@@ -890,7 +904,12 @@ function renderServerGrid(rows) {
 
   for (const r of rows) {
     const d = r.def, s = r.status;
-    const chip = stateChip(s.active, s.sub);
+    const wd = r.watchdog;
+    // Ready = the readiness probe has succeeded at least once since the
+    // server went active. If the game type has no supported probe we
+    // trust systemd and treat "active" as ready.
+    const ready = !s.probe_supported || !!(wd && wd.ready);
+    const chip = stateChip(s.active, s.sub, ready, !!s.probe_supported);
 
     // RAM % of the cap.
     const capBytes = (d.memory_mb || 0) * 1024 * 1024;
@@ -918,10 +937,11 @@ function renderServerGrid(rows) {
 
     // Watchdog / idle-shutdown chip (only when server is running and
     // idle_shutdown_min is set). Shows current player count and, if empty,
-    // the countdown to auto-shutdown.
+    // the countdown to auto-shutdown. Suppressed while the server is
+    // still starting — the "◐ starting" badge already tells the operator
+    // there's no player data yet.
     let idleChip = "";
-    const wd = r.watchdog;
-    if (d.idle_shutdown_min && s.active === "active" && wd) {
+    if (d.idle_shutdown_min && s.active === "active" && wd && ready) {
       const pl = wd.players;
       if (pl == null || !wd.probe_ok) {
         idleChip = `<span class="chip" title="Waiting for A2S/SLP probe response">👥 —</span>`;

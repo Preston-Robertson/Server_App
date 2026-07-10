@@ -40,7 +40,7 @@ from typing import Optional
 from . import control, registry
 
 
-WATCHDOG_INTERVAL_SEC = 60
+WATCHDOG_INTERVAL_SEC = 15
 PROBE_TIMEOUT_SEC = 3.0
 
 # Steam apps that use the game port (not 27015) for their query response.
@@ -357,6 +357,22 @@ def _probe_for(sd) -> Optional[ProbeResult]:
     return None
 
 
+def probe_supported(sd) -> bool:
+    """True when the manager knows how to probe this server for readiness
+    (world loaded + accepting connections). Used by the dashboard to show
+    a 'starting' badge while systemd says active but the game is still
+    loading the world.
+
+    Custom-type servers and generic steamcmd installs without a known
+    query strategy return False — the dashboard falls back to 'running'
+    the moment systemd flips the service to active."""
+    if sd.type in ("minecraft-java", "minecraft-forge"):
+        return True
+    if sd.type == "steamcmd":
+        return bool(getattr(sd, "steam_app_id", None))
+    return False
+
+
 # ---------- watchdog thread --------------------------------------------
 
 @dataclass
@@ -364,6 +380,12 @@ class _State:
     last_players: Optional[int] = None
     last_max: Optional[int] = None
     last_probe_ok: bool = False
+    # First wall-clock ms at which the probe succeeded since the server
+    # last went active. Populated on the first successful probe and reset
+    # to None whenever the systemd unit stops. Used purely for the "ready"
+    # signal on the dashboard — the idle-shutdown countdown is driven by
+    # empty_since_ms, not this field.
+    first_ready_ms: Optional[int] = None
     empty_since_ms: Optional[int] = None
     consecutive_probe_fails: int = 0
 
@@ -386,6 +408,7 @@ class Watchdog:
                     "players": s.last_players,
                     "max_players": s.last_max,
                     "probe_ok": s.last_probe_ok,
+                    "ready": s.first_ready_ms is not None,
                     "empty_sec": empty_ms // 1000,
                 }
             return out
@@ -417,20 +440,21 @@ class Watchdog:
     def _tick(self) -> None:
         now_ms = int(time.time() * 1000)
         for sd in registry.list_defs():
-            # Skip if no idle policy — but also purge any stale state so
-            # snapshots stay clean.
-            if not sd.idle_shutdown_min or sd.idle_shutdown_min <= 0:
-                with self._lock:
-                    self._states.pop(sd.name, None)
-                continue
-
             try:
                 st = control.status(sd)
             except Exception:
                 continue
             if st.active != "active":
-                # Server not running — clear its state so the timer starts
-                # fresh once it comes back up.
+                # Server not running — clear its state so the "starting"
+                # signal and the empty-since timer both start fresh once
+                # it comes back up.
+                with self._lock:
+                    self._states.pop(sd.name, None)
+                continue
+
+            # Servers with no supported probe strategy get no state — the
+            # dashboard falls back to systemd "active" == running.
+            if not probe_supported(sd):
                 with self._lock:
                     self._states.pop(sd.name, None)
                 continue
@@ -448,6 +472,17 @@ class Watchdog:
             state.last_probe_ok = True
             state.last_players = result.players
             state.last_max = result.max_players
+            if state.first_ready_ms is None:
+                # First successful probe since this server went active —
+                # the world has finished loading and the game is accepting
+                # connections. This flips the dashboard from "starting" to
+                # "running".
+                state.first_ready_ms = now_ms
+
+            # Idle-shutdown countdown only runs when configured.
+            if not sd.idle_shutdown_min or sd.idle_shutdown_min <= 0:
+                state.empty_since_ms = None
+                continue
 
             if result.players > 0:
                 state.empty_since_ms = None

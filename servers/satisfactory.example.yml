@@ -6,6 +6,16 @@
 # Default port (Update 8 / 1.0+): 7777/UDP for both game traffic AND query.
 # The old separate 15000 / 15777 ports are no longer used.
 #
+# WAN / router port-forwarding (required for friends outside your LAN):
+#   * UDP + TCP  <port>  → LXC IP:<port>   — game traffic + Server API
+#   * TCP        8888    → LXC IP:8888     — reliable messaging (FIXED,
+#                                            not configurable in-game)
+# Missing the 8888 forward manifests as: friend loads into the world for
+# a few seconds, then gets "Your connection to the host has been lost"
+# with `LogReliableMessaging: Handshake ... timed out` in the server log.
+# The manager auto-opens 8888/tcp in UFW on the LXC; the router forward
+# is on you.
+#
 # Migrating an existing world:
 #   1. Install (this file + Control -> Install).
 #   2. Start once, then Stop \u2014 the game creates world_dir/SaveGames/server/.
