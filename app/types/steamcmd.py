@@ -502,6 +502,29 @@ def _apply_palworld_passwords(install_dir, port: int, server_pw: str, admin_pw: 
             return text
         return pattern.sub(lambda m: f'{m.group(1)}{val}', text)
 
+    def _set_bool(text: str, key: str, val: bool) -> str:
+        """Replace ``Key=True|False`` — Palworld's boolean fields (no quotes)."""
+        pattern = re.compile(rf'({re.escape(key)}=)(True|False)')
+        if not pattern.search(text):
+            return text
+        return pattern.sub(lambda m: f'{m.group(1)}{"True" if val else "False"}', text)
+
+    # bIsMultiplay MUST be True for a dedicated server. Palworld's
+    # DefaultPalWorldSettings.ini ships with bIsMultiplay=False (the
+    # single-player default). If left at False on a dedicated server,
+    # some Palworld builds fail to fully initialize the multiplayer
+    # subsystem — game process starts, binds sockets, prints "Running
+    # Palworld dedicated server on :PORT", then hangs waiting for a
+    # local client (that never arrives on a headless server). Main
+    # thread sits in hrtimer_nanosleep polling, RAM stuck ~1 GB, world
+    # load never triggers. This was undiagnosed for hours before we
+    # spotted it by comparing the shipped ini defaults against known-
+    # working configs.
+    new_text = _set_bool(text, "bIsMultiplay", True)
+    if new_text != text:
+        changed.append("bIsMultiplay=True")
+        text = new_text
+
     # Port — always applied so the server binds where the def says.
     new_text = _set_number(text, "PublicPort", int(port))
     if new_text != text:
