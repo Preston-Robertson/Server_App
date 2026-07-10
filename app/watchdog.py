@@ -27,8 +27,10 @@ Design notes:
 """
 from __future__ import annotations
 
+import http.client
 import json
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -44,6 +46,12 @@ PROBE_TIMEOUT_SEC = 3.0
 # Steam apps that use the game port (not 27015) for their query response.
 # Satisfactory (Update 8+) is the only one we know about today.
 _SINGLE_PORT_STEAM_APPS = {1690800}   # Satisfactory
+
+# Steam apps that do NOT expose a working A2S_INFO responder and must be
+# probed via a game-specific channel instead. Satisfactory implements the
+# Steam query protocol only partially (the player count byte is unreliable
+# and often reads 0) so we route it through the vendor HTTPS API instead.
+_SATISFACTORY_APPS = {1690800}
 
 
 # ---------- A2S_INFO probe (Steam) --------------------------------------
@@ -168,6 +176,135 @@ def probe_mc_slp(host: str, port: int, timeout: float = PROBE_TIMEOUT_SEC) -> Op
         return None
 
 
+# ---------- Satisfactory HTTPS API probe --------------------------------
+
+# Satisfactory ships its own management API (HTTPS + self-signed cert) on
+# the game's TCP port. It exposes ``QueryServerState`` which returns real
+# player counts — the A2S responder built into the game is unreliable and
+# usually reports 0/0 even with players connected, so we skip it entirely
+# for this game.
+#
+# Auth model:
+#   * ``QueryServerState`` requires a bearer token with at least ``Client``
+#     privilege.
+#   * ``PasswordlessLogin`` with ``MinimumPrivilegeLevel: Client`` returns
+#     a client token anonymously **only when the server does not require a
+#     join password**. Servers with a Guest/Client password will 401 that
+#     call and require ``PasswordLogin`` with the admin password.
+#   * ``PasswordLogin`` with the admin password + ``Administrator`` level
+#     always works (Administrator is a superset of Client).
+#
+# We cache the token in-process so the 60 s tick isn't three round trips.
+# On 401 we drop the cache entry and re-login on the next tick.
+#
+# TLS: the dedicated server generates a self-signed cert on first run.
+# We disable verification because we're probing 127.0.0.1 — same trust
+# domain as the manager itself.
+_sf_token_cache: dict[tuple[str, int], str] = {}
+_sf_tls_ctx: Optional[ssl.SSLContext] = None
+
+
+def _sf_ssl_context() -> ssl.SSLContext:
+    global _sf_tls_ctx
+    if _sf_tls_ctx is None:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        _sf_tls_ctx = ctx
+    return _sf_tls_ctx
+
+
+def _sf_api(host: str, port: int, body: dict, token: Optional[str],
+            timeout: float) -> Optional[dict]:
+    """POST to /api/v1 and return the parsed JSON body, or None on any
+    HTTP/parse error. 401 also returns None so callers can retry after
+    re-authenticating."""
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        conn = http.client.HTTPSConnection(
+            host, port, timeout=timeout, context=_sf_ssl_context()
+        )
+        try:
+            conn.request("POST", "/api/v1", json.dumps(body), headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+            if resp.status != 200:
+                return None
+            return json.loads(raw.decode("utf-8", "replace"))
+        finally:
+            conn.close()
+    except (OSError, socket.timeout, ssl.SSLError, ValueError,
+            json.JSONDecodeError, http.client.HTTPException):
+        return None
+
+
+def _sf_login(host: str, port: int, admin_password: str,
+              timeout: float) -> Optional[str]:
+    """Return an auth token or None. Prefers admin login if the operator
+    put the password in the server def (needed for password-protected
+    servers); otherwise falls back to anonymous Client login."""
+    if admin_password:
+        body = {
+            "function": "PasswordLogin",
+            "data": {
+                "MinimumPrivilegeLevel": "Administrator",
+                "Password": admin_password,
+            },
+        }
+        j = _sf_api(host, port, body, None, timeout)
+        tok = (j or {}).get("data", {}).get("authenticationToken")
+        if tok:
+            return tok
+    # Fall through: try passwordless Client (works for open servers).
+    body = {
+        "function": "PasswordlessLogin",
+        "data": {"MinimumPrivilegeLevel": "Client"},
+    }
+    j = _sf_api(host, port, body, None, timeout)
+    return (j or {}).get("data", {}).get("authenticationToken")
+
+
+def probe_satisfactory_https(host: str, port: int, admin_password: str = "",
+                              timeout: float = PROBE_TIMEOUT_SEC) -> Optional[ProbeResult]:
+    """Query player count via the Satisfactory Server API.
+
+    Returns None on any failure — including "no admin password configured
+    AND server won't accept anonymous Client login". In that case the
+    operator needs to set ``passwords.admin_password`` in the server YAML."""
+    key = (host, port)
+    for attempt in range(2):
+        token = _sf_token_cache.get(key)
+        if not token:
+            token = _sf_login(host, port, admin_password, timeout)
+            if not token:
+                return None
+            _sf_token_cache[key] = token
+
+        j = _sf_api(
+            host, port,
+            {"function": "QueryServerState"},
+            token, timeout,
+        )
+        if j is None:
+            # 401 or transport error — drop the token and retry once.
+            _sf_token_cache.pop(key, None)
+            if attempt == 0:
+                continue
+            return None
+
+        state = (j.get("data", {}) or {}).get("serverGameState", {}) or {}
+        try:
+            return ProbeResult(
+                players=int(state.get("numConnectedPlayers", 0) or 0),
+                max_players=int(state.get("playerLimit", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 # ---------- probe strategy per server type -----------------------------
 
 # Must stay in sync with wake_proxy.WAKE_INTERNAL_OFFSET. Kept as a local
@@ -193,6 +330,19 @@ def _probe_for(sd) -> Optional[ProbeResult]:
     if sd.type == "steamcmd":
         if not sd.steam_app_id:
             return None
+        # Satisfactory: A2S is broken (always reports 0 players). Route to
+        # the HTTPS Server API instead. The API listens on the same TCP
+        # port as the game; wake-on-demand remaps that to the internal
+        # port just like the UDP game socket.
+        if sd.steam_app_id in _SATISFACTORY_APPS:
+            api_port = sd.port
+            if getattr(sd, "wake_on_demand", False):
+                api_port = sd.port + _WAKE_INTERNAL_OFFSET
+            admin_pw = ""
+            pw_cfg = getattr(sd, "passwords", None)
+            if pw_cfg is not None:
+                admin_pw = getattr(pw_cfg, "admin_password", "") or ""
+            return probe_satisfactory_https(host, api_port, admin_pw)
         query_port = sd.port if sd.steam_app_id in _SINGLE_PORT_STEAM_APPS else 27015
         # Single-port Steam games (Satisfactory) share the game socket with
         # A2S — remap to the internal port when wake is on.

@@ -93,6 +93,26 @@ _APP_RECIPES: dict[int, dict] = {
         "saves_rel": "Pal/Saved",
     },
     1690800: {  # Satisfactory dedicated
+        # Post-1.0 quirks (learned the hard way — see
+        # docs/SATISFACTORY_NOTES.md and this class's install() hook):
+        #   * Server needs THREE ports: game UDP + HTTPS API TCP on
+        #     ``sd.port`` (both), PLUS a fixed TCP 8888 for reliable
+        #     messaging (save/asset streaming when clients join).
+        #     firewall.py's _extra_ports_for() opens all three.
+        #   * Direct-Connect ("Join Game") always fails with
+        #     "Encryption token missing" — the client MUST use Server
+        #     Manager to auth first and receive a session token.
+        #   * SM caches per-(IP, PORT) key. If a bad connection ever
+        #     wedges the client's state machine, changing the server port
+        #     (e.g. 7777 → 15777) gives a fresh cache key and often
+        #     unsticks it — we've seen this in the field.
+        #   * The old AutoLoadSessionName ini directive is largely a
+        #     no-op in 1.0+; server always boots into DedicatedserverEntry
+        #     until Server Manager (or the HTTPS API's LoadGame call)
+        #     tells it what to load.
+        #   * Bootstrap via curl works (PasswordlessLogin → ClaimServer
+        #     → LoadGame). See docs/SATISFACTORY_NOTES.md for the exact
+        #     sequence.
         "name": "satisfactory",
         "run": "./FactoryServer.sh -Port={port} -log -unattended",
         # HOME is pinned so Epic/FactoryGame/Saved lands inside install_dir,

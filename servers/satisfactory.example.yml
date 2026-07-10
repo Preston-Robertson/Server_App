@@ -30,3 +30,13 @@ rcon:
   enabled: false
 backup:
   enabled: true
+# Satisfactory's built-in Steam A2S responder is unreliable (usually
+# reports 0 players even with clients connected), so the manager polls the
+# HTTPS Server API instead. QueryServerState needs at least a Client-level
+# token: on OPEN servers (no client password) it authenticates anonymously
+# and you can leave `admin_password` blank; on password-protected servers
+# the operator must paste the in-game Server Manager admin password here
+# so the watchdog + dashboard can read the real player count.
+passwords:
+  server_password: ""
+  admin_password: ""             # required for accurate player count on password-protected servers

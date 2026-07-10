@@ -63,6 +63,27 @@ def _proto_for(sd) -> str:
     return "udp"
 
 
+def _extra_ports_for(sd) -> list[tuple[int, str, str]]:
+    """Return additional (port, proto, tag) rules a game needs beyond its
+    primary port. Satisfactory is the current case: game UDP + Server API
+    TCP on the same port, plus a fixed TCP:8888 for reliable messaging
+    (world/save streaming when players join).
+
+    Kept as a table so adding another dual-protocol Steam game later is
+    a one-line addition.
+    """
+    if sd.type == "steamcmd" and getattr(sd, "steam_app_id", None) == 1690800:
+        # Satisfactory 1.0+:
+        #   UDP <port>  — game traffic (primary; handled by _proto_for)
+        #   TCP <port>  — HTTPS Server API (Server Manager uses this)
+        #   TCP 8888    — Reliable messaging (save streaming during joins)
+        return [
+            (int(sd.port), "tcp", "satisfactory-api"),
+            (8888, "tcp", "satisfactory-reliable"),
+        ]
+    return []
+
+
 # `ufw status numbered` line examples we need to parse:
 #   [ 3] 25565/tcp                  ALLOW IN    Anywhere       # gamesrv-auto:foo:public
 #   [ 4] 25565/tcp (v6)             ALLOW IN    Anywhere (v6)  # gamesrv-auto:foo:public
@@ -151,29 +172,39 @@ def reconcile_server(sd) -> dict:
     allow_ips = list(fw.allow_ips) if (fw and fw.allow_ips) else []
     port = int(sd.port)
     proto = _proto_for(sd)
+    extras = _extra_ports_for(sd)
 
     with _RECONCILE_LOCK:
         _delete_managed_for(sd.name)
 
-        added = 0
-        if mode == "public":
-            if _add_rule(sd.name, port, proto, None, "public"):
-                added += 1
-        elif mode == "allowlist":
-            # LAN always included so the operator can't lock themselves out.
-            if _add_rule(sd.name, port, proto, LAN_CIDR, "lan"):
-                added += 1
-            for ip in allow_ips:
-                if _add_rule(sd.name, port, proto, ip, f"allow:{ip}"):
-                    added += 1
-        else:  # "lan" — default
-            if _add_rule(sd.name, port, proto, LAN_CIDR, "lan"):
-                added += 1
+        # Every port the game uses — primary first, then per-game extras
+        # (Satisfactory needs TCP:port + TCP:8888 in addition to UDP:port).
+        # All extras use the same mode/source rules as the primary.
+        all_ports = [(port, proto, "primary")] + [(p, pr, t) for (p, pr, t) in extras]
 
+        added = 0
+        for (p, pr, t) in all_ports:
+            if mode == "public":
+                if _add_rule(sd.name, p, pr, None, f"public:{t}"):
+                    added += 1
+            elif mode == "allowlist":
+                # LAN always included so the operator can't lock themselves out.
+                if _add_rule(sd.name, p, pr, LAN_CIDR, f"lan:{t}"):
+                    added += 1
+                for ip in allow_ips:
+                    if _add_rule(sd.name, p, pr, ip, f"allow:{t}:{ip}"):
+                        added += 1
+            else:  # "lan" — default
+                if _add_rule(sd.name, p, pr, LAN_CIDR, f"lan:{t}"):
+                    added += 1
+
+    port_summary = f"{port}/{proto}"
+    if extras:
+        port_summary += "+" + ",".join(f"{p}/{pr}" for (p, pr, _) in extras)
     result.update(
         ok=True,
         rules_added=added,
-        detail=f"mode={mode} port={port}/{proto} rules={added}",
+        detail=f"mode={mode} ports={port_summary} rules={added}",
     )
     return result
 

@@ -53,8 +53,12 @@ class PasswordsCfg(BaseModel):
                     `&`, `"`, `'`, spaces.
       * Valheim   — server_password → `-password "..."` (admin_password ignored;
                     Valheim uses `adminlist.txt` steamID64s instead).
-      * Satisfactory / Minecraft / Enshrouded — passwords fields are
-        ignored (those games negotiate admin secrets differently).
+      * Satisfactory — `server_password` is ignored (set via in-game Server
+        Manager); `admin_password` is read by the idle-shutdown watchdog to
+        call the HTTPS Server API for the real player count (required on
+        password-protected servers, optional on open ones).
+      * Minecraft / Enshrouded — passwords fields are ignored (those games
+        negotiate admin secrets differently).
     """
     server_password: str = ""
     admin_password: str = ""
