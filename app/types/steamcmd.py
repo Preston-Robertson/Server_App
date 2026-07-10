@@ -136,15 +136,20 @@ _APP_RECIPES: dict[int, dict] = {
         "name": "palworld",
         "run": "./PalServer.sh -port={port} -useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS",
         "saves_rel": "Pal/Saved",
-        # Pin HOME so Palworld's Steam layer looks for
-        # $HOME/.steam/sdk64/steamclient.so inside install_dir, where the
-        # post-install hook (_apply_palworld_steamsdk) creates it. Without
-        # this pin HOME would be /home/gamesrv (per /etc/passwd) — which
-        # a) may not exist on unprivileged LXCs with a tmpfs /home, and
-        # b) survives reinstalls, so a stale .steam dir there causes
-        # confusing state drift. Keeping runtime state under install_dir
-        # matches the pattern we already use for Satisfactory.
-        "env": {"HOME": "{install_dir}"},
+        # NO env overrides. An earlier version of this recipe pinned
+        # HOME=install_dir alongside a post-install hook that symlinked
+        # $HOME/.steam/sdk64/steamclient.so → Pal/Binaries/Linux/steamclient.so
+        # in an attempt to fix [S_API FAIL] messages. That symlink is a
+        # circular reference: Palworld's local steamclient.so, when
+        # searching for the "real" one, finds the symlink pointing back
+        # at itself. Steam networking init then hangs — the game process
+        # stays alive at ~800 MB RAM (engine loaded, sockets bound) but
+        # never finishes SteamAPI_Init, so world load never starts.
+        # Symptom: card shows "starting" forever, RAM never grows past
+        # first-boot value, no crash, no exit. The [S_API FAIL] messages
+        # appear on EVERY Palworld dedicated server on Linux — they're
+        # printed by Palworld's telemetry racing with SteamAPI_Init and
+        # are functionally harmless. Do NOT try to "fix" them again.
     },
     1690800: {  # Satisfactory dedicated
         # Post-1.0 quirks (learned the hard way — see
@@ -1003,105 +1008,22 @@ def _apply_post_install_config(sd, install_dir, world_dir) -> list[str]:
     """Idempotent per-game config writer. Runs after every install/configure.
 
     Dispatches by ``sd.steam_app_id`` to per-game helpers:
-      * Palworld (2394010) — creates the ``.steam/sdk64/steamclient.so``
-        symlink Palworld's SteamAPI needs (else Steam networking silently
-        degrades and clients can't join).
       * Satisfactory (1690800) — writes ``AutoLoadSessionName`` pointing
         at the newest ``.sav`` under ``world_dir``.
+      * (Palworld had a helper here that created a symlink at
+        ``$HOME/.steam/sdk64/steamclient.so`` in an attempt to fix the
+        ``[S_API FAIL]`` messages. That symlink was a CIRCULAR REFERENCE
+        that made the game hang after "Running Palworld dedicated server
+        on :8211" — engine loaded, sockets bound, ~800 MB RAM, world load
+        never starts. Removed. The [S_API FAIL] messages appear on every
+        Palworld Linux dedicated server and are functionally harmless.)
 
     Kept as a single dispatch function so future games can slot in without
     touching the main install() path.
     """
-    if sd.steam_app_id == 2394010:
-        return _apply_palworld_steamsdk(install_dir)
     if sd.steam_app_id == 1690800:
         return _apply_satisfactory_autoload(sd, install_dir, world_dir)
     return []
-
-
-def _apply_palworld_steamsdk(install_dir) -> list[str]:
-    """Fix Palworld's [S_API FAIL] on SteamUser021 / SteamFriends017 / etc.
-
-    Palworld's dedicated server loads its LOCAL ``steamclient.so`` from
-    ``Pal/Binaries/Linux/`` (that part logs as ``SteamAPI_Init(): Loaded
-    local 'steamclient.so' OK``), but its Steam interface init separately
-    looks for ``$HOME/.steam/sdk64/steamclient.so``. When that file is
-    missing Steam networking never fully initialises — the game process
-    stays up and binds :8211/:27015, but:
-      * A2S queries queue on :27015 without ever being read (visible as a
-        growing Recv-Q in ``ss -lnup``).
-      * Client sessions time out because Palworld authenticates them via
-        Steam GameNetworkingSockets, which needs those interfaces.
-
-    None of this is documented in Palworld's official notes; it's
-    community folklore. The manager now sets it up unconditionally so
-    ``Install → Start`` works out of the box.
-
-    Requires the Palworld recipe to pin ``HOME`` to ``install_dir`` so
-    ``$HOME/.steam/sdk64`` lands somewhere gamesrv can write to (and
-    where the file survives reinstalls without polluting /home/gamesrv).
-    """
-    from pathlib import Path
-    sdk_dir = Path(install_dir) / ".steam" / "sdk64"
-    link = sdk_dir / "steamclient.so"
-    target = Path(install_dir) / "Pal" / "Binaries" / "Linux" / "steamclient.so"
-
-    if not target.exists():
-        return [
-            "post-install (Palworld): expected steamclient.so at "
-            f"{target} but it's missing — the SteamCMD download may be "
-            "incomplete. Re-run Install."
-        ]
-
-    try:
-        sdk_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        return [
-            f"WARNING: could not create {sdk_dir} for Palworld SteamAPI "
-            f"symlink ({e}). Steam networking may fail with [S_API FAIL] "
-            "on client connect. Fix: chown -R gamesrv:gamesrv on install_dir."
-        ]
-
-    # Idempotent: if link exists and points at the right file, leave it.
-    if link.is_symlink() or link.exists():
-        try:
-            current_target = Path(os.readlink(link)) if link.is_symlink() else link.resolve()
-        except OSError:
-            current_target = None
-        if current_target == target:
-            return [
-                f"post-install (Palworld): .steam/sdk64/steamclient.so already "
-                f"points at {target.name} — Steam networking OK"
-            ]
-        # Wrong target — replace.
-        try:
-            link.unlink()
-        except OSError:
-            pass
-
-    try:
-        link.symlink_to(target)
-    except OSError as e:
-        # Fall back to a copy if symlink is disallowed (rare — some
-        # filesystems / bind mounts refuse symlinks). A copy works too,
-        # it just won't auto-update if the game's steamclient.so changes.
-        try:
-            import shutil as _shutil
-            _shutil.copy2(target, link)
-            return [
-                f"post-install (Palworld): copied steamclient.so → {link} "
-                f"(symlink failed: {e})"
-            ]
-        except OSError as e2:
-            return [
-                f"WARNING: could not install Palworld SteamAPI shim ({e2}). "
-                "Steam networking may fail with [S_API FAIL] on client connect."
-            ]
-
-    return [
-        f"post-install (Palworld): linked {link} → {target.name} "
-        "(fixes [S_API FAIL] SteamUser021 / clients-can't-connect)"
-    ]
 
 
 def _apply_satisfactory_autoload(sd, install_dir, world_dir) -> list[str]:
