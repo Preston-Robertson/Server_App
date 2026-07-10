@@ -145,20 +145,15 @@ _APP_RECIPES: dict[int, dict] = {
         # viewed via the Files tab even if console.log gets truncated.
         "run": "./PalServer.sh -port={port} -useperfthreads -NoAsyncLoadingThread -UseMultithreadForDS -log",
         "saves_rel": "Pal/Saved",
-        # NO env overrides. An earlier version of this recipe pinned
-        # HOME=install_dir alongside a post-install hook that symlinked
-        # $HOME/.steam/sdk64/steamclient.so → Pal/Binaries/Linux/steamclient.so
-        # in an attempt to fix [S_API FAIL] messages. That symlink is a
-        # circular reference: Palworld's local steamclient.so, when
-        # searching for the "real" one, finds the symlink pointing back
-        # at itself. Steam networking init then hangs — the game process
-        # stays alive at ~800 MB RAM (engine loaded, sockets bound) but
-        # never finishes SteamAPI_Init, so world load never starts.
-        # Symptom: card shows "starting" forever, RAM never grows past
-        # first-boot value, no crash, no exit. The [S_API FAIL] messages
-        # appear on EVERY Palworld dedicated server on Linux — they're
-        # printed by Palworld's telemetry racing with SteamAPI_Init and
-        # are functionally harmless. Do NOT try to "fix" them again.
+        # Pin HOME to install_dir so Palworld's Steam Runtime state
+        # (~/.steam/{sdk32,sdk64,registry.vdf}, ~/Steam/logs/) lands
+        # somewhere gamesrv definitely owns and survives reinstalls
+        # cleanly. Without this, HOME defaults to gamesrv's shell home
+        # (/home/gamesrv per /etc/passwd) which is not always writable
+        # on tmpfs'd LXCs and pollutes /home across servers. The
+        # post-install hook _apply_palworld_steam_runtime populates the
+        # required Steamworks SDK shim files under this pinned HOME.
+        "env": {"HOME": "{install_dir}"},
     },
     1690800: {  # Satisfactory dedicated
         # Post-1.0 quirks (learned the hard way — see
@@ -1017,22 +1012,182 @@ def _apply_post_install_config(sd, install_dir, world_dir) -> list[str]:
     """Idempotent per-game config writer. Runs after every install/configure.
 
     Dispatches by ``sd.steam_app_id`` to per-game helpers:
+      * Palworld (2394010) — populate ``$HOME/.steam/sdk{32,64}/`` with
+        real Steam runtime libraries so ``SteamAPI_Init()`` completes
+        instead of spinning forever waiting for a Steam Client that
+        doesn't exist.
       * Satisfactory (1690800) — writes ``AutoLoadSessionName`` pointing
         at the newest ``.sav`` under ``world_dir``.
-      * (Palworld had a helper here that created a symlink at
-        ``$HOME/.steam/sdk64/steamclient.so`` in an attempt to fix the
-        ``[S_API FAIL]`` messages. That symlink was a CIRCULAR REFERENCE
-        that made the game hang after "Running Palworld dedicated server
-        on :8211" — engine loaded, sockets bound, ~800 MB RAM, world load
-        never starts. Removed. The [S_API FAIL] messages appear on every
-        Palworld Linux dedicated server and are functionally harmless.)
 
     Kept as a single dispatch function so future games can slot in without
     touching the main install() path.
     """
+    if sd.steam_app_id == 2394010:
+        return _apply_palworld_steam_runtime(install_dir)
     if sd.steam_app_id == 1690800:
         return _apply_satisfactory_autoload(sd, install_dir, world_dir)
     return []
+
+
+def _apply_palworld_steam_runtime(install_dir) -> list[str]:
+    """Set up the Steam Runtime shim files Palworld's SteamAPI needs.
+
+    THE HANG THIS FIXES (evidenced by /proc/PID/wchan diagnostics):
+
+      Palworld's ``SteamAPI_Init()`` succeeds partially (loads its LOCAL
+      ``Pal/Binaries/Linux/steamclient.so``), then starts the
+      ``IPC:CSteamEngin`` thread which uses ``/dev/shm/u999-ValveIPCSharedObj-Steam``
+      to talk to a running Steam Client. On a dedicated server host with
+      no Steam Client installed, that IPC thread blocks in ``epoll_wait``
+      forever waiting for messages that never come.
+
+      Meanwhile Palworld's main thread sits in ``hrtimer_nanosleep``
+      polling SteamAPI status every few ms. Neither side ever completes,
+      neither side crashes, no error is printed. The card shows
+      "◐ starting" forever, RAM sits at 800 MB - 1 GB (engine loaded,
+      world load never starts), and there's no signal in any log about
+      what's wrong.
+
+    THE FIX:
+
+      Populate ``$HOME/.steam/sdk64/steamclient.so`` (and sdk32 for
+      completeness) with a REAL Steam Runtime library — the one that
+      SteamCMD installs when it initialises its own state. This is what
+      LinuxGSM, official Palworld VPS guides, and every working
+      Palworld-on-Linux setup does. The library's "server mode" fallback
+      code path detects that no Steam Client is running and completes
+      init WITHOUT trying to talk to one.
+
+      CRITICAL: the symlink target MUST be a SteamCMD-provided
+      ``steamclient.so``, NOT the game's own
+      ``Pal/Binaries/Linux/steamclient.so``. Pointing at the game's local
+      copy creates a circular reference — the library's fallback logic
+      finds the "real" library at ``$HOME/.steam/sdk64/steamclient.so``,
+      follows the symlink, and finds itself. That was a bug in an
+      earlier iteration of this helper; do NOT reintroduce it.
+
+    Requires the Palworld recipe to pin ``HOME`` to ``install_dir`` so
+    ``$HOME/.steam/`` lands under install_dir (writable by gamesrv,
+    scoped per-server, no /home/gamesrv pollution).
+    """
+    from pathlib import Path
+    import shutil as _shutil
+
+    install_dir = Path(install_dir)
+
+    # Find a SteamCMD-provided steamclient.so to symlink to. Order of
+    # preference — SteamCMD's runtime cache first (freshest), then the
+    # copy Palworld ships in linux64/ (which is the same library, just
+    # installed to a different path by Palworld's SteamCMD invocation).
+    # We DO NOT accept Pal/Binaries/Linux/steamclient.so as a target
+    # because that's the server-mode shim library and self-referential
+    # from an sdk64/ symlink.
+    sdk64_candidates = [
+        install_dir / ".local" / "share" / "Steam" / "steamcmd" / "linux64" / "steamclient.so",
+        install_dir / "linux64" / "steamclient.so",
+    ]
+    sdk32_candidates = [
+        install_dir / ".local" / "share" / "Steam" / "steamcmd" / "linux32" / "steamclient.so",
+        install_dir / "linux32" / "steamclient.so",
+    ]
+
+    def _pick_target(candidates: list[Path]) -> Path | None:
+        for c in candidates:
+            if c.exists() and c.is_file():
+                return c
+        return None
+
+    target64 = _pick_target(sdk64_candidates)
+    target32 = _pick_target(sdk32_candidates)
+
+    msgs: list[str] = []
+
+    if target64 is None:
+        msgs.append(
+            "WARNING (Palworld): could not find any SteamCMD-provided "
+            f"steamclient.so under {install_dir}. Palworld will hang at "
+            "SteamAPI_Init. Re-run Install so SteamCMD populates its runtime cache."
+        )
+        return msgs
+
+    def _install_symlink(sdk_dir_name: str, target: Path | None, arch: str) -> None:
+        if target is None:
+            msgs.append(f"NOTE (Palworld): no {arch} steamclient.so found — skipping .steam/{sdk_dir_name}/")
+            return
+        sdk_dir = install_dir / ".steam" / sdk_dir_name
+        try:
+            sdk_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            msgs.append(
+                f"WARNING (Palworld): could not create {sdk_dir} ({e}). "
+                "Steam runtime may fail — fix ownership on install_dir."
+            )
+            return
+
+        link = sdk_dir / "steamclient.so"
+        # Reject reinstating a circular symlink from any earlier bad state.
+        BANNED_TARGETS = {
+            install_dir / "Pal" / "Binaries" / "Linux" / "steamclient.so",
+        }
+        if target in BANNED_TARGETS:
+            msgs.append(
+                f"WARNING (Palworld): refused to symlink {link} at {target} — "
+                "that's the game's own server-mode shim and creates a circular "
+                "reference. Skipping — Install needs to re-run SteamCMD."
+            )
+            return
+
+        # Idempotent: if link exists and already points at the right file,
+        # leave it. Otherwise replace with the fresh target.
+        try:
+            if link.is_symlink() or link.exists():
+                current = link.resolve(strict=False)
+                if current == target.resolve(strict=False):
+                    msgs.append(
+                        f"post-install (Palworld): .steam/{sdk_dir_name}/steamclient.so "
+                        f"already points at {target.name} — Steam runtime OK"
+                    )
+                    return
+                try:
+                    link.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+        try:
+            link.symlink_to(target)
+            msgs.append(
+                f"post-install (Palworld): linked .steam/{sdk_dir_name}/steamclient.so "
+                f"-> {target.relative_to(install_dir)} (fixes SteamAPI_Init hang)"
+            )
+        except OSError as e:
+            # Fall back to a copy if symlink is disallowed (rare on
+            # unpriv LXCs). Copy has the same effect at load time.
+            try:
+                _shutil.copy2(target, link)
+                msgs.append(
+                    f"post-install (Palworld): copied {target.name} → "
+                    f".steam/{sdk_dir_name}/ (symlink failed: {e})"
+                )
+            except OSError as e2:
+                msgs.append(
+                    f"WARNING (Palworld): could not install Steam runtime shim ({e2}). "
+                    "Game will hang at SteamAPI_Init."
+                )
+
+    _install_symlink("sdk64", target64, "64-bit")
+    _install_symlink("sdk32", target32, "32-bit")
+
+    # Some Palworld builds also check for $HOME/.steam/steam/. Create an
+    # empty directory so any getcwd/stat check succeeds without the
+    # heavy state a real Steam Client would put there. Best effort.
+    try:
+        (install_dir / ".steam" / "steam").mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    return msgs
 
 
 def _apply_satisfactory_autoload(sd, install_dir, world_dir) -> list[str]:
