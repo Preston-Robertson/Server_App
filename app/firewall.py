@@ -245,3 +245,47 @@ def snapshot() -> dict:
     for num, comment in _current_managed_rules():
         result["managed_rules"].append({"rule": num, "comment": comment})
     return result
+
+
+def port_allowed(port: int, proto: str) -> Optional[bool]:
+    """Best-effort: does the LXC's OWN ufw permit ``<port>/<proto>`` inbound?
+
+    This is what the network diagnostic must check BEFORE ever pointing the
+    operator at the Proxmox host: an "unreachable" game whose port the
+    container's own firewall is dropping is a MANAGER-side problem we can
+    fix (reconcile), not a host one.
+
+    Returns:
+      * ``True``  — ufw is active AND an ALLOW rule matches the port
+                    (either ``<port>/<proto>`` or a bare ``<port>``).
+      * ``False`` — ufw is active/enabled but NO allow rule matches — the
+                    container firewall itself is the block.
+      * ``None``  — can't tell: ufw not installed, status unreadable, or
+                    ufw inactive (so it isn't filtering anything at all).
+    """
+    if not _ufw_available():
+        return None
+    try:
+        r = _run_ufw(["status"])
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    text = r.stdout or ""
+    # ufw inactive => it filters nothing => it cannot be the block.
+    if re.search(r"^Status:\s+inactive", text, re.IGNORECASE | re.MULTILINE):
+        return None
+    port_s = str(int(port))
+    for line in text.splitlines():
+        up = line.upper()
+        if "ALLOW" not in up or "DENY" in up or "REJECT" in up:
+            continue
+        # The "To" column (everything left of ALLOW) holds the port spec,
+        # e.g. "8211/udp", "8211", "8211/tcp (v6)", "25565".
+        left = up.split("ALLOW", 1)[0]
+        m = re.search(r"(?<![\d.])" + re.escape(port_s) + r"(?:/(TCP|UDP))?(?![\d.])", left)
+        if m:
+            rule_proto = m.group(1)
+            if rule_proto is None or rule_proto.lower() == proto.lower():
+                return True
+    return False

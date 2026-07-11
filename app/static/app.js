@@ -271,26 +271,41 @@ async function loadNetworkDiagnostics() {
       results.innerHTML = "<p class='muted small'>Create a server first, then re-run the check.</p>";
       return;
     }
-    let unreachableCount = 0;
+    let upstreamCount = 0;
+    let ufwBlockCount = 0;
+    const verdictFor = (s) => {
+      switch (s.cause) {
+        case "lxc-ufw-blocking":
+          return { cls: "chip-err", label: "⛔ LXC firewall blocking (fixable here)" };
+        case "bound-but-no-traffic":
+          return { cls: "chip-warn", label: "⚠ bound, no traffic — game or host" };
+        case "game-not-bound":
+          return { cls: "chip-warn", label: "◐ game not bound — run Diagnose" };
+        default:
+          return s.ready
+            ? { cls: "chip-ok", label: "✔ probe OK" }
+            : (s.active === "active"
+                ? { cls: "chip-warn", label: "◐ still starting" }
+                : { cls: "chip-muted", label: "○ not running" });
+      }
+    };
     const rows = d.servers.map((s) => {
-      const flagged = s.looks_externally_unreachable;
-      if (flagged) unreachableCount++;
+      if (s.cause === "lxc-ufw-blocking") ufwBlockCount++;
+      else if (s.cause === "bound-but-no-traffic") upstreamCount++;
       const secStr = s.starting_sec ? `${Math.floor(s.starting_sec / 60)}m ${s.starting_sec % 60}s` : "-";
       const recvStr = s.recv_q == null ? "n/a" : `${s.recv_q} B`;
-      const cls = flagged
-        ? "chip-err"
-        : (s.ready ? "chip-ok" : (s.active === "active" ? "chip-warn" : "chip-muted"));
-      const label = flagged
-        ? "⚠ likely blocked upstream"
-        : (s.ready ? "✔ probe OK" : (s.active === "active" ? "◐ still starting" : "○ not running"));
+      const ufwStr = s.lxc_ufw_allows === true ? "✔ allow"
+        : (s.lxc_ufw_allows === false ? "⛔ closed" : "n/a");
+      const v = verdictFor(s);
       return `
         <tr>
           <td><code>${s.name}</code></td>
-          <td><code>:${s.port}</code></td>
+          <td><code>:${s.port}/${s.proto || "?"}</code></td>
           <td>${s.active}</td>
           <td>${secStr}</td>
           <td>${recvStr}</td>
-          <td><span class="chip ${cls}">${label}</span></td>
+          <td>${ufwStr}</td>
+          <td><span class="chip ${v.cls}">${v.label}</span></td>
         </tr>`;
     }).join("");
     results.innerHTML = `
@@ -302,25 +317,43 @@ async function loadNetworkDiagnostics() {
             <th style="text-align:left;">Active</th>
             <th style="text-align:left;">Starting for</th>
             <th style="text-align:left;">Recv-Q</th>
+            <th style="text-align:left;">LXC ufw</th>
             <th style="text-align:left;">Verdict</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
       </table>
       <p class="small muted" style="margin-top:8px;">
-        <strong>Recv-Q</strong> is the number of bytes queued on the game's UDP socket
-        waiting to be read. If it's 0 while the server has been "starting" for &gt;5 minutes,
-        that means no packets are arriving on the port — which is diagnostic of a block
-        upstream of the LXC (Proxmox host firewall, bridge iptables, or the client's
-        outbound firewall).
+        Checks are ordered manager-first: <strong>LXC ufw</strong> shows whether this
+        container's own firewall permits the port — a <code>⛔ closed</code> there IS the
+        block and is fixable right here (Re-apply firewall rules). Only when the socket is
+        bound AND ufw allows it AND nothing is arriving (<strong>Recv-Q</strong> 0) is an
+        upstream drop (Proxmox host bridge-nf) even possible — and a still-loading game looks
+        the same from inside the LXC, so run <strong>Diagnose</strong> before touching the host.
       </p>`;
-    if (unreachableCount > 0) {
-      summaryChip.textContent = `${unreachableCount} likely blocked upstream`;
+    if (ufwBlockCount > 0) {
+      summaryChip.textContent = `${ufwBlockCount} blocked by LXC firewall`;
       summaryChip.className = "chip chip-err";
+      // Manager-fixable: offer a reconcile button instead of host surgery.
+      hostFix.hidden = true;
+      results.innerHTML += `
+        <div class="netdiag-selffix" style="margin-top:10px;padding:10px;border:1px solid #b4506a;border-radius:6px;">
+          <strong>This container's own firewall (ufw) is dropping a game port.</strong>
+          That's a manager-side block — re-apply the rules right here (no host access needed):
+          <div style="margin-top:8px;">
+            <button class="btn btn-small" id="netdiag-reconcile">Re-apply firewall rules</button>
+            <span id="netdiag-reconcile-out" class="small muted"></span>
+          </div>
+        </div>`;
+      $("#netdiag-reconcile")?.addEventListener("click", reconcileFirewall);
+    } else if (upstreamCount > 0) {
+      summaryChip.textContent = `${upstreamCount} bound but no traffic`;
+      summaryChip.className = "chip chip-warn";
       hostFix.hidden = false;
     } else {
       summaryChip.textContent = "all clear";
       summaryChip.className = "chip chip-ok";
+      hostFix.hidden = true;
     }
   } catch (e) {
     summaryChip.textContent = "check failed";
@@ -329,6 +362,25 @@ async function loadNetworkDiagnostics() {
   }
 }
 $("#netdiag-refresh")?.addEventListener("click", loadNetworkDiagnostics);
+
+// Manager-side fix for the "LXC ufw is dropping the game port" cause: re-run
+// the firewall reconcile (idempotent) and re-check. No host access required.
+async function reconcileFirewall() {
+  const out = $("#netdiag-reconcile-out");
+  const btn = $("#netdiag-reconcile");
+  if (btn) btn.disabled = true;
+  if (out) out.textContent = "re-applying\u2026";
+  try {
+    const r = await api("/api/diagnostics/network/reconcile", { method: "POST" });
+    const added = (r.results || []).reduce((n, x) => n + (x.rules_added || 0), 0);
+    if (out) out.textContent = r.ok ? `done \u2014 ${added} rule(s) applied. Re-checking\u2026` : `failed: ${r.detail || "?"}`;
+    setTimeout(loadNetworkDiagnostics, 800);
+  } catch (e) {
+    if (out) out.textContent = `failed: ${e.message}`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
 
 // keyctl syscall availability check. Palworld and other Steam-session-auth
 // games hang silently if keyctl is blocked by the LXC's syscall filter.

@@ -659,27 +659,25 @@ def _world_dir_mount_info(world_dir) -> dict:
 
 @app.get("/api/diagnostics/network", dependencies=[Depends(require_token)])
 def api_diagnostics_network() -> dict:
-    """Detect the "server bound locally but unreachable from LAN" failure mode.
+    """Classify why a bound game server is unreachable — checking the layers
+    the manager OWNS before ever pointing at the Proxmox host.
 
-    The manager runs INSIDE an unprivileged LXC, so it can't fix — or even
-    directly see — the Proxmox HOST's firewall / bridge-nf-call-iptables
-    config that most often eats UDP packets. What it CAN see is a
-    fingerprint that only matches this scenario:
+    Earlier this endpoint jumped straight to "packets never reached the LXC =>
+    fix the host firewall" purely because the game's UDP Recv-Q was 0. That is
+    a false positive: Recv-Q 0 is ALSO the normal idle state (no client is
+    sending right now) AND what you see when the GAME itself never finished
+    world-load (so it isn't answering). Blaming the host for a stuck game is
+    exactly the wrong steer.
 
-      * A server has been in systemd ``active`` state for >5 min AND
-      * its readiness probe (A2S/SLP/HTTPS) has never succeeded, AND
-      * the game socket has Recv-Q == 0 in ``ss`` (nothing has arrived
-        on the port to be read).
-
-    That combination is diagnostic of "packets never reached the LXC",
-    which points at the host firewall / bridge-nf. Any OTHER failure
-    mode (game crashed, wrong port, config broken) would either flip
-    the systemd state to failed OR would show packets queuing in
-    Recv-Q as the game reads them and drops.
-
-    Returns per-server flags so the UI can highlight the ones that
-    look externally-unreachable and point the operator at
-    ``scripts/proxmox-host-fix.sh``.
+    New order of checks (manager-owned first):
+      1. Is the game's socket even bound? If not, it's still starting / hung
+         in world-load — NOT a network block (run Diagnose instead).
+      2. Does the LXC's OWN ufw permit <port>/<proto>? If not, the container
+         firewall is the block — manager-fixable via reconcile.
+      3. Only if the socket is bound AND our ufw permits it AND nothing is
+         arriving do we mention a possible upstream (host bridge-nf) drop —
+         and even then we hedge, because a world-load hang looks identical
+         from in here.
     """
     from .watchdog import watchdog as _wd
     wd_snap = _wd.snapshot()
@@ -696,27 +694,55 @@ def api_diagnostics_network() -> dict:
         starting_sec = int(wd.get("starting_sec") or 0)
         ready = bool(wd.get("ready"))
 
-        # Recv-Q on the game's primary port. If we can't see the port,
-        # we skip the diagnostic (custom types / unknown ports).
+        proto = firewall._proto_for(sd)
+        # Recv-Q on the game's primary port; also tells us whether the socket
+        # is bound at all (a port absent from /proc/net/udp isn't bound yet).
         recv_q = sockets.get(int(sd.port))
+        port_bound = recv_q is not None
+        # Does the CONTAINER's own firewall permit this port? Checked before
+        # any host suggestion so we never send the operator host-side for a
+        # block we put in place ourselves.
+        ufw_allows = firewall.port_allowed(int(sd.port), proto)
 
-        # "Externally unreachable" fingerprint. All three must hold:
-        looks_unreachable = (
+        active_stuck = (
             st.active == "active"
             and probe_supported
             and not ready
             and starting_sec >= 5 * 60
-            and recv_q == 0
         )
+
+        cause = None
+        if active_stuck:
+            if not port_bound:
+                # Socket never bound => still starting or hung in world-load.
+                # This is NOT a network block — the single biggest false
+                # positive this endpoint used to emit.
+                cause = "game-not-bound"
+            elif ufw_allows is False:
+                # Our OWN ufw is dropping the port. Manager-fixable.
+                cause = "lxc-ufw-blocking"
+            elif recv_q == 0:
+                # Bound + our firewall permits it (or ufw is off) + nothing
+                # queued. Could be a world-load hang OR a genuine upstream
+                # drop — indistinguishable from inside the LXC, so hedge.
+                cause = "bound-but-no-traffic"
 
         results.append({
             "name": sd.name,
             "port": int(sd.port),
+            "proto": proto,
             "active": st.active,
             "ready": ready,
             "starting_sec": starting_sec,
             "recv_q": recv_q,
-            "looks_externally_unreachable": looks_unreachable,
+            "port_bound": port_bound,
+            "lxc_ufw_allows": ufw_allows,
+            "cause": cause,
+            # Host suspicion is ONLY raised once we've ruled out our own
+            # firewall (ufw allows) and the socket is actually bound — never
+            # on a stuck/not-bound game.
+            "looks_externally_unreachable": cause == "bound-but-no-traffic",
+            "lxc_firewall_blocking": cause == "lxc-ufw-blocking",
         })
 
     return {
@@ -731,6 +757,22 @@ def api_diagnostics_network() -> dict:
             "inside an unprivileged container."
         ),
     }
+
+
+@app.post("/api/diagnostics/network/reconcile", dependencies=[Depends(require_token)])
+def api_diagnostics_network_reconcile() -> dict:
+    """Re-apply every server's ufw rules — the manager-side fix for the
+    ``lxc-ufw-blocking`` cause the network diagnostic can now detect.
+
+    Idempotent and safe: reconcile deletes only this manager's own
+    ``gamesrv-auto:*`` rules and re-adds them from each server def, so a
+    silently-failed earlier reconcile (the reason a UDP game port could be
+    closed while Minecraft's TCP rule was fine) is repaired in place.
+    """
+    try:
+        return {"ok": True, "results": firewall.reconcile_all()}
+    except Exception as e:  # never 500 the diagnostics panel
+        return {"ok": False, "detail": f"{type(e).__name__}: {e}", "results": []}
 
 
 def _read_udp_socket_recv_q() -> dict[int, int]:
