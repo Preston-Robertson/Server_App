@@ -6,6 +6,7 @@ docs/USAGE.md for the exact permission surface.
 """
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
 import socket
@@ -31,6 +32,98 @@ def _run(cmd: list[str], *, timeout: int = 15, check: bool = False) -> subproces
         timeout=timeout,
         check=check,
     )
+
+
+# Below this cgroup MemoryCurrent (bytes), a supposedly-"active" game unit is
+# almost certainly reporting only the start.sh wrapper, not the real game
+# (see _tmux_tree_rss_bytes). 8 MiB: a bash loop + tmux client sit well under
+# this; any real game binary (JVM, UE5) is far above it within a second of
+# launch.
+_CGROUP_MEM_SANITY_FLOOR = 8 * 1024 * 1024
+
+
+def _proc_rss_bytes(pid: int) -> int | None:
+    """VmRSS (bytes) for one PID from /proc/<pid>/status, or None."""
+    try:
+        with open(f"/proc/{pid}/status", encoding="ascii", errors="replace") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024   # kB -> bytes
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _descendant_pids(roots: list[int]) -> set[int]:
+    """All PIDs in the process trees rooted at ``roots`` (inclusive)."""
+    children: dict[int, list[int]] = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return set(roots)
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/status", encoding="ascii", errors="replace") as f:
+                for line in f:
+                    if line.startswith("PPid:"):
+                        ppid = int(line.split()[1])
+                        children.setdefault(ppid, []).append(int(entry))
+                        break
+        except (OSError, ValueError, IndexError):
+            continue
+    seen: set[int] = set()
+    stack = list(roots)
+    while stack:
+        p = stack.pop()
+        if p in seen:
+            continue
+        seen.add(p)
+        stack.extend(children.get(p, []))
+    return seen
+
+
+def _tmux_tree_rss_bytes(name: str) -> int | None:
+    """Sum RSS (bytes) of the whole tmux session process tree for a server.
+
+    WHY THIS EXISTS: our games run inside a tmux session (``gs-<name>``) so
+    the manager gets a console channel. But the tmux server can host the
+    game in a process tree that is NOT inside THIS systemd unit's cgroup
+    (tmux server reuse / daemonisation). When that happens, systemd's
+    ``MemoryCurrent`` for the unit reports only the ~KB ``start.sh`` wrapper
+    while the real game uses gigabytes — the dashboard then shows a
+    nonsensical "848 KB" for a running Palworld/ARK server and the operator
+    reasonably concludes it is hung. Walking the tmux pane's process tree via
+    /proc gives the game's true resident memory regardless of cgroup.
+
+    Returns total RSS in bytes, or None if tmux/the session/proc are
+    unreadable.
+    """
+    if not shutil.which("tmux"):
+        return None
+    try:
+        r = _run(["tmux", "list-panes", "-t", _session(name), "-F", "#{pane_pid}"])
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    roots: list[int] = []
+    for tok in r.stdout.split():
+        try:
+            roots.append(int(tok))
+        except ValueError:
+            pass
+    if not roots:
+        return None
+    total = 0
+    found = False
+    for pid in _descendant_pids(roots):
+        rss = _proc_rss_bytes(pid)
+        if rss is not None:
+            total += rss
+            found = True
+    return total if found else None
 
 
 # ---------- lifecycle ----------
@@ -192,6 +285,17 @@ def status(sd: ServerDef) -> ServerStatus:
     pid = _int_or_none(kv.get("MainPID", "0"))
     mem = _int_or_none(kv.get("MemoryCurrent", "0"))
     cpu = _int_or_none(kv.get("CPUUsageNSec", "0"))
+
+    # Memory sanity fallback. Games run inside tmux; if the real game process
+    # escaped this unit's cgroup, MemoryCurrent reports only the start.sh
+    # wrapper (~KB) even though the game is using GBs. When the unit is active
+    # but the cgroup figure is implausibly small, sum the tmux session's
+    # process-tree RSS instead so the dashboard shows the game's true memory
+    # (and readiness/RAM panels stop screaming "hung" at a healthy server).
+    if active == "active" and (mem is None or mem < _CGROUP_MEM_SANITY_FLOOR):
+        tree_rss = _tmux_tree_rss_bytes(sd.name)
+        if tree_rss and (mem is None or tree_rss > mem):
+            mem = tree_rss
 
     # NRestarts is a plain integer (0 for a healthy unit). _int_or_none
     # would swallow 0 as None; use a straight parse and default to 0.
