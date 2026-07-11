@@ -156,6 +156,14 @@
               <button class="btn btn-ghost"   data-action="disable">Disable on Boot</button>
             </div>
 
+            <div class="row" style="margin-top:6px;">
+              <button class="btn btn-warn" data-action="diagnose"
+                title="Server stuck at 'starting' with RAM frozen and no crash? This X-rays the frozen game process (kernel wait-channel + process state + open files) and checks the two host-level blockers (keyctl syscall filter, networked world_dir) that stall Palworld/Unreal world-load identically on native, Wine, and LinuxGSM.">
+                🩺 Diagnose stuck start
+              </button>
+            </div>
+            <div id="diagnose-panel" class="diagnose-panel" hidden></div>
+
             <hr />
             <h3 style="margin: 6px 0;">Idle shutdown &amp; wake-on-demand</h3>
             <div class="iw-panel">

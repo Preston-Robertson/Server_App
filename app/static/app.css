@@ -100,6 +100,20 @@ main { padding: 20px; }
 .btn-ghost:hover { background: var(--bg-hover); color: var(--text); border-color: transparent; }
 .btn-danger { border-color: var(--danger); color: var(--danger); }
 .btn-danger:hover { background: var(--danger-dim); color: white; border-color: var(--danger); }
+.btn-warn { border-color: var(--warn); color: var(--warn); }
+.btn-warn:hover { background: var(--warn-dim); color: #111; border-color: var(--warn); }
+
+/* ---------- Stuck-start diagnosis panel ---------- */
+.diagnose-panel { margin-top: 8px; }
+.diag-verdict { border: 1px solid var(--warn); border-radius: 6px; padding: 10px 12px; background: #0003; }
+.diag-title { margin-bottom: 8px; font-size: 0.95rem; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.diag-cause { margin: 8px 0; padding: 8px 10px; border-radius: 5px; background: #0004; border-left: 3px solid var(--text-dim); }
+.diag-cause-top { border-left-color: var(--danger); }
+.diag-cause-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.diag-fix { margin: 6px 0 0; padding: 8px; border-radius: 4px; background: #0006; white-space: pre-wrap; font-size: 0.82rem; }
+.diag-raw { margin-top: 8px; }
+.diag-raw summary { cursor: pointer; color: var(--text-dim); font-size: 0.85rem; }
+.diag-pre { margin: 6px 0 0; padding: 8px; border-radius: 4px; background: #0006; max-height: 220px; overflow: auto; font-size: 0.78rem; white-space: pre-wrap; }
 .btn-success { border-color: var(--success); color: var(--success); }
 .btn-success:hover { background: var(--success-dim); color: white; border-color: var(--success); }
 .btn-tiny { padding: 3px 8px; font-size: 12px; }

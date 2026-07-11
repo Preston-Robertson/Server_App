@@ -5,18 +5,25 @@ in the server YAML (Palworld = 2394010, Satisfactory = 1690800). Anonymous
 login covers most free-to-host dedicated servers.
 
 Palworld notes (baked into the default start.sh):
-  - We install the WINDOWS depot (via steamcmd `+@sSteamCmdForcePlatformType
-    windows`) and run PalServer.exe under Wine. The native Linux build
-    hangs during world load inside unprivileged Proxmox LXCs even with
-    every documented fix applied — LinuxGSM reproduces the same hang,
-    which rules out our manager as the cause. Wine path uses the exact
-    same infrastructure as Enshrouded.
-  - Binary lives at PalServer.exe (launcher) →
-    Pal/Binaries/Win64/PalServer-Win64-Shipping.exe (actual game).
+  - We install the NATIVE LINUX depot and run PalServer.sh directly — no
+    Wine. The official docs list "Linux with SteamCMD" as a first-class
+    path, and real native-Linux deployments (e.g.
+    github.com/BitsNBytes25/Palworld-Installer on Debian 12/13 + Ubuntu
+    24.04) work with just PalServer.sh + perf flags. The world-load hang
+    we chased was the LAUNCH ENVIRONMENT, not the binary: the biggest
+    culprit is the open-file limit (Unreal opens tens of thousands of FDs
+    on boot; default 1024 => a silent ~800 MB stall). start.sh now raises
+    ulimit -n and the systemd unit sets LimitNOFILE=100000. keyctl seccomp
+    + a networked world_dir are the other two launch-env suspects — see the
+    /api/servers/<name>/diagnose verdict.
+  - Binary lives at PalServer.sh (launcher) ->
+    Pal/Binaries/Linux/PalServer-Linux-Shipping (actual game).
   - Save data lives in Pal/Saved — we symlink Saved -> world_dir so the
-    NFS bind mount holds saves. Same path on both depots.
-  - Config file lives at Pal/Saved/Config/WindowsServer/PalWorldSettings.ini
-    (NOT LinuxServer/ — the Windows depot writes to a different folder).
+    NFS bind mount holds saves.
+  - Config file lives at Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
+    (the native Linux depot writes here; the old Wine/Windows depot used
+    WindowsServer/). _apply_palworld_passwords() auto-detects, preferring
+    LinuxServer/.
 
 Satisfactory notes:
   - Binary is FactoryServer.sh (top-level wrapper); single UDP port since
@@ -44,6 +51,22 @@ _START_TEMPLATE = """#!/usr/bin/env bash
 # inside tmux so the console channel + graceful stop work.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# --- launch-environment fixes for Unreal dedicated servers (Palworld/ARK) ---
+# Raise the open-file limit. Unreal Engine dedicated servers open tens of
+# thousands of file handles while streaming the world's .pak/.ucas assets on
+# boot; the default 1024 soft limit makes world-load STALL silently — the
+# process climbs to ~800 MB-1 GB RSS then freezes with no crash and no error
+# (exactly the Palworld symptom we chased). Every working native-Linux
+# Palworld deploy raises this (LimitNOFILE=100000 in the BitsNBytes installer
+# systemd unit; LinuxGSM sets ulimit -n). We set it here too so it applies
+# even when the systemd LimitNOFILE isn't redeployed.
+ulimit -n 100000 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+# Steam's runtime expects a writable XDG_RUNTIME_DIR. As a system service we
+# have no logind-managed /run/user/<uid>, so hand Steam a private one under
+# the install dir — otherwise SteamAPI init can stall waiting on it.
+export XDG_RUNTIME_DIR="$(pwd)/.runtime"
+mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null && chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
 
 SESSION="gs-{name}"
 BIN="{run_cmd}"
@@ -140,83 +163,39 @@ fi
 #                handler wraps it in `wine ...` and sets WINEPREFIX.
 #   steamcmd_platform — "linux" (default) or "windows".
 _APP_RECIPES: dict[int, dict] = {
-    2394010: {  # Palworld dedicated — Windows depot under Wine
+    2394010: {  # Palworld dedicated — NATIVE LINUX depot (no Wine)
         "name": "palworld",
-        # WHY WINE AND NOT NATIVE LINUX:
+        # NATIVE LINUX (reverted from the Wine experiment on 2026-07-11):
         #
-        # Palworld's native Linux dedicated server hangs during world
-        # load in unprivileged Debian LXCs (RAM ~1 GB, no port bind, no
-        # error). LinuxGSM reproduces the same hang, ruling out the
-        # manager. Windows build under Wine reproduces the SAME hang at
-        # the SAME message ("Running Palworld dedicated server on :PORT"),
-        # which points at a game-logic issue shared by both builds
-        # rather than a Wine or Linux-syscall issue.
+        # The official docs list "Linux with SteamCMD" as a first-class
+        # deploy path, and BitsNBytes25/Palworld-Installer runs the native
+        # Linux build fine on Debian 12/13 + Ubuntu 24.04 with nothing more
+        # exotic than PalServer.sh + the perf flags below. Wine bought us a
+        # whole extra failure surface (wineprefix, D3D/RHI init) and zero
+        # benefit. The world-load hang we blamed on "the binary" was really
+        # the LAUNCH ENVIRONMENT — see start.sh (ulimit -n / LimitNOFILE),
+        # the keyctl check, and the world_dir mount check surfaced by
+        # /api/servers/<name>/diagnose.
         #
-        # WHY SENTRY_DSN="":
+        # PERF/STABILITY FLAGS (community + BitsNBytes installer standard):
+        #   -useperfthreads        spread work across threads
+        #   -NoAsyncLoadingThread  synchronous asset streaming — avoids a
+        #                          class of world-load stalls on dedicated
+        #                          Linux servers
+        #   -UseMuilthreadForDS    (sic — Pocketpair's spelling) multithread
+        #                          the dedicated server
+        # -port={port} is embedded here (the native launcher honours it);
+        # PublicPort in PalWorldSettings.ini is also set as a backstop.
         #
-        # Both builds have Sentry-native (crash reporter) compiled in.
-        # On startup Sentry tries to hand-shake with sentry.io; when
-        # outbound to Sentry's servers is restricted or slow (common in
-        # LXCs with locked-down egress), Sentry-native's init BLOCKS
-        # instead of failing gracefully. Palworld's engine waits on that
-        # init before proceeding to world load. Setting SENTRY_DSN=""
-        # tells Sentry to disable itself entirely — no network call, no
-        # block. This is the fix cited in every "Palworld hangs on
-        # dedicated Linux" thread that got resolved.
+        # SENTRY_DSN="" disables the Sentry crash-reporter phone-home, which
+        # can block Steam init on egress-restricted LXCs. Applies to the
+        # native build too.
         #
-        # WHY -nullrhi:
-        #
-        # Palworld's Windows shipping binary is a client+server hybrid
-        # (152 MB — way too large for a pure server build). It calls
-        # into D3D at startup to enumerate graphics adapters even in
-        # dedicated-server mode. Under Wine without a display, D3D
-        # returns nothing (see err:d3d:wined3d_caps_gl_ctx_create in
-        # the console log). ``-nullrhi`` is the standard Unreal Engine
-        # flag that swaps the Rendering Hardware Interface for a null
-        # implementation — skips all graphics init entirely. Standard
-        # practice for headless UE dedicated servers.
-        #
-        # WHY DIRECT SHIPPING BINARY (not PalServer.exe launcher):
-        #
-        # The 182 KB PalServer.exe is a launcher that spawns the
-        # shipping binary. Under Wine this worked eventually (once the
-        # wineprefix was warm) but the ``-Cmd`` shipping variant is the
-        # console-subsystem build — cleaner stdout/stderr routing for a
-        # headless server. The "Pal" argument is the Unreal project
-        # name (implicit via launcher, explicit via direct binary).
-        #
-        # Config file path DIFFERS from native Linux:
-        #   Linux:   Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
-        #   Windows: Pal/Saved/Config/WindowsServer/PalWorldSettings.ini
-        # _apply_palworld_passwords() auto-detects which dir exists.
-        "run": "./Pal/Binaries/Win64/PalServer-Win64-Shipping-Cmd.exe Pal -log -nullrhi -nosound -nosplash",
-        # NO ``saves_rel`` — Palworld saves land on install_dir/Pal/Saved
-        # (local ext4), NOT symlinked to world_dir (NFS from TrueNAS).
-        #
-        # WHY: Palworld's Windows save code (under Wine) does an atomic
-        # write pattern — write .tmp, MoveFileExW with REPLACE_EXISTING,
-        # rotate .bak. Wine translates MoveFileExW to Linux rename(2),
-        # which fails with EXDEV when Palworld's Wine-tempdir source and
-        # the NFS-symlinked destination are on different mount points
-        # (ext4 vs nfs4). The game surfaces this as
-        # "Failed to save. Failed copy from backup." and world load
-        # aborts. Enshrouded uses the same NFS-symlink pattern and works
-        # because its save code does simple write-in-place, not
-        # rename-with-rotation.
-        #
-        # TRADE-OFF: saves are on the LXC's local disk, not the TrueNAS
-        # NAS backup. Operators wanting NFS backup should add a cron
-        # rsync from /srv/gameservers/palworld/Pal/Saved/ to their
-        # backup target. The manager could ship a periodic sync job for
-        # this if it becomes a common need.
-        "saves_rel": None,
-        "wine": True,
-        "wine_debug": "-all,err+all,fixme-all",
-        "steamcmd_platform": "windows",
+        # Config path (native): Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
+        # Binary: PalServer.sh -> Pal/Binaries/Linux/PalServer-Linux-Shipping
+        "run": "./PalServer.sh -port={port} -useperfthreads -NoAsyncLoadingThread -UseMuilthreadForDS",
+        "saves_rel": "Pal/Saved",
         "env": {
-            # Disable Sentry crash-reporter phone-home — the specific fix
-            # for the shared Linux+Wine world-load hang. Wine passes Linux
-            # env vars through to the Windows process (GetEnvironmentVariable).
             "SENTRY_DSN": "",
         },
     },
@@ -536,25 +515,25 @@ def _apply_palworld_passwords(install_dir, port: int, server_pw: str, admin_pw: 
     port to bind.
 
     Config-file directory differs by depot:
-      * Windows build under Wine → Pal/Saved/Config/WindowsServer/
-      * Native Linux build       → Pal/Saved/Config/LinuxServer/
+      * Native Linux build       -> Pal/Saved/Config/LinuxServer/
+      * Windows build under Wine -> Pal/Saved/Config/WindowsServer/
     We accept whichever directory the installed binary uses. If both
-    exist (mid-migration), we prefer WindowsServer since that's what a
-    freshly-installed Wine-based Palworld will read.
+    exist (mid-migration), we prefer LinuxServer since the native Linux
+    build is the default now.
     """
     default_ini = install_dir / "DefaultPalWorldSettings.ini"
     win_ini = install_dir / "Pal" / "Saved" / "Config" / "WindowsServer" / "PalWorldSettings.ini"
     lin_ini = install_dir / "Pal" / "Saved" / "Config" / "LinuxServer" / "PalWorldSettings.ini"
 
     # Pick the target ini: prefer an already-populated one; otherwise,
-    # bootstrap a fresh WindowsServer/ config since the Wine recipe is
-    # the current default (see _APP_RECIPES[2394010]).
-    if win_ini.exists():
-        target_ini = win_ini
-    elif lin_ini.exists():
+    # bootstrap a fresh LinuxServer/ config since the native Linux depot
+    # is the current default (see _APP_RECIPES[2394010]).
+    if lin_ini.exists():
         target_ini = lin_ini
+    elif win_ini.exists():
+        target_ini = win_ini
     else:
-        target_ini = win_ini   # will be created below from Default
+        target_ini = lin_ini   # will be created below from Default
 
     if target_ini.exists():
         text = target_ini.read_text(encoding="utf-8")
@@ -779,7 +758,7 @@ def _wine_prefix_init(install_dir, on_event=None) -> str:
 # cheap to fix (delete something, retry); a false-negative (partial install
 # because df ran out mid-download) leaves install_dir wedged.
 _MIN_DISK_GB: dict[int, int] = {
-    2394010: 12,   # Palworld Windows depot under Wine (~4 GB game + ~2 GB Wine prefix + shader cache)
+    2394010: 10,   # Palworld native Linux depot (~4 GB game + validate headroom)
     1690800: 15,   # Satisfactory (~7 GB game + updates)
     376030:  35,   # ARK: Survival Evolved (~20 GB game)
     2430930: 60,   # ARK: Survival Ascended (heavy Unreal 5 build)
@@ -977,13 +956,8 @@ class SteamCmdHandler(TypeHandler):
 
         game_port = _effective_game_port(self.sd)
         run_cmd = recipe["run"].format(name=self.sd.name, port=game_port)
-        # Palworld special case: the recipe's `run` doesn't include -port=
-        # (Pocketpair's docs recommend PalWorldSettings.ini's PublicPort field,
-        # which _apply_palworld_passwords writes below). If the operator picked
-        # a non-default port, ALSO pass -port= on the command line as a
-        # belt-and-suspenders override so the two sources can't disagree.
-        if self.sd.steam_app_id == 2394010 and game_port != 8211:
-            run_cmd = f"{run_cmd} -port={game_port}"
+        # (Palworld's native PalServer.sh recipe already embeds -port={port};
+        # no belt-and-suspenders CLI port injection needed anymore.)
         if self.sd.wake_on_demand:
             msgs.append(
                 f"wake-on-demand: game will bind :{game_port} internally; "
@@ -1158,105 +1132,15 @@ def _apply_post_install_config(sd, install_dir, world_dir) -> list[str]:
     """Idempotent per-game config writer. Runs after every install/configure.
 
     Dispatches by ``sd.steam_app_id`` to per-game helpers:
-      * Palworld (2394010) — pre-create the save directory tree under
-        world_dir so Palworld's Wine-wrapped Windows binary can write
-        saves without needing to CREATE any directories (Wine's
-        directory-creation code path through a cross-filesystem
-        symlink is unreliable — Palworld's error is
-        "Failed to save. Failed copy from backup.").
       * Satisfactory (1690800) — writes ``AutoLoadSessionName`` pointing
         at the newest ``.sav`` under ``world_dir``.
 
     Kept as a single dispatch function so future games can slot in without
     touching the main install() path.
     """
-    if sd.steam_app_id == 2394010:
-        return _apply_palworld_saves_dirs(install_dir, world_dir)
     if sd.steam_app_id == 1690800:
         return _apply_satisfactory_autoload(sd, install_dir, world_dir)
     return []
-
-
-def _apply_palworld_saves_dirs(install_dir, world_dir) -> list[str]:
-    """Pre-create Palworld's save-directory tree on local ext4.
-
-    THE ERROR THIS FIXES (verified 2026-07-11):
-        "Failed to save. Failed copy from backup."
-
-    Palworld's Windows save code (under Wine) does atomic writes with
-    ``MoveFileExW(REPLACE_EXISTING)`` and rotates ``.bak`` files. When
-    the target save directory is on a different filesystem than Wine's
-    tempdir (e.g. saves symlinked from local ext4 to an NFS bind mount),
-    Wine's ``rename(2)`` fails with ``EXDEV`` (cross-device link) and
-    Palworld reports the error above. See recipe comment for the full
-    diagnosis and the ``saves_rel: None`` setting that keeps saves on
-    local ext4.
-
-    ``world_dir`` argument is IGNORED for Palworld now — accepted only
-    because the dispatcher passes it uniformly to all handlers.
-
-    MIGRATION: if a previous Configure created a symlink at
-    ``install_dir/Pal/Saved`` -> ``world_dir``, we remove it here so the
-    subsequent mkdir creates a real ext4 directory instead. This runs
-    idempotently on every Configure/Start.
-
-    We still pre-create the deep directory tree here because Wine's
-    ``CreateDirectoryW`` for multi-level paths is slower and slightly
-    less reliable than native Linux mkdir. Doing it here keeps the
-    first-boot experience clean and shifts one class of potential
-    error out of the Wine code path.
-    """
-    from pathlib import Path
-    saved_root = Path(install_dir) / "Pal" / "Saved"
-
-    msgs: list[str] = []
-
-    # MIGRATION: remove any leftover symlink from an earlier recipe
-    # version that used ``saves_rel: "Pal/Saved"``. Only remove if it's
-    # a symlink — a real directory here (either pre-existing or from a
-    # previous run of this helper) is exactly what we want.
-    if saved_root.is_symlink():
-        try:
-            target = saved_root.readlink()
-            saved_root.unlink()
-            msgs.append(
-                f"Palworld: removed legacy Pal/Saved symlink -> {target} "
-                "(migrating to local-ext4 saves — see recipe comment for "
-                "why NFS-symlinked saves break Palworld's atomic writes)"
-            )
-        except OSError as e:
-            msgs.append(
-                f"WARNING (Palworld): could not remove existing Pal/Saved "
-                f"symlink ({e}). Delete it manually so saves land on local ext4."
-            )
-            return msgs
-
-    subdirs = [
-        saved_root / "SaveGames" / "0",             # server save slot
-        saved_root / "Logs",                        # Unreal -log output
-        saved_root / "Backups",                     # Palworld auto-backup
-        saved_root / "Config" / "WindowsServer",    # config storage
-    ]
-    created: list[str] = []
-    for p in subdirs:
-        if not p.exists():
-            try:
-                p.mkdir(parents=True, exist_ok=True)
-                created.append(str(p.relative_to(saved_root)))
-            except OSError as e:
-                msgs.append(f"WARNING (Palworld): could not pre-create {p}: {e}")
-    if created:
-        msgs.append(
-            "Palworld: pre-created save dirs under install_dir/Pal/Saved "
-            f"({', '.join(created)}) — saves land on local ext4, not "
-            "symlinked to NFS world_dir (avoids the cross-mount save "
-            "failure). Add a cron rsync to world_dir if you want NAS backup."
-        )
-    else:
-        msgs.append(
-            "Palworld: save dirs already present under install_dir/Pal/Saved"
-        )
-    return msgs
 
 
 def _apply_satisfactory_autoload(sd, install_dir, world_dir) -> list[str]:

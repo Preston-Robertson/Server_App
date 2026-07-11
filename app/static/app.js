@@ -1081,6 +1081,10 @@ function renderServerGrid(rows) {
     // trust systemd and treat "active" as ready.
     const ready = !s.probe_supported || !!(wd && wd.ready);
     const chip = stateChip(s.active, s.sub, ready, !!s.probe_supported, wd, s);
+    // "Stuck/slow start" = the unit is active but the readiness probe still
+    // hasn't answered. That's the exact state where /diagnose earns its
+    // keep (RAM frozen, no crash), so surface a Diagnose button on the card.
+    const looksStuck = s.active === "active" && !!s.probe_supported && !ready;
 
     // RAM % of the cap.
     const capBytes = (d.memory_mb || 0) * 1024 * 1024;
@@ -1209,6 +1213,7 @@ function renderServerGrid(rows) {
         <button class="btn btn-tiny btn-success" data-quick="start"   data-name="${d.name}">▶ Start</button>
         <button class="btn btn-tiny btn-danger"  data-quick="stop"    data-name="${d.name}">■ Stop</button>
         <button class="btn btn-tiny"             data-quick="restart" data-name="${d.name}">↻</button>
+        ${looksStuck ? `<button class="btn btn-tiny btn-warn" data-diagnose="${d.name}" title="Active but not answering its readiness probe — find out why">🩺 Diagnose</button>` : ""}
         <button class="btn btn-tiny btn-ghost"   data-open="${d.name}">Open →</button>
       </div>
     `;
@@ -1225,6 +1230,13 @@ function escape(s) {
 document.addEventListener("click", async (ev) => {
   const t = ev.target;
   if (t.dataset.open)  { ev.preventDefault(); openServer(t.dataset.open); return; }
+  if (t.dataset.diagnose) {
+    // Jump straight from a stuck card into the detail panel + verdict.
+    ev.preventDefault();
+    await openServer(t.dataset.diagnose);
+    runDiagnose(t.dataset.diagnose);
+    return;
+  }
   if (t.dataset.copy) {
     ev.preventDefault(); ev.stopPropagation();
     try {
@@ -1766,6 +1778,10 @@ document.addEventListener("click", async (ev) => {
     await startInstallJob(action);
     return;
   }
+  if (action === "diagnose") {
+    await runDiagnose(CURRENT);
+    return;
+  }
   try {
     const path = `/api/servers/${CURRENT}/action`;
     const opts = { method: "POST", body: JSON.stringify({ action }) };
@@ -1774,6 +1790,64 @@ document.addEventListener("click", async (ev) => {
     setTimeout(refreshServers, 500);
   } catch (e) { $("#control-out").textContent = "ERROR: " + e.message; }
 });
+
+// ---------- Stuck-start diagnosis ----------
+// Calls /api/servers/<name>/diagnose (kernel wchan + process State + open
+// FDs, plus the keyctl-syscall and world_dir-mount host-blocker checks)
+// and renders ONE ranked verdict. This is the anti-"guess for 5 hours"
+// tool: when a server sits at "◐ starting" with RAM frozen and no crash,
+// it names the exact blocking layer and the exact fix instead of making
+// the operator correlate /proc fields by hand.
+async function runDiagnose(name) {
+  const panel = $("#diagnose-panel");
+  if (!panel) return;
+  panel.hidden = false;
+  panel.innerHTML = `<p class="muted">Diagnosing <code>${escape(name)}</code>…</p>`;
+  try {
+    const d = await api(`/api/servers/${name}/diagnose`);
+    if (!d.ok) {
+      panel.innerHTML = `<p class="form-error">${escape(d.detail || d.reason || "diagnose failed")}</p>`;
+      return;
+    }
+    const v = d.verdict || {};
+    const causes = v.causes || [];
+    const confCls = { high: "chip-err", medium: "chip-warn", low: "chip-muted" };
+    const causeHtml = causes.length
+      ? causes.map((c, i) => `
+          <div class="diag-cause${i === 0 ? " diag-cause-top" : ""}">
+            <div class="diag-cause-head">
+              <span class="chip ${confCls[c.confidence] || "chip-muted"}">${escape(c.confidence || "?")}</span>
+              <strong>${escape(c.cause)}</strong>
+            </div>
+            <p class="small">${escape(c.why || "")}</p>
+            ${c.fix ? `<pre class="diag-fix">${escape(c.fix)}</pre>` : ""}
+          </div>`).join("")
+      : `<p class="muted">${escape(v.summary || "No blocking cause detected.")}</p>`;
+    const chk = v.checks || {};
+    panel.innerHTML = `
+      <div class="diag-verdict">
+        <div class="diag-title">
+          <strong>Diagnosis:</strong> ${escape(v.summary || "-")}
+          ${v.in_disk_sleep ? '<span class="chip chip-err" title="Uninterruptible I/O sleep — the NFS/disk fingerprint">State D</span>' : ""}
+        </div>
+        ${causeHtml}
+        <details class="diag-raw">
+          <summary>Raw process introspection (game PID ${escape(String(d.game_pid))})</summary>
+          <table class="kv small">
+            <tr><td>wchan</td><td><code>${escape(d.wchan || "-")}</code></td></tr>
+            <tr><td>comm</td><td><code>${escape(d.comm || "-")}</code></td></tr>
+            <tr><td>keyctl</td><td><code>${chk.keyctl_available ? "available" : "BLOCKED (" + escape(chk.keyctl_error || "?") + ")"}</code></td></tr>
+            <tr><td>world_dir fs</td><td><code>${escape(chk.world_dir_fstype || "-")}${chk.world_dir_networked ? " ⚠ networked" : ""}</code></td></tr>
+          </table>
+          <pre class="diag-pre">${escape(d.status || "")}</pre>
+          <pre class="diag-pre">${escape((d.thread_wchans || []).join("\n"))}</pre>
+          <pre class="diag-pre">${escape((d.open_fds || []).join("\n"))}</pre>
+        </details>
+      </div>`;
+  } catch (e) {
+    panel.innerHTML = `<p class="form-error">Diagnose failed: ${escape(e.message)}</p>`;
+  }
+}
 
 // ---------- Install / Update / Backup / Restore progress ----------
 // The install, update, backup and restore endpoints all return a job id;

@@ -14,6 +14,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Unreal Engine dedicated servers (Palworld, ARK) open tens of thousands of
+# file handles while streaming world assets during load. The default 1024
+# soft limit makes world-load STALL silently — RSS climbs to ~800 MB-1 GB
+# then freezes with no crash and no error (the exact Palworld symptom).
+# Every working native-Linux Palworld deploy raises this. start.sh also runs
+# `ulimit -n` as a backstop in case this unit file isn't redeployed.
+LimitNOFILE=100000
 User=gamesrv
 Group=gamesrv
 WorkingDirectory=/srv/gameservers/%i

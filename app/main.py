@@ -461,8 +461,7 @@ def api_firewall_snapshot() -> dict:
     return firewall.snapshot()
 
 
-@app.get("/api/diagnostics/keyctl", dependencies=[Depends(require_token)])
-def api_diagnostics_keyctl() -> dict:
+def _check_keyctl() -> dict:
     """Detect whether the keyctl() syscall is usable in this container.
 
     Palworld and many other Steamworks SDK games call the Linux kernel's
@@ -543,6 +542,63 @@ def api_diagnostics_keyctl() -> dict:
         result["detail"] = f"could not test keyctl syscall: {e}"
 
     return result
+
+
+@app.get("/api/diagnostics/keyctl", dependencies=[Depends(require_token)])
+def api_diagnostics_keyctl() -> dict:
+    """HTTP wrapper around _check_keyctl (see that helper for the rationale)."""
+    return _check_keyctl()
+
+
+def _world_dir_mount_info(world_dir) -> dict:
+    """Determine the filesystem type backing world_dir (via its realpath).
+
+    Palworld / Unreal Engine take fcntl+flock file locks and do heavy
+    random I/O in Pal/Saved during world load. When Saved is symlinked
+    onto a networked mount (NFS/CIFS/9p) or FUSE, those lock/IO calls can
+    block *indefinitely* in the kernel (process State 'D', wchan
+    io_schedule / rpc_wait_bit_killable): the game reaches ~800 MB-1 GB,
+    then freezes with no crash and no error. This stalls the native Linux
+    build, the Windows-under-Wine build, AND LinuxGSM identically because
+    it's a property of the mount, not the game binary. We flag
+    networked/FUSE backings so the diagnose verdict can name it.
+    """
+    import os
+    info: dict = {
+        "world_dir": str(world_dir),
+        "realpath": "",
+        "mountpoint": "",
+        "fstype": "",
+        "networked": False,
+    }
+    try:
+        real = os.path.realpath(world_dir)
+        info["realpath"] = real
+    except OSError:
+        return info
+    # Longest mountpoint prefix containing realpath wins (handles nested mounts).
+    best_mount = ""
+    best_fstype = ""
+    try:
+        with open("/proc/mounts", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mountpoint, fstype = parts[1], parts[2]
+                if (real == mountpoint
+                        or real.startswith(mountpoint.rstrip("/") + "/")) \
+                        and len(mountpoint) > len(best_mount):
+                    best_mount = mountpoint
+                    best_fstype = fstype
+    except OSError:
+        return info
+    info["mountpoint"] = best_mount
+    info["fstype"] = best_fstype
+    networked = {"nfs", "nfs4", "cifs", "smb3", "smbfs", "9p",
+                 "glusterfs", "ceph", "lustre", "afs"}
+    info["networked"] = best_fstype in networked or best_fstype.startswith("fuse")
+    return info
 
 
 @app.get("/api/diagnostics/network", dependencies=[Depends(require_token)])
@@ -1056,6 +1112,97 @@ def api_diagnose_stuck(name: str) -> dict:
                 "Usually means an outbound service (Steam, Sentry, master server) "
                 "isn't responding.")
     result["hint"] = hint
+
+    # ---- consolidated verdict ------------------------------------------
+    # Fold the raw /proc introspection together with the two host-level
+    # blockers this manager already knows about (keyctl syscall filter,
+    # networked world_dir) into ONE ranked cause + exact fix, so the
+    # dashboard can show a definitive answer on the stuck server's card
+    # instead of making the operator correlate wchan/State/FDs by hand.
+    # This is the anti-"5 hours of guessing" fix: a stuck Palworld start
+    # now names the exact blocking layer.
+    state_line = next(
+        (ln for ln in result["status"].splitlines() if ln.startswith("State:")),
+        "",
+    )
+    in_d_state = "D" in state_line.split(":", 1)[-1].strip()[:1] if state_line else False
+
+    keyctl = _check_keyctl()
+    world = _world_dir_mount_info(sd.world_dir)
+    is_steam_game = getattr(sd, "type", "") == "steamcmd"
+    wchan = result.get("wchan") or ""
+
+    causes: list[dict] = []
+
+    # 1) keyctl seccomp block — the canonical Palworld "~1 GB freeze".
+    if is_steam_game and not keyctl.get("keyctl_available", False) \
+            and keyctl.get("syscall_error_name") == "EPERM":
+        causes.append({
+            "cause": "keyctl() syscall blocked by the LXC seccomp filter",
+            "confidence": "high",
+            "why": (
+                "Steamworks session-keyring auth calls keyctl(); when the "
+                "unprivileged LXC filters it, Steam init hangs after 'Running "
+                "<game> on :PORT' with RAM frozen ~800 MB-1 GB and no crash. "
+                "Hits native, Wine, and LinuxGSM identically."
+            ),
+            "fix": keyctl.get("fix_instructions", ""),
+        })
+
+    # 2) networked world_dir — Unreal world-load lock/IO stalls on NFS/FUSE.
+    if world.get("networked"):
+        causes.append({
+            "cause": f"world_dir is on a networked/FUSE mount ({world.get('fstype')})",
+            "confidence": "high" if in_d_state else "medium",
+            "why": (
+                "Palworld/Unreal take fcntl locks and do heavy random I/O in "
+                f"Pal/Saved during world load. On {world.get('fstype')} those "
+                "calls can block forever in the kernel (State D, wchan "
+                "io_schedule/rpc_wait) — a binary-independent stall on every "
+                "deploy method."
+                + (" The process is currently in uninterruptible I/O sleep (D),"
+                   " which matches this exactly." if in_d_state else "")
+            ),
+            "fix": (
+                "Keep the live save dir on local disk: point world_dir at a "
+                "local path (e.g. under /srv/gameservers) and use the Backups "
+                "tab to persist to the network share. The manager can pin "
+                "Palworld's live Saved dir local automatically — say the word."
+            ),
+        })
+
+    # 3) fall back to the wchan-derived hint when neither host blocker fired.
+    if not causes and result.get("hint"):
+        if "io_schedule" in wchan or "wait_on_page" in wchan:
+            wchan_cause = "blocked on disk/NFS I/O"
+        elif "futex" in wchan:
+            wchan_cause = "blocked on a user-space lock (futex)"
+        elif any(k in wchan for k in ("sk_wait", "recvmsg", "poll", "select")):
+            wchan_cause = "blocked waiting on network/socket I/O"
+        else:
+            wchan_cause = "process is blocked in the kernel"
+        causes.append({
+            "cause": wchan_cause,
+            "confidence": "medium",
+            "why": result["hint"],
+            "fix": "",
+        })
+
+    result["verdict"] = {
+        "in_disk_sleep": in_d_state,
+        "checks": {
+            "keyctl_available": keyctl.get("keyctl_available"),
+            "keyctl_error": keyctl.get("syscall_error_name"),
+            "world_dir_fstype": world.get("fstype"),
+            "world_dir_networked": world.get("networked"),
+            "world_dir_realpath": world.get("realpath"),
+        },
+        "causes": causes,
+        "summary": causes[0]["cause"] if causes else (
+            "No blocking cause detected. If RAM is growing the world is still "
+            "loading; if not, check thread_wchans + Console."
+        ),
+    }
 
     return result
 
