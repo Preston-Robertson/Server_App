@@ -1828,6 +1828,12 @@ async function runDiagnose(name) {
     const mb = (x) => (x == null ? "∞" : Math.round(x / 1048576) + " MB");
     const envStr = Object.entries(d.env || {}).map(([k, val]) => `${k}=${val}`).join("   ") || "(none captured)";
     const limitsStr = (d.limits || []).join("   ") || "(unavailable)";
+    const logTails = d.game_log_tail || {};
+    const logTailHtml = Object.keys(logTails).length
+      ? Object.entries(logTails).map(([p, lines]) =>
+          `<div class="diag-logtail"><div class="small muted">${escape(p)}</div>` +
+          `<pre class="diag-pre">${escape((lines || []).join("\n"))}</pre></div>`).join("")
+      : `<p class="small muted">No game log tail captured (console.log / Saved/Logs empty or not created yet).</p>`;
     panel.innerHTML = `
       <div class="diag-verdict">
         <div class="diag-title">
@@ -1845,10 +1851,13 @@ async function runDiagnose(name) {
             <tr><td>mem cap</td><td><code>High=${mb(ml.MemoryHigh)}  Max=${mb(ml.MemoryMax)}  Cur=${ml.MemoryCurrent == null ? "?" : mb(ml.MemoryCurrent)}</code></td></tr>
             <tr><td>launch env</td><td><code>${escape(envStr)}</code></td></tr>
             <tr><td>rlimits</td><td><code>${escape(limitsStr)}</code></td></tr>
+            <tr><td>game port</td><td><code>${d.game_port ? (d.game_port_bound ? "\u2713 " + d.game_port + " bound" : "\u2717 " + d.game_port + " NOT bound \u2014 not accepting connections") : "-"}</code></td></tr>
+            <tr><td>local ports</td><td><code>${escape((d.local_ports || []).join("   ") || "-")}</code></td></tr>
           </table>
           <pre class="diag-pre">${escape(d.status || "")}</pre>
           <pre class="diag-pre">${escape((d.thread_wchans || []).join("\n"))}</pre>
           <pre class="diag-pre">${escape((d.open_fds || []).join("\n"))}</pre>
+          <div class="diag-logtail-wrap"><div class="small"><strong>game log tail</strong></div>${logTailHtml}</div>
         </details>
       </div>`;
   } catch (e) {

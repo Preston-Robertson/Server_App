@@ -1036,6 +1036,7 @@ def api_diagnose_stuck(name: str) -> dict:
                         the main.
     """
     from pathlib import Path
+    import re
     sd = registry.load_def(name)
     try:
         st = control.status(sd)
@@ -1112,16 +1113,21 @@ def api_diagnose_stuck(name: str) -> dict:
     # to identify game ports, Steam outbound connections, IPC sockets,
     # etc. at a glance.
     socket_info = _read_socket_details()
+    # Collect the LOCAL ports this process holds across ALL fds (not just the
+    # first 40 we display) — the game's own UDP port socket routinely sits
+    # past fd 40, so a truncated scan would wrongly report it "not bound".
+    local_ports: list = []
     try:
         entries = sorted(fds_dir.iterdir(),
                          key=lambda p: int(p.name) if p.name.isdigit() else 999)
-        for fd in entries[:40]:
+        for idx, fd in enumerate(entries):
             try:
                 target = str(fd.readlink()) if fd.is_symlink() else "(not a link)"
             except OSError:
                 target = "(unreadable)"
             # If it's a socket, look up the inode → endpoint details.
             annotated = target
+            details = None
             if target.startswith("socket:["):
                 try:
                     inode = int(target[len("socket:["):-1])
@@ -1130,10 +1136,18 @@ def api_diagnose_stuck(name: str) -> dict:
                         annotated = f"{target}  {details}"
                 except ValueError:
                     pass
-            fds.append(f"{fd.name} -> {annotated}")
+            if details:
+                _pm = re.search(r"\b(TCP|UDP)\s+\S+?:(\d+)\b", details)
+                if _pm:
+                    _tag = f"{_pm.group(1)}:{int(_pm.group(2))}"
+                    if _tag not in local_ports:
+                        local_ports.append(_tag)
+            if idx < 40:
+                fds.append(f"{fd.name} -> {annotated}")
     except OSError as e:
         fds.append(f"(cannot list fds: {e})")
     result["open_fds"] = fds
+    result["local_ports"] = local_ports
 
     thread_wchans: list[str] = []
     try:
@@ -1243,6 +1257,70 @@ def api_diagnose_stuck(name: str) -> dict:
         pass
     result["limits"] = limits_lines
 
+    # ---- game's own log tail — the definitive "what step is it on?" signal --
+    # /proc tells us the process is parked but not WHY. The game's own log
+    # names the exact startup step it reached. For tmux-hosted SteamCMD games
+    # stdout is teed to console.log; Unreal servers ALSO write a rich engine
+    # log under <mount>/Saved/Logs/*.log (Palworld: Pal/Saved/Logs/Pal.log).
+    # Surface the tail of whatever exists so we stop inferring from wchan and
+    # just read what the engine last said.
+    def _tail_lines(p: Path, n: int = 40) -> list:
+        try:
+            size = p.stat().st_size
+            with p.open("rb") as f:
+                if size > n * 1024:
+                    f.seek(size - n * 1024)
+                    f.readline()
+                data = f.read()
+        except OSError:
+            return []
+        return data.decode("utf-8", "replace").splitlines()[-n:]
+
+    log_tails: dict = {}
+    _cands: list = []
+    _console = _game_log_path(sd)
+    if _console:
+        _cands.append(_console)
+    try:
+        for _lg in sorted(Path(sd.install_dir).glob("*/Saved/Logs/*.log")):
+            _cands.append(_lg)
+    except OSError:
+        pass
+    _seen: set = set()
+    for _p in _cands:
+        _ps = str(_p)
+        if _ps in _seen:
+            continue
+        _seen.add(_ps)
+        _t = _tail_lines(_p)
+        if _t:
+            log_tails[_ps] = _t
+    result["game_log_tail"] = log_tails
+
+    # ---- is the game actually accepting connections? ----------------------
+    # AGENT_RULES: "started" is a false positive — process-alive != world
+    # loaded. The truth is whether the configured game port is bound. If Steam
+    # is connected + paks open but the game port is NOT among the process's own
+    # local sockets, the world load never finished, regardless of status chip.
+    game_port = None
+    _gp_src = result.get("env", {}).get("GAME_PORT")
+    try:
+        game_port = int(_gp_src) if _gp_src is not None else None
+    except (TypeError, ValueError):
+        game_port = None
+    if game_port is None:
+        for _cand_attr in ("port", "game_port"):
+            try:
+                game_port = int(getattr(sd, _cand_attr, None))
+                break
+            except (TypeError, ValueError):
+                continue
+    game_port_bound = bool(game_port) and (
+        f"UDP:{game_port}" in local_ports or f"TCP:{game_port}" in local_ports
+    )
+    result["game_port"] = game_port
+    result["game_port_bound"] = game_port_bound
+
     # ---- consolidated verdict ------------------------------------------
     # Fold the raw /proc introspection together with the two host-level
     # blockers this manager already knows about (keyctl syscall filter,
@@ -1324,11 +1402,18 @@ def api_diagnose_stuck(name: str) -> dict:
             "fix": keyctl.get("fix_instructions", ""),
         })
 
-    # 2) networked world_dir — Unreal world-load lock/IO stalls on NFS/FUSE.
-    if world.get("networked"):
+    # 2) networked world_dir — but ONLY when there's real I/O-block evidence.
+    # A stall in State S with the main thread in a plain timed sleep is NOT an
+    # NFS I/O block (that shows State D + wchan io_schedule/rpc_wait/nfs). This
+    # cause used to fire on EVERY networked world_dir, which kept re-raising
+    # NFS as a red herring when the process was demonstrably not in I/O wait.
+    _io_block = in_d_state or any(
+        k in wchan for k in ("io_schedule", "wait_on_page", "rpc_wait", "nfs_")
+    )
+    if world.get("networked") and _io_block:
         causes.append({
             "cause": f"world_dir is on a networked/FUSE mount ({world.get('fstype')})",
-            "confidence": "high" if in_d_state else "medium",
+            "confidence": "high",
             "why": (
                 "Palworld/Unreal take fcntl locks and do heavy random I/O in "
                 f"Pal/Saved during world load. On {world.get('fstype')} those "
@@ -1346,7 +1431,34 @@ def api_diagnose_stuck(name: str) -> dict:
             ),
         })
 
-    # 3) fall back to the wchan-derived hint when neither host blocker fired.
+    # 3) engine up but world load not progressing — "parked, not blocked".
+    # State S + main thread in a plain timed sleep (hrtimer_nanosleep or no
+    # wait channel), Steam connected + paks open, but the game port never
+    # bound. This is the fingerprint that ISN'T keyctl/NFS/memory/lock — all
+    # ruled out above — so the answer is in the game's own log, not /proc.
+    _idle_sleep = (not in_d_state) and ("hrtimer" in wchan or not wchan or wchan == "0")
+    if not causes and is_steam_game and _idle_sleep and not result.get("game_port_bound", False):
+        causes.append({
+            "cause": "engine initialised but the world load is not progressing (not blocked on I/O, a lock, or a syscall)",
+            "confidence": "medium",
+            "why": (
+                "State is S (interruptible sleep) with the main thread in a "
+                "plain timed sleep (hrtimer_nanosleep) \u2014 NOT io_schedule/"
+                "futex/rpc_wait \u2014 so it is NOT blocked on NFS I/O, a lock, "
+                "or keyctl. Steam is connected and pak files are open, but the "
+                f"game port ({result.get('game_port') or '?'}) is not bound, so "
+                "world load stalled after engine init. The game's own log tail "
+                "names the exact step."
+            ),
+            "fix": (
+                "Open the game log tail below \u2014 the last engine line is the "
+                "stuck step. This fingerprint is NOT a container/NFS/keyctl "
+                "problem; look for a bad PalWorldSettings.ini value, a save "
+                "mid-migration, or a RESTAPI/RCON port collision in that log."
+            ),
+        })
+
+    # 4) fall back to the wchan-derived hint when neither host blocker fired.
     if not causes and result.get("hint"):
         if "io_schedule" in wchan or "wait_on_page" in wchan:
             wchan_cause = "blocked on disk/NFS I/O"
@@ -1375,8 +1487,9 @@ def api_diagnose_stuck(name: str) -> dict:
         },
         "causes": causes,
         "summary": causes[0]["cause"] if causes else (
-            "No blocking cause detected. If RAM is growing the world is still "
-            "loading; if not, check thread_wchans + Console."
+            "No blocking cause detected — the process is not stuck in the kernel. "
+            "If RAM is still growing the world is loading; otherwise read the "
+            "game log tail below for the last engine step."
         ),
     }
 
