@@ -1139,19 +1139,77 @@ def _apply_post_install_config(sd, install_dir, world_dir) -> list[str]:
     """Idempotent per-game config writer. Runs after every install/configure.
 
     Dispatches by ``sd.steam_app_id`` to per-game helpers:
-      * Palworld (2394010) — Windows depot under Wine (see recipe). The
-        old ``_apply_palworld_steam_runtime`` symlink helper for the
-        native Linux depot is no longer dispatched; the Wine path
-        doesn't need it and the Linux depot is no longer the default.
+      * Palworld (2394010) — pre-create the save directory tree under
+        world_dir so Palworld's Wine-wrapped Windows binary can write
+        saves without needing to CREATE any directories (Wine's
+        directory-creation code path through a cross-filesystem
+        symlink is unreliable — Palworld's error is
+        "Failed to save. Failed copy from backup.").
       * Satisfactory (1690800) — writes ``AutoLoadSessionName`` pointing
         at the newest ``.sav`` under ``world_dir``.
 
     Kept as a single dispatch function so future games can slot in without
     touching the main install() path.
     """
+    if sd.steam_app_id == 2394010:
+        return _apply_palworld_saves_dirs(install_dir, world_dir)
     if sd.steam_app_id == 1690800:
         return _apply_satisfactory_autoload(sd, install_dir, world_dir)
     return []
+
+
+def _apply_palworld_saves_dirs(install_dir, world_dir) -> list[str]:
+    """Pre-create Palworld's save-directory tree.
+
+    THE ERROR THIS FIXES:
+        "Failed to save. Failed copy from backup."
+
+    Palworld under Wine writes saves to ``Pal\\Saved\\SaveGames\\0\\<guid>\\``,
+    which we symlink to ``world_dir``. When world_dir is on a different
+    mount than install_dir (common — install is local, saves are on an
+    NFS bind mount), Wine's ``CreateDirectoryW`` implementation fails to
+    create intermediate directories that traverse the symlink boundary.
+    Palworld's save code then reports the error above and continues
+    without saving.
+
+    We pre-create the whole tree from Python (native Linux mkdir, no
+    Wine involvement). Palworld only needs to CREATE its own <guid>/
+    subdir inside the pre-existing SaveGames/0/, which is a single-level
+    mkdir that Wine handles reliably.
+
+    Also pre-creates Logs/ (Unreal's -log target) and Backups/ so
+    Palworld's auto-backup loop doesn't fail on the first tick.
+    """
+    from pathlib import Path
+    world_dir = Path(world_dir)
+
+    # These paths are relative to Pal/Saved which is our symlink to world_dir.
+    # Under the symlink, Pal/Saved/SaveGames/0 == world_dir/SaveGames/0.
+    subdirs = [
+        world_dir / "SaveGames" / "0",             # server save slot
+        world_dir / "Logs",                        # Unreal -log output
+        world_dir / "Backups",                     # Palworld auto-backup
+        world_dir / "Config" / "WindowsServer",    # config storage (also created by _apply_palworld_passwords)
+    ]
+    created: list[str] = []
+    msgs: list[str] = []
+    for p in subdirs:
+        if not p.exists():
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+                created.append(str(p.relative_to(world_dir)))
+            except OSError as e:
+                msgs.append(f"WARNING (Palworld): could not pre-create {p}: {e}")
+    if created:
+        msgs.append(
+            "Palworld: pre-created save dirs in world_dir "
+            f"({', '.join(created)}) — avoids Wine's cross-mount "
+            "CreateDirectoryW failure that produces "
+            "'Failed to save. Failed copy from backup.'"
+        )
+    else:
+        msgs.append("Palworld: save dirs already present in world_dir")
+    return msgs
 
 
 def _apply_satisfactory_autoload(sd, install_dir, world_dir) -> list[str]:
