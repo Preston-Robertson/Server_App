@@ -1905,6 +1905,7 @@ async function runDiagnose(name) {
             <tr><td>rlimits</td><td><code>${escape(limitsStr)}</code></td></tr>
             <tr><td>game port</td><td><code>${d.game_port ? (d.game_port_bound ? "\u2713 " + d.game_port + " bound" : "\u2717 " + d.game_port + " NOT bound \u2014 not accepting connections") : "-"}</code></td></tr>
             <tr><td>local ports</td><td><code>${escape((d.local_ports || []).join("   ") || "-")}</code></td></tr>
+            <tr><td>external peers</td><td><code>${escape((d.external_conns || []).join("  |  ") || "(none \u2014 talking only to itself; no outbound Steam/Epic connection, so game-server login isn't established)")}</code></td></tr>
           </table>
           <pre class="diag-pre">${escape(d.status || "")}</pre>
           <pre class="diag-pre">${escape((d.thread_wchans || []).join("\n"))}</pre>

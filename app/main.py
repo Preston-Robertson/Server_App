@@ -1158,7 +1158,16 @@ def api_diagnose_stuck(name: str) -> dict:
     # Collect the LOCAL ports this process holds across ALL fds (not just the
     # first 40 we display) — the game's own UDP port socket routinely sits
     # past fd 40, so a truncated scan would wrongly report it "not bound".
+    # ALSO collect ESTABLISHED connections to non-local peers: for a Steam
+    # dedicated server, the game MUST hold an outbound connection to Steam's
+    # servers to complete game-server login (advertise, A2S, accept joins).
+    # If that set is EMPTY the game is talking only to itself — its Steam
+    # game-server never came up, which is the "bound + ticking but never ready
+    # + clients can't join" fingerprint. This directly answers "is this tmux
+    # session actually wired to the outside world?".
     local_ports: list = []
+    external_conns: list = []
+    _lan_prefix = firewall.LAN_CIDR.split("/", 1)[0].rsplit(".", 1)[0] + "."
     try:
         entries = sorted(fds_dir.iterdir(),
                          key=lambda p: int(p.name) if p.name.isdigit() else 999)
@@ -1184,12 +1193,22 @@ def api_diagnose_stuck(name: str) -> dict:
                     _tag = f"{_pm.group(1)}:{int(_pm.group(2))}"
                     if _tag not in local_ports:
                         local_ports.append(_tag)
+                if "ESTAB" in details and " -> " in details:
+                    _remote = details.split(" -> ", 1)[1].strip()
+                    _rip = _remote.rsplit(":", 1)[0].strip().strip("[]")
+                    if not (_rip.startswith("127.") or _rip == "::1"
+                            or _rip.startswith(_lan_prefix) or _rip.startswith("0.0.0.0")
+                            or _rip in ("::", "*")):
+                        _d = details.strip()
+                        if _d not in external_conns:
+                            external_conns.append(_d)
             if idx < 40:
                 fds.append(f"{fd.name} -> {annotated}")
     except OSError as e:
         fds.append(f"(cannot list fds: {e})")
     result["open_fds"] = fds
     result["local_ports"] = local_ports
+    result["external_conns"] = external_conns
 
     thread_wchans: list[str] = []
     try:
