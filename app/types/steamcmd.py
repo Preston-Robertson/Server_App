@@ -55,13 +55,25 @@ cd "$(dirname "$0")"
 # --- launch-environment fixes for Unreal dedicated servers (Palworld/ARK) ---
 # Raise the open-file limit. Unreal Engine dedicated servers open tens of
 # thousands of file handles while streaming the world's .pak/.ucas assets on
-# boot; the default 1024 soft limit makes world-load STALL silently — the
-# process climbs to ~800 MB-1 GB RSS then freezes with no crash and no error
-# (exactly the Palworld symptom we chased). Every working native-Linux
+# boot; a low soft limit (systemd's default is often 1024) makes world-load
+# STALL silently — the process climbs to ~800 MB-1 GB RSS then freezes with no
+# crash and no stdout error (the EMFILE goes to Pal/Saved/Logs/Pal.log, not the
+# console) right after "Running <game> on :PORT". Every working native-Linux
 # Palworld deploy raises this (LimitNOFILE=100000 in the BitsNBytes installer
-# systemd unit; LinuxGSM sets ulimit -n). We set it here too so it applies
-# even when the systemd LimitNOFILE isn't redeployed.
-ulimit -n 100000 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+# unit; LinuxGSM sets ulimit -n).
+# A FIXED `ulimit -n 100000` FAILS SILENTLY if the hard cap is lower, dropping
+# the game back to the tiny default. Lift the SOFT limit up to whatever the
+# HARD ceiling allows instead — robust regardless of the unit's LimitNOFILE.
+# This is also the leading explanation for "why running Minecraft helped": the
+# shared tmux daemon Palworld used to run inside was spawned by a unit with
+# LimitNOFILE=100000, so its pane inherited a high limit; Palworld's OWN private
+# daemon only gets what start.sh sets right here.
+_hard_nofile="$(ulimit -Hn 2>/dev/null || echo 1024)"
+if [[ "$_hard_nofile" == "unlimited" ]]; then
+  ulimit -n 1048576 2>/dev/null || ulimit -n 100000 2>/dev/null || true
+else
+  ulimit -n "$_hard_nofile" 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+fi
 # NOTE: we deliberately DO NOT override XDG_RUNTIME_DIR. An earlier version set
 # it to "$(pwd)/.runtime" thinking Steam needed a writable runtime dir — but
 # that STALLED Palworld's world load at ~800 MB (confirmed: MemoryMax/High were
@@ -102,6 +114,11 @@ if [[ -f console.log ]] && [[ $(stat -c%s console.log 2>/dev/null || echo 0) -gt
 fi
 # Marker so the operator can find where THIS launch begins in the log.
 {{ echo ""; echo "===== $(date -Iseconds) start.sh launching (session $SESSION) ====="; }} >> console.log
+# Record the achieved open-file limits so a stalled world-load is diagnosable
+# straight from console.log: a soft value near 1024 here is the smoking gun for
+# the ~1 GB "Running on :PORT then silence" hang; a value in the 100k range
+# rules fd-exhaustion OUT and points diagnosis at the game log / port bind.
+echo "start.sh: RLIMIT_NOFILE soft=$(ulimit -Sn) hard=$(ulimit -Hn)" >> console.log
 
 # Each server uses its OWN tmux server via a private socket (-L "$SESSION",
 # named after the session). CRITICAL: with the shared DEFAULT socket, every
