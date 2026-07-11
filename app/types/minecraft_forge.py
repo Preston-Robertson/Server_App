@@ -69,8 +69,16 @@ fi
 # -f /dev/null (so tmux doesn't try to source a user config that references
 # a terminal) avoids that failure mode.
 export TERM="${{TERM:-screen-256color}}"
-TMUX="tmux -f /dev/null"
+# Private per-server tmux socket (-L "$SESSION"). With the shared default
+# socket, all games live in ONE tmux daemon: stopping one server's unit can
+# tear it down and kill every other game's session, and games escape their
+# own unit cgroup (breaking memory accounting). A per-server socket isolates
+# this game's tmux server inside its own unit cgroup.
+TMUX="tmux -L $SESSION -f /dev/null"
 
+# One-time migration: kill any stale session for THIS server on the OLD shared
+# default socket so we don't double-launch after switching sockets.
+tmux kill-session -t "$SESSION" 2>/dev/null || true
 $TMUX kill-session -t "$SESSION" 2>/dev/null || true
 
 # Start tmux DETACHED (no PTY needed under systemd), then block this shell
@@ -95,13 +103,14 @@ _STOP_TEMPLATE = """#!/usr/bin/env bash
 # JVM and can corrupt the mid-save world.
 set -euo pipefail
 SESSION="gs-{name}"
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-  tmux send-keys -t "$SESSION" "say Server stopping in 10s..." Enter || true
+TMUX="tmux -L $SESSION"   # per-server private socket (see start.sh)
+if $TMUX has-session -t "$SESSION" 2>/dev/null; then
+  $TMUX send-keys -t "$SESSION" "say Server stopping in 10s..." Enter || true
   sleep 10
-  tmux send-keys -t "$SESSION" "stop" Enter || true
+  $TMUX send-keys -t "$SESSION" "stop" Enter || true
   # Heartbeat every 30s so the journal shows the stop is progressing.
   for i in $(seq 1 {stop_timeout_sec}); do
-    tmux has-session -t "$SESSION" 2>/dev/null || exit 0
+    $TMUX has-session -t "$SESSION" 2>/dev/null || exit 0
     if (( i % 30 == 0 )); then
       echo "stop.sh: still waiting for tmux session to exit (${{i}}s elapsed)" >&2
     fi

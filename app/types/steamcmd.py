@@ -90,7 +90,20 @@ fi
 # Marker so the operator can find where THIS launch begins in the log.
 {{ echo ""; echo "===== $(date -Iseconds) start.sh launching (session $SESSION) ====="; }} >> console.log
 
+# Each server uses its OWN tmux server via a private socket (-L "$SESSION",
+# named after the session). CRITICAL: with the shared DEFAULT socket, every
+# game runs inside ONE tmux daemon for the user — so stopping one server's
+# unit tears down that shared daemon and kills EVERY other game's session
+# (this is why stopping Minecraft was killing Palworld), and games land in
+# whichever unit first spawned the daemon, wrecking systemd memory accounting
+# + stop/kill. A private socket keeps this game's tmux server in ITS OWN unit
+# cgroup, fully isolated.
+# One-time migration: older launches used the SHARED default socket; kill any
+# stale session for THIS server there so we don't end up with two instances
+# fighting over the port after switching to the private socket. Harmless once
+# migrated (the default daemon exits when its last session dies).
 tmux kill-session -t "$SESSION" 2>/dev/null || true
+tmux -L "$SESSION" kill-session -t "$SESSION" 2>/dev/null || true
 
 # Start tmux DETACHED, but wrap the actual game invocation so we can
 # capture its true exit code. Without this wrapper, tmux swallows the
@@ -108,7 +121,7 @@ tmux kill-session -t "$SESSION" 2>/dev/null || true
 # want the tmux window to persist after the game dies for hands-on
 # debugging — enable by hand-editing start.sh; the manager won't
 # regenerate over it if you also set MANAGED=false at the top.
-tmux new-session -d -s "$SESSION" -n game \\
+tmux -L "$SESSION" new-session -d -s "$SESSION" -n game \\
   "$BIN ; ec=\\$?; printf '\\nGAMESRV_EXIT=%d\\n' \\$ec | tee -a $(pwd)/console.log >&2"
 
 # Tee the tmux pane's live output to console.log. This is the ONLY way the
@@ -122,11 +135,11 @@ tmux new-session -d -s "$SESSION" -n game \\
 # won't see live output in the dashboard until the next Install regenerates
 # start.sh. Older tmux (<2.6) may not accept ``-t sess:window`` — retry
 # with just the session target if that happens.
-tmux pipe-pane -t "$SESSION:game" "cat >> $(pwd)/console.log" 2>/dev/null \\
-  || tmux pipe-pane -t "$SESSION" "cat >> $(pwd)/console.log" 2>/dev/null \\
+tmux -L "$SESSION" pipe-pane -t "$SESSION:game" "cat >> $(pwd)/console.log" 2>/dev/null \\
+  || tmux -L "$SESSION" pipe-pane -t "$SESSION" "cat >> $(pwd)/console.log" 2>/dev/null \\
   || echo "WARN: tmux pipe-pane failed; Console tab will fall back to systemd journal" >&2
 
-while tmux has-session -t "$SESSION" 2>/dev/null; do
+while tmux -L "$SESSION" has-session -t "$SESSION" 2>/dev/null; do
   sleep 1
 done
 """
@@ -138,10 +151,11 @@ _STOP_TEMPLATE = """#!/usr/bin/env bash
 # TimeoutStopSec.
 set -euo pipefail
 SESSION="gs-{name}"
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-  tmux send-keys -t "$SESSION" C-c || true
+# Private per-server socket — must match start.sh (see rationale there).
+if tmux -L "$SESSION" has-session -t "$SESSION" 2>/dev/null; then
+  tmux -L "$SESSION" send-keys -t "$SESSION" C-c || true
   for _ in $(seq 1 60); do
-    tmux has-session -t "$SESSION" 2>/dev/null || exit 0
+    tmux -L "$SESSION" has-session -t "$SESSION" 2>/dev/null || exit 0
     sleep 1
   done
 fi

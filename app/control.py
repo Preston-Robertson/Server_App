@@ -103,7 +103,7 @@ def _tmux_tree_rss_bytes(name: str) -> int | None:
     if not shutil.which("tmux"):
         return None
     try:
-        r = _run(["tmux", "list-panes", "-t", _session(name), "-F", "#{pane_pid}"])
+        r = _run(["tmux", "-L", _session(name), "list-panes", "-t", _session(name), "-F", "#{pane_pid}"])
     except (OSError, subprocess.SubprocessError):
         return None
     if r.returncode != 0 or not r.stdout.strip():
@@ -363,7 +363,10 @@ def _session(name: str) -> str:
 def console_available(sd: ServerDef) -> bool:
     if not shutil.which("tmux"):
         return False
-    r = _run(["tmux", "has-session", "-t", _session(sd.name)])
+    # -L <socket>: talk to THIS server's private tmux server (socket name ==
+    # session name). Must match the -L used in the generated start.sh, or the
+    # manager would be querying the wrong (shared) tmux daemon.
+    r = _run(["tmux", "-L", _session(sd.name), "has-session", "-t", _session(sd.name)])
     return r.returncode == 0
 
 
@@ -374,7 +377,7 @@ def send_console(sd: ServerDef, command: str) -> None:
         raise ValueError("command must not contain newlines")
     if not console_available(sd):
         raise RuntimeError("tmux session not available — is the server running?")
-    _run(["tmux", "send-keys", "-t", _session(sd.name), command, "Enter"], check=True)
+    _run(["tmux", "-L", _session(sd.name), "send-keys", "-t", _session(sd.name), command, "Enter"], check=True)
 
 
 def graceful_console_stop(sd: ServerDef) -> None:
@@ -384,7 +387,7 @@ def graceful_console_stop(sd: ServerDef) -> None:
     for line in sd.stop_cmd.splitlines():
         line = line.strip()
         if line:
-            _run(["tmux", "send-keys", "-t", _session(sd.name), line, "Enter"])
+            _run(["tmux", "-L", _session(sd.name), "send-keys", "-t", _session(sd.name), line, "Enter"])
 
 
 def shell_quote(s: str) -> str:

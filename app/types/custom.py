@@ -13,7 +13,7 @@ class CustomHandler(TypeHandler):
         if not start.exists():
             msgs.append(
                 f"NOTE: create {start} yourself. It MUST launch the game inside "
-                f"`tmux new-session -s gs-{self.sd.name} -n game '...'` so console + "
+                f"`tmux -L gs-{self.sd.name} new-session -s gs-{self.sd.name} -n game '...'` so console + "
                 "graceful stop work."
             )
         return msgs
