@@ -32,3 +32,4 @@ Thumbs.db
 # Build/rollback state
 .update-rollback
 requirements.lock.bak
+AGENT_RULES.md
