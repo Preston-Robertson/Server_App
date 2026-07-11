@@ -1839,7 +1839,7 @@ async function runDiagnose(name) {
           <table class="kv small">
             <tr><td>wchan</td><td><code>${escape(d.wchan || "-")}</code></td></tr>
             <tr><td>comm</td><td><code>${escape(d.comm || "-")}</code></td></tr>
-            <tr><td>keyctl</td><td><code>${chk.keyctl_available ? "available" : "BLOCKED (" + escape(chk.keyctl_error || "?") + ")"}</code></td></tr>
+            <tr><td>keyctl</td><td><code>${chk.keyctl_available ? ("available" + (chk.keyctl_privileged ? " (privileged CT)" : "")) : "BLOCKED (" + escape(chk.keyctl_error || "?") + ")"}</code></td></tr>
             <tr><td>world_dir fs</td><td><code>${escape(chk.world_dir_fstype || "-")}${chk.world_dir_networked ? " ⚠ networked" : ""}</code></td></tr>
             <tr><td>mem cap</td><td><code>High=${mb(ml.MemoryHigh)}  Max=${mb(ml.MemoryMax)}  Cur=${ml.MemoryCurrent == null ? "?" : mb(ml.MemoryCurrent)}</code></td></tr>
             <tr><td>launch env</td><td><code>${escape(envStr)}</code></td></tr>

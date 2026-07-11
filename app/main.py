@@ -493,11 +493,32 @@ def _check_keyctl() -> dict:
 
     result: dict = {
         "keyctl_available": False,
+        "privileged": None,
         "syscall_errno": None,
         "syscall_error_name": None,
         "detail": "",
         "fix_instructions": "",
     }
+
+    # A PRIVILEGED LXC (uid_map maps root->root) is NEVER subject to the
+    # unprivileged seccomp filter that blocks keyctl — keyctl is always
+    # available there. Read the map first so this check can never mislead by
+    # crying "blocked" on a privileged container. Only unprivileged CTs (root
+    # maps to a high host uid, e.g. 100000) can filter keyctl at all.
+    try:
+        with open("/proc/self/uid_map", encoding="ascii") as _f:
+            _m = _f.readline().split()
+        if len(_m) >= 2 and _m[0] == "0" and _m[1] == "0":
+            result["privileged"] = True
+            result["keyctl_available"] = True
+            result["detail"] = (
+                "privileged container (uid_map root->root) — keyctl is available; "
+                "not a factor."
+            )
+            return result
+        result["privileged"] = False
+    except OSError:
+        pass
 
     # keyctl(2): long keyctl(int cmd, ...). We call KEYCTL_GET_KEYRING_ID
     # (cmd=0) on the process keyring (id=-2), a read-only lookup that either
@@ -1321,6 +1342,7 @@ def api_diagnose_stuck(name: str) -> dict:
         "checks": {
             "keyctl_available": keyctl.get("keyctl_available"),
             "keyctl_error": keyctl.get("syscall_error_name"),
+            "keyctl_privileged": keyctl.get("privileged"),
             "world_dir_fstype": world.get("fstype"),
             "world_dir_networked": world.get("networked"),
             "world_dir_realpath": world.get("realpath"),
