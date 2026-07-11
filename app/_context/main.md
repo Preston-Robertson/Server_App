@@ -4,7 +4,7 @@
 ## Purpose
 FastAPI application entrypoint: defines all HTTP routes (dashboard, health, server CRUD, lifecycle actions, file ops, backup, git, firewall, admin), mounts static files and Jinja2 templates, and wires up startup hooks for the watchdog, wake proxy, perf sampler, and firewall reconciler.
 
-## Public API (routes — all require ****** except /healthz and /)
+## Public API (routes — all require bearer-token auth except /healthz and /)
 | Method | Path | Action |
 |---|---|---|
 | GET | `/` | Jinja2 dashboard HTML |

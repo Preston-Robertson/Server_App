@@ -2,11 +2,11 @@
 # Context summary for app/auth.py (23 lines).
 
 ## Purpose
-****** validation for all `/api/*` endpoints: checks the `Authorization: ****** header against `settings.token` using a constant-time comparison.
+Bearer-token validation for all `/api/*` endpoints: checks the `Authorization: ****** header against `settings.token` using a constant-time comparison.
 
 ## Public API
 - `require_token(authorization: str | None = Header(default=None)) -> None`
-  FastAPI dependency; raises `HTTPException` on failure. Used as `Depends(require_token)`.
+  FastAPI dependency; raises `HTTPException` on auth failure, returns `None` on success. Used as `Depends(require_token)`.
 
 ## Called by
 `app/main.py` — injected as `dependencies=[Depends(require_token)]` on every authenticated route.

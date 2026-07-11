@@ -13,7 +13,7 @@
 | `firewall.md` | `app/firewall.py` | UFW reconciler: manages per-server port rules tagged gamesrv-auto |
 | `registry.md` | `app/registry.py` | Parses/validates server definition YAMLs via Pydantic models |
 | `config.md` | `app/config.py` | Frozen Settings dataclass loaded from env vars on startup |
-| `auth.md` | `app/auth.py` | ****** validation for all /api endpoints |
+| `auth.md` | `app/auth.py` | Bearer-token validation for all /api endpoints |
 | `uploads.md` | `app/uploads.py` | File upload/download + backup archive creation and restore |
 | `git_source.md` | `app/git_source.py` | Pulls server config files from a git remote into install_dir |
 | `git_backup.md` | `app/git_backup.py` | Pushes local backup .tgz files to a private GitHub repo |
