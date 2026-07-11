@@ -1113,6 +1113,62 @@ def api_diagnose_stuck(name: str) -> dict:
                 "isn't responding.")
     result["hint"] = hint
 
+    # ---- cgroup memory limits + key launch env (added 2026-07-11) -------
+    # WHY: a game running inside a SHARED tmux daemon borrows another unit's
+    # cgroup limits AND environment. Once each server got its own private
+    # tmux socket, Palworld went back on its OWN unit's cgroup — so if this
+    # unit has a MemoryMax/MemoryHigh drop-in, world load now stalls against
+    # that ceiling (~800 MB-1 GB) which it previously escaped by piggybacking
+    # on another server's (larger) cgroup. Surface the effective limits + the
+    # launch env so we can tell a memory ceiling from an env problem at a
+    # glance instead of guessing.
+    mem_props: dict = {}
+    try:
+        _p = subprocess.run(
+            ["systemctl", "show", unit_prefix,
+             "--property=MemoryMax,MemoryHigh,MemorySwapMax,MemoryCurrent"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for _ln in _p.stdout.splitlines():
+            if "=" in _ln:
+                _k, _v = _ln.split("=", 1)
+                mem_props[_k] = _v
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    def _mem_or_none(v: str):
+        try:
+            n = int(v)
+        except (ValueError, TypeError):
+            return None
+        return None if (n <= 0 or n >= 2 ** 63 - 1) else n
+
+    mem_max = _mem_or_none(mem_props.get("MemoryMax", ""))
+    mem_high = _mem_or_none(mem_props.get("MemoryHigh", ""))
+    result["mem_limits"] = {
+        "MemoryMax": mem_max,
+        "MemoryHigh": mem_high,
+        "MemorySwapMax": _mem_or_none(mem_props.get("MemorySwapMax", "")),
+        "MemoryCurrent": _mem_or_none(mem_props.get("MemoryCurrent", "")),
+    }
+
+    # Whitelist of launch-env vars that affect Steam/Unreal startup. We do
+    # NOT dump the whole environ (it can carry secrets); only these keys.
+    _ENV_KEYS = ("XDG_RUNTIME_DIR", "SENTRY_DSN", "HOME", "LD_LIBRARY_PATH",
+                 "STEAM_RUNTIME", "TERM", "MEMORY_MB", "GAME_PORT", "TMPDIR")
+    env_seen: dict = {}
+    try:
+        _raw = Path(f"/proc/{target_pid}/environ").read_bytes()
+        for _kv in _raw.split(bytes([0])):
+            if b"=" in _kv:
+                _ek, _ev = _kv.split(b"=", 1)
+                _eks = _ek.decode("utf-8", "replace")
+                if _eks in _ENV_KEYS:
+                    env_seen[_eks] = _ev.decode("utf-8", "replace")
+    except OSError:
+        pass
+    result["env"] = env_seen
+
     # ---- consolidated verdict ------------------------------------------
     # Fold the raw /proc introspection together with the two host-level
     # blockers this manager already knows about (keyctl syscall filter,
@@ -1133,6 +1189,49 @@ def api_diagnose_stuck(name: str) -> dict:
     wchan = result.get("wchan") or ""
 
     causes: list[dict] = []
+
+    # 0) cgroup memory ceiling — the game is capped below what a loaded world
+    # needs. THIS is the "another server's cgroup let Palworld reach 6.7 GB"
+    # story: a MemoryHigh/Max on this unit throttles world load near the cap,
+    # but running inside another server's tmux daemon borrowed that unit's
+    # larger cgroup and escaped it.
+    _memcur = result["mem_limits"].get("MemoryCurrent") or 0
+    _need = (sd.memory_mb or 0) * 1024 * 1024
+
+    def _cap_bites(cap) -> bool:
+        if not cap:
+            return False
+        pressed = bool(_memcur) and _memcur >= cap * 0.85
+        far_below_need = bool(_need) and cap < _need * 0.6
+        return pressed or far_below_need
+
+    _ceiling = None
+    if _cap_bites(mem_high):
+        _ceiling = ("MemoryHigh", mem_high)
+    elif _cap_bites(mem_max):
+        _ceiling = ("MemoryMax", mem_max)
+    if _ceiling:
+        _prop, _capval = _ceiling
+        _cap_mb = _capval // (1024 * 1024)
+        causes.append({
+            "cause": f"cgroup memory ceiling ({_prop}\u2248{_cap_mb} MB) throttling world load",
+            "confidence": "high",
+            "why": (
+                f"This unit has {_prop}\u2248{_cap_mb} MB, but the server def asks "
+                f"for {sd.memory_mb} MB. Unreal world load pushes past the cap and "
+                "the kernel throttles/reclaims, so RAM parks just under the ceiling "
+                "and the world never finishes loading. When the game ran inside "
+                "another server's shared tmux daemon it borrowed THAT unit's larger "
+                "cgroup and loaded fine — that's why the other server 'helped'."
+            ),
+            "fix": (
+                f"Raise/remove the cap (run as root on the LXC), then restart:\n"
+                f"  systemctl set-property {unit_prefix} MemoryHigh=infinity "
+                f"MemoryMax={(sd.memory_mb // 1024) + 2}G\n"
+                "That writes + applies a drop-in live. Or delete the existing "
+                "drop-in that set the low cap."
+            ),
+        })
 
     # 1) keyctl seccomp block — the canonical Palworld "~1 GB freeze".
     if is_steam_game and not keyctl.get("keyctl_available", False) \

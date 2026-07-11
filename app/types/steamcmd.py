@@ -62,11 +62,14 @@ cd "$(dirname "$0")"
 # systemd unit; LinuxGSM sets ulimit -n). We set it here too so it applies
 # even when the systemd LimitNOFILE isn't redeployed.
 ulimit -n 100000 2>/dev/null || ulimit -n 65536 2>/dev/null || true
-# Steam's runtime expects a writable XDG_RUNTIME_DIR. As a system service we
-# have no logind-managed /run/user/<uid>, so hand Steam a private one under
-# the install dir — otherwise SteamAPI init can stall waiting on it.
-export XDG_RUNTIME_DIR="$(pwd)/.runtime"
-mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null && chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+# NOTE: we deliberately DO NOT override XDG_RUNTIME_DIR. An earlier version set
+# it to "$(pwd)/.runtime" thinking Steam needed a writable runtime dir — but
+# that STALLED Palworld's world load at ~800 MB (confirmed: MemoryMax/High were
+# both infinity, so it wasn't a cgroup cap; the only launch-env delta vs a
+# Minecraft server that loaded fine in the SAME shared tmux daemon was this
+# override). Steam's IPC behaves worse pointed at a game-local disk dir than
+# left unset, where it falls back to /tmp — which PrivateTmp=false keeps
+# shared. Leave it unset. If a future game truly needs it, set it per-recipe.
 
 SESSION="gs-{name}"
 BIN="{run_cmd}"

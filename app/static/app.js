@@ -1824,6 +1824,9 @@ async function runDiagnose(name) {
           </div>`).join("")
       : `<p class="muted">${escape(v.summary || "No blocking cause detected.")}</p>`;
     const chk = v.checks || {};
+    const ml = d.mem_limits || {};
+    const mb = (x) => (x == null ? "∞" : Math.round(x / 1048576) + " MB");
+    const envStr = Object.entries(d.env || {}).map(([k, val]) => `${k}=${val}`).join("   ") || "(none captured)";
     panel.innerHTML = `
       <div class="diag-verdict">
         <div class="diag-title">
@@ -1838,6 +1841,8 @@ async function runDiagnose(name) {
             <tr><td>comm</td><td><code>${escape(d.comm || "-")}</code></td></tr>
             <tr><td>keyctl</td><td><code>${chk.keyctl_available ? "available" : "BLOCKED (" + escape(chk.keyctl_error || "?") + ")"}</code></td></tr>
             <tr><td>world_dir fs</td><td><code>${escape(chk.world_dir_fstype || "-")}${chk.world_dir_networked ? " ⚠ networked" : ""}</code></td></tr>
+            <tr><td>mem cap</td><td><code>High=${mb(ml.MemoryHigh)}  Max=${mb(ml.MemoryMax)}  Cur=${ml.MemoryCurrent == null ? "?" : mb(ml.MemoryCurrent)}</code></td></tr>
+            <tr><td>launch env</td><td><code>${escape(envStr)}</code></td></tr>
           </table>
           <pre class="diag-pre">${escape(d.status || "")}</pre>
           <pre class="diag-pre">${escape((d.thread_wchans || []).join("\n"))}</pre>
