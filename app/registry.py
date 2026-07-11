@@ -47,7 +47,9 @@ class PasswordsCfg(BaseModel):
     Per-game applicability:
 
       * Palworld  — server_password → `ServerPassword=`, admin_password → `AdminPassword=`
-                    (written into `Pal/Saved/Config/LinuxServer/PalWorldSettings.ini`).
+                    (written into `Pal/Saved/Config/WindowsServer/PalWorldSettings.ini`
+                    for the Wine-wrapped Windows depot; the manager also handles the
+                    legacy `LinuxServer/` path if present).
       * ARK SE/SA — appended to the launch URL as
                     `?ServerPassword=...?ServerAdminPassword=...`. Avoid `?`,
                     `&`, `"`, `'`, spaces.

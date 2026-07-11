@@ -5,10 +5,18 @@ in the server YAML (Palworld = 2394010, Satisfactory = 1690800). Anonymous
 login covers most free-to-host dedicated servers.
 
 Palworld notes (baked into the default start.sh):
-  - Binary lives at Pal/Binaries/Linux/PalServer-Linux-Shipping
-  - Also ships a top-level PalServer.sh wrapper — we call that.
+  - We install the WINDOWS depot (via steamcmd `+@sSteamCmdForcePlatformType
+    windows`) and run PalServer.exe under Wine. The native Linux build
+    hangs during world load inside unprivileged Proxmox LXCs even with
+    every documented fix applied — LinuxGSM reproduces the same hang,
+    which rules out our manager as the cause. Wine path uses the exact
+    same infrastructure as Enshrouded.
+  - Binary lives at PalServer.exe (launcher) →
+    Pal/Binaries/Win64/PalServer-Win64-Shipping.exe (actual game).
   - Save data lives in Pal/Saved — we symlink Saved -> world_dir so the
-    NFS bind mount holds saves.
+    NFS bind mount holds saves. Same path on both depots.
+  - Config file lives at Pal/Saved/Config/WindowsServer/PalWorldSettings.ini
+    (NOT LinuxServer/ — the Windows depot writes to a different folder).
 
 Satisfactory notes:
   - Binary is FactoryServer.sh (top-level wrapper); single UDP port since
@@ -132,48 +140,43 @@ fi
 #                handler wraps it in `wine ...` and sets WINEPREFIX.
 #   steamcmd_platform — "linux" (default) or "windows".
 _APP_RECIPES: dict[int, dict] = {
-    2394010: {  # Palworld dedicated
+    2394010: {  # Palworld dedicated — Windows depot under Wine
         "name": "palworld",
-        # Launch and env mostly match the OFFICIAL Pocketpair Linux docs:
-        # https://docs.palworldgame.com/getting-started/deploy-dedicated-server/
-        # (Linux with SteamCMD tab) — literally just `./PalServer.sh -log`.
+        # WHY WINE AND NOT NATIVE LINUX:
         #
-        # HOWEVER — we ALSO set the two env vars that every working
-        # Debian-based Palworld systemd unit in the wild sets
-        # (A1RM4X/HowTo-Palworld's palworld.service, AidenM6901's fork,
-        # LinuxGSM's palworld config). Pocketpair's minimal docs work on
-        # a Steam-Client-populated home dir; on a headless SteamCMD-only
-        # Debian install those two vars are what bridges the gap:
+        # Palworld's native Linux dedicated server has a documented,
+        # widely-reproduced hang in unprivileged Debian LXCs: it completes
+        # Steam init (IPC shared memory allocated, UDP 27015 registered
+        # with Valve, pak files opened), then wedges during world load
+        # with RAM stuck ~1 GB and never binds the game port. LinuxGSM
+        # reproduces the identical hang on the same host, which rules out
+        # the manager as the cause — it's a Palworld × LXC-kernel-syscall
+        # interaction. After a marathon debugging session applying every
+        # documented fix (dir symlinks at ~/.steam/sdk{32,64}, keyctl,
+        # nesting, fuse, SteamAppId, LD_LIBRARY_PATH, bIsMultiplay), the
+        # native Linux path could not be made to reach world-load
+        # completion on this host class. See the deep-dive comments on
+        # the removed _apply_palworld_steam_runtime helper.
         #
-        #   SteamAppId=2394010
-        #     Palworld's SteamAPI_Init() falls back to this env var when
-        #     it can't find steam_appid.txt in CWD. Without it, some
-        #     builds silently identify as app 0 and never complete init.
+        # The Windows depot (PalServer.exe) runs cleanly under Wine using
+        # exactly the same infrastructure as Enshrouded (see 2278520
+        # recipe below). Windows Palworld's Steamworks integration takes
+        # different code paths that don't hit the LXC-specific syscall
+        # traps of the Linux build.
         #
-        #   LD_LIBRARY_PATH={install_dir}/:...
-        #     Palworld puts a steamclient.so at the root of install_dir
-        #     (in addition to Pal/Binaries/Linux/ and linux64/). Steam
-        #     Runtime's dlopen looks in LD_LIBRARY_PATH for the "real"
-        #     library after finding the local shim. Without HOME on the
-        #     path, resolution fails half-way and the IPC:CSteamEngin
-        #     thread deadlocks in do_epoll_wait waiting for a Steam
-        #     Client that will never respond.
+        # PalServer.exe is a launcher that spawns
+        # Pal/Binaries/Win64/PalServer-Win64-Shipping.exe. The launcher
+        # holds the process group for us, so systemd's MainPID tracking
+        # works the same as any other Wine game.
         #
-        # PREREQUISITE for Palworld to actually run in an unprivileged
-        # LXC: the LXC config MUST have `features: nesting=1,keyctl=1`
-        # on the Proxmox host. Palworld's Steam auth path calls the
-        # keyctl() syscall which unprivileged LXCs block by default —
-        # that block causes the classic silent hang after "Running
-        # Palworld dedicated server on :PORT". Satisfactory doesn't hit
-        # that syscall path so it works without keyctl. See the manager's
-        # /api/diagnostics/keyctl endpoint (Admin page) for a live check.
-        "run": "./PalServer.sh -log",
+        # Config file path DIFFERS from native Linux:
+        #   Linux:   Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
+        #   Windows: Pal/Saved/Config/WindowsServer/PalWorldSettings.ini
+        # _apply_palworld_passwords() auto-detects which dir exists.
+        "run": "./PalServer.exe -log",
         "saves_rel": "Pal/Saved",
-        "env": {
-            "HOME": "{install_dir}",
-            "SteamAppId": "2394010",
-            "LD_LIBRARY_PATH": "{install_dir}/:{install_dir}/linux64/:{install_dir}/Pal/Binaries/Linux/",
-        },
+        "wine": True,
+        "steamcmd_platform": "windows",
     },
     1690800: {  # Satisfactory dedicated
         # Post-1.0 quirks (learned the hard way — see
@@ -457,7 +460,9 @@ def _apply_valheim_passwords(run_cmd: str, server_pw: str) -> tuple[str, str]:
 
 # Palworld config editing — the game reads a single monolithic
 # OptionSettings=(K=V,K=V,...) line inside
-# Pal/Saved/Config/LinuxServer/PalWorldSettings.ini.
+# Pal/Saved/Config/{WindowsServer,LinuxServer}/PalWorldSettings.ini.
+# Windows depot (our default under Wine) writes to WindowsServer/;
+# legacy Linux depot writes to LinuxServer/. See _apply_palworld_passwords.
 _PALWORLD_KV_RE = re.compile(r'([A-Za-z]+)=("(?:[^"\\]|\\.)*")')
 
 
@@ -487,9 +492,27 @@ def _apply_palworld_passwords(install_dir, port: int, server_pw: str, admin_pw: 
     hang debugging), the port MUST be set here in ``PalWorldSettings.ini``
     via the ``PublicPort`` field. Palworld reads this to decide what UDP
     port to bind.
+
+    Config-file directory differs by depot:
+      * Windows build under Wine → Pal/Saved/Config/WindowsServer/
+      * Native Linux build       → Pal/Saved/Config/LinuxServer/
+    We accept whichever directory the installed binary uses. If both
+    exist (mid-migration), we prefer WindowsServer since that's what a
+    freshly-installed Wine-based Palworld will read.
     """
     default_ini = install_dir / "DefaultPalWorldSettings.ini"
-    target_ini = install_dir / "Pal" / "Saved" / "Config" / "LinuxServer" / "PalWorldSettings.ini"
+    win_ini = install_dir / "Pal" / "Saved" / "Config" / "WindowsServer" / "PalWorldSettings.ini"
+    lin_ini = install_dir / "Pal" / "Saved" / "Config" / "LinuxServer" / "PalWorldSettings.ini"
+
+    # Pick the target ini: prefer an already-populated one; otherwise,
+    # bootstrap a fresh WindowsServer/ config since the Wine recipe is
+    # the current default (see _APP_RECIPES[2394010]).
+    if win_ini.exists():
+        target_ini = win_ini
+    elif lin_ini.exists():
+        target_ini = lin_ini
+    else:
+        target_ini = win_ini   # will be created below from Default
 
     if target_ini.exists():
         text = target_ini.read_text(encoding="utf-8")
@@ -500,7 +523,8 @@ def _apply_palworld_passwords(install_dir, port: int, server_pw: str, admin_pw: 
         return (
             "WARNING: Palworld DefaultPalWorldSettings.ini not found; "
             "port + passwords NOT applied. Complete the install first, then set "
-            "them manually in Pal/Saved/Config/LinuxServer/PalWorldSettings.ini."
+            "them manually in Pal/Saved/Config/WindowsServer/PalWorldSettings.ini "
+            "(or LinuxServer/ if you're on the native Linux depot)."
         )
 
     changed: list[str] = []
@@ -708,7 +732,7 @@ def _wine_prefix_init(install_dir, on_event=None) -> str:
 # cheap to fix (delete something, retry); a false-negative (partial install
 # because df ran out mid-download) leaves install_dir wedged.
 _MIN_DISK_GB: dict[int, int] = {
-    2394010: 8,    # Palworld (~4 GB game)
+    2394010: 12,   # Palworld Windows depot under Wine (~4 GB game + ~2 GB Wine prefix + shader cache)
     1690800: 15,   # Satisfactory (~7 GB game + updates)
     376030:  35,   # ARK: Survival Evolved (~20 GB game)
     2430930: 60,   # ARK: Survival Ascended (heavy Unreal 5 build)
@@ -906,11 +930,11 @@ class SteamCmdHandler(TypeHandler):
 
         game_port = _effective_game_port(self.sd)
         run_cmd = recipe["run"].format(name=self.sd.name, port=game_port)
-        # Palworld special case: docs show `./PalServer.sh` with no args;
-        # port defaults to 8211. If the operator picked a different port,
-        # we still need to override via `-port=N` (docs list this arg as
-        # valid). Appending it only when non-default keeps the launch
-        # line matching Pocketpair's example verbatim in the common case.
+        # Palworld special case: the recipe's `run` doesn't include -port=
+        # (Pocketpair's docs recommend PalWorldSettings.ini's PublicPort field,
+        # which _apply_palworld_passwords writes below). If the operator picked
+        # a non-default port, ALSO pass -port= on the command line as a
+        # belt-and-suspenders override so the two sources can't disagree.
         if self.sd.steam_app_id == 2394010 and game_port != 8211:
             run_cmd = f"{run_cmd} -port={game_port}"
         if self.sd.wake_on_demand:
@@ -1086,186 +1110,19 @@ def _apply_post_install_config(sd, install_dir, world_dir) -> list[str]:
     """Idempotent per-game config writer. Runs after every install/configure.
 
     Dispatches by ``sd.steam_app_id`` to per-game helpers:
-      * Palworld (2394010) — populate ``$HOME/.steam/sdk{32,64}/`` with
-        real Steam runtime libraries so ``SteamAPI_Init()`` completes
-        instead of spinning forever waiting for a Steam Client that
-        doesn't exist.
+      * Palworld (2394010) — Windows depot under Wine (see recipe). The
+        old ``_apply_palworld_steam_runtime`` symlink helper for the
+        native Linux depot is no longer dispatched; the Wine path
+        doesn't need it and the Linux depot is no longer the default.
       * Satisfactory (1690800) — writes ``AutoLoadSessionName`` pointing
         at the newest ``.sav`` under ``world_dir``.
 
     Kept as a single dispatch function so future games can slot in without
     touching the main install() path.
     """
-    if sd.steam_app_id == 2394010:
-        return _apply_palworld_steam_runtime(install_dir)
     if sd.steam_app_id == 1690800:
         return _apply_satisfactory_autoload(sd, install_dir, world_dir)
     return []
-
-
-def _apply_palworld_steam_runtime(install_dir) -> list[str]:
-    """Set up the Steam Runtime directory symlinks Palworld needs.
-
-    THE ANSWER THAT SETTLED HOURS OF DEBUGGING:
-
-    Every working Palworld-on-Debian-LXC guide (AidenM6901's tutorial,
-    A1RM4X's HowTo-Palworld, hosting-provider docs) does the SAME thing:
-
-        cd ~/.steam
-        ln -s steam/steamcmd/linux32 sdk32
-        ln -s steam/steamcmd/linux64 sdk64
-
-    Notice these are ``ln -s`` on the last argument being a DIRECTORY
-    NAME (``linux32`` / ``linux64``), not a file. The resulting symlinks
-    are DIRECTORY symlinks — ``~/.steam/sdk64`` becomes a whole
-    directory containing every file Steam Runtime installed there,
-    not just steamclient.so.
-
-    An earlier version of this helper created FILE symlinks
-    (``~/.steam/sdk64/steamclient.so → some steamclient.so``) which is
-    wrong. Steam Runtime's dlopen path looks up MULTIPLE files inside
-    ``~/.steam/sdk64/`` — steamclient.so, libsteamnetworkingsockets.so,
-    libsdkencryptedappticket.so, config files, etc. With only one file
-    symlinked, the others aren't found and Steam Runtime's
-    IPC:CSteamEngin thread deadlocks in do_epoll_wait waiting for
-    resolution that never comes. Confirmed via /proc/PID/wchan analysis
-    on 2026-07-10.
-
-    Directory targets — order of preference:
-      1. ``install_dir/linux64/`` — bundled by Palworld's own SteamCMD
-         install of the game depot (created by ``+app_update 2394010``)
-      2. ``install_dir/.local/share/Steam/steamcmd/linux64/`` — created
-         by the manager's SteamCMD invocation, present when the
-         manager ran ``steamcmd`` with HOME=install_dir
-
-    NEVER point at ``install_dir/Pal/Binaries/Linux/`` — that directory
-    contains the GAME'S server-mode Steamworks shim. Pointing sdk64 there
-    creates a circular reference: Steam Runtime's dlopen finds itself.
-
-    Requires the Palworld recipe to pin ``HOME=install_dir`` so
-    ``~/.steam/`` resolves to ``install_dir/.steam/``.
-    """
-    from pathlib import Path
-    install_dir = Path(install_dir)
-
-    def _pick_dir(candidates: list[Path]) -> Path | None:
-        for c in candidates:
-            if c.is_dir():
-                # Must contain steamclient.so — otherwise it's an empty
-                # dir that won't help Steam Runtime.
-                if (c / "steamclient.so").exists():
-                    return c
-        return None
-
-    sdk64_target = _pick_dir([
-        # SteamCMD's own runtime is CANONICALLY the "real" Steam Runtime
-        # (contains steamclient.so + steamerrorreporter + runtime helpers).
-        # Palworld's install_dir/linux64/ is a MINIMAL bundle — usually
-        # only steamclient.so. Prefer SteamCMD's dir first so the symlink
-        # exposes the full Steam Runtime file set, matching what the
-        # working Debian tutorial's `~/.steam/steam/steamcmd/linux64`
-        # target does.
-        install_dir / ".local" / "share" / "Steam" / "steamcmd" / "linux64",
-        install_dir / "linux64",                                       # fallback
-    ])
-    sdk32_target = _pick_dir([
-        install_dir / ".local" / "share" / "Steam" / "steamcmd" / "linux32",
-        install_dir / "linux32",
-    ])
-
-    msgs: list[str] = []
-    if sdk64_target is None:
-        msgs.append(
-            "WARNING (Palworld): could not find a linux64/ directory "
-            f"containing steamclient.so under {install_dir}. Steam Runtime "
-            "will fail to init. Re-run Install so SteamCMD populates the "
-            "game files."
-        )
-        return msgs
-
-    steam_root = install_dir / ".steam"
-    try:
-        steam_root.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        msgs.append(
-            f"WARNING (Palworld): could not create {steam_root} ({e}). "
-            "Fix ownership on install_dir."
-        )
-        return msgs
-
-    # ALSO create ~/.steam/steam as a placeholder directory. Some Steam
-    # Runtime code paths check its existence via stat() before falling
-    # back to server-mode. Empty is fine — it just needs to exist so the
-    # stat() succeeds and the fallback logic doesn't block.
-    try:
-        (steam_root / "steam").mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-
-    def _make_dir_symlink(link_name: str, target: Path | None, arch: str) -> None:
-        if target is None:
-            msgs.append(f"NOTE (Palworld): no {arch} runtime dir found — skipping .steam/{link_name}")
-            return
-        link = steam_root / link_name
-        # Remove any prior state — could be a leftover file symlink from
-        # the old buggy version of this helper, an empty directory, or
-        # a stale correct symlink pointing at a moved path.
-        if link.is_symlink() or link.exists():
-            try:
-                if link.is_symlink() or link.is_file():
-                    link.unlink()
-                elif link.is_dir():
-                    # Might be a leftover empty dir from the old buggy
-                    # version. If it's empty, remove it; if it has real
-                    # content, leave it alone (operator may have hand
-                    # populated it).
-                    try:
-                        link.rmdir()   # only succeeds if empty
-                    except OSError:
-                        msgs.append(
-                            f"WARNING (Palworld): {link} is a non-empty "
-                            "directory (not a symlink). Leaving it alone. "
-                            "Delete it manually if Steam runtime still fails."
-                        )
-                        return
-            except OSError as e:
-                msgs.append(f"WARNING (Palworld): could not remove existing {link}: {e}")
-                return
-
-        # Create the DIRECTORY symlink. Use a relative target when
-        # possible so the symlink survives install_dir moves — matches
-        # the tutorial pattern (``ln -s steam/steamcmd/linux64 sdk64``
-        # is relative to steam_root).
-        try:
-            rel_target = target.relative_to(steam_root.parent)
-            # rel_target is now relative to install_dir. To make it
-            # relative to steam_root (which is install_dir/.steam), we
-            # prepend "..".
-            rel_from_steam = Path("..") / rel_target
-            link.symlink_to(rel_from_steam, target_is_directory=True)
-            msgs.append(
-                f"post-install (Palworld): .steam/{link_name} -> {rel_from_steam} "
-                "(directory symlink, matches tutorial pattern that resolves the "
-                "IPC:CSteamEngin do_epoll_wait hang)"
-            )
-        except (OSError, ValueError) as e:
-            # Fall back to absolute symlink if relative computation fails.
-            try:
-                link.symlink_to(target, target_is_directory=True)
-                msgs.append(
-                    f"post-install (Palworld): .steam/{link_name} -> {target} "
-                    "(absolute directory symlink)"
-                )
-            except OSError as e2:
-                msgs.append(
-                    f"WARNING (Palworld): could not create .steam/{link_name} "
-                    f"symlink ({e2}). Steam Runtime will fail to init."
-                )
-
-    _make_dir_symlink("sdk64", sdk64_target, "64-bit")
-    _make_dir_symlink("sdk32", sdk32_target, "32-bit")
-
-    return msgs
 
 
 def _apply_satisfactory_autoload(sd, install_dir, world_dir) -> list[str]:

@@ -1064,7 +1064,7 @@ def _find_game_pid_under_unit(unit_prefix: str) -> Optional[int]:
     """Walk /proc looking for the actual game PID under the given systemd unit.
 
     A game unit's process tree is:
-      systemd -> start.sh -> tmux -> PalServer.sh (or similar) -> GAME BINARY
+      systemd -> start.sh -> tmux -> PalServer.sh|PalServer.exe|wine -> GAME BINARY
 
     All of those are in the unit's cgroup. My earlier version returned the
     FIRST non-shell match, which was often the wrapper script — those sit
@@ -1079,8 +1079,9 @@ def _find_game_pid_under_unit(unit_prefix: str) -> Optional[int]:
     """
     from pathlib import Path
     KNOWN_GAME_BINARIES = {
-        "PalServer-Linux",           # Palworld (truncated to 15 chars in comm)
+        "PalServer-Linux",           # Palworld native Linux (truncated to 15 chars in comm)
         "PalServer-Linu",            # kernel /proc/*/comm 15-char cap
+        "PalServer-Win64",           # Palworld Windows depot under Wine
         "FactoryServer",             # Satisfactory
         "ShooterGameSer",            # ARK (truncated)
         "valheim_server",
@@ -1088,7 +1089,8 @@ def _find_game_pid_under_unit(unit_prefix: str) -> Optional[int]:
         "java",                      # Minecraft
     }
     SHELL_ISH = {"sh", "bash", "sleep", "tmux", "tmux: server", "start.sh",
-                 "stop.sh", "PalServer.sh", "FactoryServer.s"}
+                 "stop.sh", "PalServer.sh", "PalServer.exe", "FactoryServer.s",
+                 "wine", "wine64", "wineserver", "wine64-preloa", "wineboot.exe"}
 
     best_pid: Optional[int] = None
     best_score: int = -1
