@@ -153,7 +153,7 @@ _APP_RECIPES: dict[int, dict] = {
         # Palworld dedicated server on :PORT". Satisfactory doesn't hit
         # that syscall path so it works without keyctl. See the manager's
         # /api/diagnostics/keyctl endpoint (Admin page) for a live check.
-        "run": "./PalServer.sh",
+        "run": "./PalServer.sh -log",
         "saves_rel": "Pal/Saved",
         "env": {"HOME": "{install_dir}"},
     },
