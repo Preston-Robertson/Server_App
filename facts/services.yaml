@@ -1,0 +1,87 @@
+# facts/services.yaml
+# Supported game server types in this repo.
+# Source: servers/*.example.yml filenames and their content.
+# Ports: taken directly from example YAMLs; null = not specified in example.
+# Do NOT invent port numbers not visible in the examples.
+
+services:
+
+  - name: ark
+    type: steamcmd
+    steam_app_id: 376030
+    example_config: servers/ark.example.yml
+    default_ports:
+      game_udp: 7777
+      raw_socket_udp: 7778       # port + 1 (peer-to-peer)
+      steam_query_udp: 27015     # fixed, not configurable
+    notes: >
+      ARK: Survival Evolved. Heavyweight (8–14 GB RAM idle, more with mods).
+      Restart=no is intentional — crashes stay failed so operators notice.
+
+  - name: ark-ascended
+    type: steamcmd
+    steam_app_id: 2430930
+    example_config: servers/ark-ascended.example.yml
+    default_ports:
+      game_udp: 7777
+      steam_query_udp: 27015     # fixed, not configurable
+    notes: >
+      ARK: Survival Ascended (Unreal Engine 5). Even heavier than ARK SE
+      (16–24 GB RAM idle). Native Linux support intermittent; may need Wine.
+
+  - name: enshrouded
+    type: steamcmd
+    steam_app_id: 2278520
+    example_config: servers/enshrouded.example.yml
+    default_ports:
+      game_udp: 15636
+      steam_query_udp: 15637     # port + 1, auto-derived
+    notes: >
+      Windows-only binary; runs under Wine. Requires bootstrap.sh --with-wine.
+      Good wake-on-demand candidate due to Wine overhead at idle.
+
+  - name: minecraft-smp
+    type: minecraft-java
+    steam_app_id: null
+    example_config: servers/minecraft-smp.example.yml
+    default_ports:
+      game_tcp: 25565
+      rcon_tcp: 25575            # optional, disabled by default
+    notes: >
+      Vanilla / Paper / Fabric. Upload server.jar via Files tab before starting.
+      Requires eula=true in eula.txt after first start attempt.
+
+  - name: minecraft-forge-smp
+    type: minecraft-forge
+    steam_app_id: null
+    example_config: servers/minecraft-forge-smp.example.yml
+    default_ports:
+      game_tcp: 25565
+      rcon_tcp: 25575            # optional, disabled by default
+    notes: >
+      Modded Forge. Uses run.sh inside tmux. Java 17 for 1.20.x, Java 21 for
+      1.21.x. TimeoutStopSec=300 critical for modded packs with custom dimensions.
+
+  - name: palworld
+    type: steamcmd
+    steam_app_id: 2394010
+    example_config: servers/palworld.example.yml
+    default_ports:
+      game_udp: 8211
+      steam_query_udp: 27015
+    notes: >
+      LimitNOFILE=100000 required (Unreal Engine asset streaming stalls otherwise).
+      PrivateTmp must be false for Steam runtime IPC.
+
+  - name: satisfactory
+    type: steamcmd
+    steam_app_id: 1690800
+    example_config: servers/satisfactory.example.yml
+    default_ports:
+      game_udp: 7777             # game traffic + (with -ServerQueryPort) API
+      server_api_tcp: 7777       # same port; -ServerQueryPort pins it
+      reliable_messaging_tcp: 8888  # FIXED — not configurable
+    notes: >
+      Update 8 / 1.0+. Old 15000/15777 ports no longer used. TCP 8888
+      (reliable messaging) MUST be forwarded on router or players disconnect.
+      A2S_INFO unreliable; watchdog uses HTTPS Server API instead.

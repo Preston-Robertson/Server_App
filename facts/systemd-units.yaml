@@ -1,0 +1,47 @@
+# facts/systemd-units.yaml
+# One entry per file in systemd/ directory.
+# Purpose inferred from filename + reading the unit files.
+# enabled-by-default: null = unknown / not set in unit; true/false = verified.
+
+units:
+
+  - unit_name: gamesrv@.service
+    file: systemd/gamesrv@.service
+    type: template
+    purpose: >
+      Template unit for running a single game server instance. One instance
+      per game (e.g. gamesrv@palworld.service). Runs as `gamesrv` user,
+      WorkingDirectory=/srv/gameservers/%i, ExecStart=%i/start.sh,
+      ExecStop=%i/stop.sh. LimitNOFILE=100000 for Unreal Engine file-handle
+      requirements. Restart=no (intentional — crashes stay visible as "failed").
+    enabled_by_default: false
+    notes: >
+      Instances are enabled per-server via `systemctl enable gamesrv@<name>`.
+      Enable/disable is managed by the dashboard (auto_start_on_boot field).
+      PrivateTmp is intentionally NOT set (breaks Steam runtime IPC).
+
+  - unit_name: gamesrv-manager.service
+    file: systemd/gamesrv-manager.service
+    type: service
+    purpose: >
+      The FastAPI manager daemon. Runs as `gamesrv` user. Loads /etc/gamesrv.env.
+      ExecStart=/opt/gamesrv/run_manager.sh (uvicorn). Restart=always so the
+      Admin → Restart button (os._exit(0)) brings it back.
+    enabled_by_default: true
+    notes: >
+      NoNewPrivileges=false is intentional — manager shells out to `sudo ufw`
+      for firewall reconcile (app/firewall.py). ProtectSystem=full makes /etc
+      read-only except ReadWritePaths=/etc/gamesrv.env for the env editor.
+
+  - unit_name: gamesrv-updater.service
+    file: systemd/gamesrv-updater.service
+    type: oneshot
+    purpose: >
+      Self-update runner. Triggered on-demand by `systemctl start --no-block
+      gamesrv-updater.service` (via polkit rule). Runs as root so it can
+      restart gamesrv-manager.service after the update. Runs update.sh.
+    enabled_by_default: false
+    notes: >
+      WantedBy is empty — never started at boot, only on demand. Being its
+      own cgroup means restarting gamesrv-manager at the end of update.sh
+      does NOT kill this process. TimeoutStartSec=1200 (20 min guard).
