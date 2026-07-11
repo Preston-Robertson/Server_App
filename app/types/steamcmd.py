@@ -155,27 +155,40 @@ _APP_RECIPES: dict[int, dict] = {
         # documented fix (dir symlinks at ~/.steam/sdk{32,64}, keyctl,
         # nesting, fuse, SteamAppId, LD_LIBRARY_PATH, bIsMultiplay), the
         # native Linux path could not be made to reach world-load
-        # completion on this host class. See the deep-dive comments on
-        # the removed _apply_palworld_steam_runtime helper.
+        # completion on this host class.
         #
-        # The Windows depot (PalServer.exe) runs cleanly under Wine using
-        # exactly the same infrastructure as Enshrouded (see 2278520
-        # recipe below). Windows Palworld's Steamworks integration takes
-        # different code paths that don't hit the LXC-specific syscall
-        # traps of the Linux build.
+        # The Windows depot runs under Wine using the same infrastructure
+        # as Enshrouded (see 2278520 recipe below).
         #
-        # PalServer.exe is a launcher that spawns
-        # Pal/Binaries/Win64/PalServer-Win64-Shipping.exe. The launcher
-        # holds the process group for us, so systemd's MainPID tracking
-        # works the same as any other Wine game.
+        # WHY WE BYPASS PalServer.exe AND RUN THE SHIPPING BINARY DIRECTLY:
+        #
+        # The 182 KB `PalServer.exe` in install_dir top-level is a thin
+        # launcher that uses a Windows-specific CreateProcess pattern to
+        # spawn `Pal/Binaries/Win64/PalServer-Win64-Shipping.exe`. Under
+        # Wine 8.0 (Debian 12's package), that spawn fails silently: the
+        # launcher exits with code 41 and the shipping binary never
+        # appears in the process list (verified in journalctl — no
+        # PalServer-Win64-Shipping process ever spawned before systemd
+        # tore down the unit). We SKIP the launcher and directly execute
+        # the `-Cmd` shipping variant, which uses the Windows console
+        # subsystem — the right choice for a headless server (stdout goes
+        # to the tmux pty instead of a suppressed GUI window). The "Pal"
+        # argument is Unreal's project name (implicit when using the
+        # launcher, explicit when calling the shipping binary).
+        #
+        # WINEDEBUG override: we set `-all,err+all,fixme-all` for Palworld
+        # specifically — keeps output quiet during normal operation but
+        # surfaces Wine's own error messages when something goes wrong.
+        # Enshrouded stays on the default `-all` (proven working).
         #
         # Config file path DIFFERS from native Linux:
         #   Linux:   Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
         #   Windows: Pal/Saved/Config/WindowsServer/PalWorldSettings.ini
         # _apply_palworld_passwords() auto-detects which dir exists.
-        "run": "./PalServer.exe -log",
+        "run": "./Pal/Binaries/Win64/PalServer-Win64-Shipping-Cmd.exe Pal -log",
         "saves_rel": "Pal/Saved",
         "wine": True,
+        "wine_debug": "-all,err+all,fixme-all",
         "steamcmd_platform": "windows",
     },
     1690800: {  # Satisfactory dedicated
@@ -677,9 +690,14 @@ def _apply_enshrouded_config(install_dir, name: str, port: int,
 
 # Wrap the recipe's `run` (a path to a .exe) in Wine, with WINEPREFIX/DEBUG
 # baked into start.sh so the systemd unit doesn't need any extra env plumbing.
-def _wine_wrap_run_cmd(run_cmd: str) -> str:
+#
+# ``wine_debug`` controls WINEDEBUG. Common values:
+#   "-all"                       — silent (default; used by Enshrouded)
+#   "-all,err+all,fixme-all"     — errors only, no fixme spam (Palworld)
+#   ""                           — full default Wine output
+def _wine_wrap_run_cmd(run_cmd: str, wine_debug: str = "-all") -> str:
     return (
-        'WINEPREFIX="$(pwd)/.wine" WINEDEBUG=-all WINEARCH=win64 '
+        f'WINEPREFIX="$(pwd)/.wine" WINEDEBUG={wine_debug} WINEARCH=win64 '
         'wine ' + run_cmd
     )
 
@@ -1034,7 +1052,8 @@ class SteamCmdHandler(TypeHandler):
             self._emit(phase="wine setup", line="initialising wineprefix")
             m = _wine_prefix_init(self.install_dir, on_event=lambda ev: self._emit(**ev))
             if m: msgs.append(m)
-            run_cmd = _wine_wrap_run_cmd(run_cmd)
+            wine_debug = recipe.get("wine_debug", "-all")
+            run_cmd = _wine_wrap_run_cmd(run_cmd, wine_debug=wine_debug)
             msgs.append(f"Wine: wrapped run command → {run_cmd}")
 
         self.write_script(
