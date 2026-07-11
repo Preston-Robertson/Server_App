@@ -144,52 +144,62 @@ _APP_RECIPES: dict[int, dict] = {
         "name": "palworld",
         # WHY WINE AND NOT NATIVE LINUX:
         #
-        # Palworld's native Linux dedicated server has a documented,
-        # widely-reproduced hang in unprivileged Debian LXCs: it completes
-        # Steam init (IPC shared memory allocated, UDP 27015 registered
-        # with Valve, pak files opened), then wedges during world load
-        # with RAM stuck ~1 GB and never binds the game port. LinuxGSM
-        # reproduces the identical hang on the same host, which rules out
-        # the manager as the cause — it's a Palworld × LXC-kernel-syscall
-        # interaction. After a marathon debugging session applying every
-        # documented fix (dir symlinks at ~/.steam/sdk{32,64}, keyctl,
-        # nesting, fuse, SteamAppId, LD_LIBRARY_PATH, bIsMultiplay), the
-        # native Linux path could not be made to reach world-load
-        # completion on this host class.
+        # Palworld's native Linux dedicated server hangs during world
+        # load in unprivileged Debian LXCs (RAM ~1 GB, no port bind, no
+        # error). LinuxGSM reproduces the same hang, ruling out the
+        # manager. Windows build under Wine reproduces the SAME hang at
+        # the SAME message ("Running Palworld dedicated server on :PORT"),
+        # which points at a game-logic issue shared by both builds
+        # rather than a Wine or Linux-syscall issue.
         #
-        # The Windows depot runs under Wine using the same infrastructure
-        # as Enshrouded (see 2278520 recipe below).
+        # WHY SENTRY_DSN="":
         #
-        # WHY WE BYPASS PalServer.exe AND RUN THE SHIPPING BINARY DIRECTLY:
+        # Both builds have Sentry-native (crash reporter) compiled in.
+        # On startup Sentry tries to hand-shake with sentry.io; when
+        # outbound to Sentry's servers is restricted or slow (common in
+        # LXCs with locked-down egress), Sentry-native's init BLOCKS
+        # instead of failing gracefully. Palworld's engine waits on that
+        # init before proceeding to world load. Setting SENTRY_DSN=""
+        # tells Sentry to disable itself entirely — no network call, no
+        # block. This is the fix cited in every "Palworld hangs on
+        # dedicated Linux" thread that got resolved.
         #
-        # The 182 KB `PalServer.exe` in install_dir top-level is a thin
-        # launcher that uses a Windows-specific CreateProcess pattern to
-        # spawn `Pal/Binaries/Win64/PalServer-Win64-Shipping.exe`. Under
-        # Wine 8.0 (Debian 12's package), that spawn fails silently: the
-        # launcher exits with code 41 and the shipping binary never
-        # appears in the process list (verified in journalctl — no
-        # PalServer-Win64-Shipping process ever spawned before systemd
-        # tore down the unit). We SKIP the launcher and directly execute
-        # the `-Cmd` shipping variant, which uses the Windows console
-        # subsystem — the right choice for a headless server (stdout goes
-        # to the tmux pty instead of a suppressed GUI window). The "Pal"
-        # argument is Unreal's project name (implicit when using the
-        # launcher, explicit when calling the shipping binary).
+        # WHY -nullrhi:
         #
-        # WINEDEBUG override: we set `-all,err+all,fixme-all` for Palworld
-        # specifically — keeps output quiet during normal operation but
-        # surfaces Wine's own error messages when something goes wrong.
-        # Enshrouded stays on the default `-all` (proven working).
+        # Palworld's Windows shipping binary is a client+server hybrid
+        # (152 MB — way too large for a pure server build). It calls
+        # into D3D at startup to enumerate graphics adapters even in
+        # dedicated-server mode. Under Wine without a display, D3D
+        # returns nothing (see err:d3d:wined3d_caps_gl_ctx_create in
+        # the console log). ``-nullrhi`` is the standard Unreal Engine
+        # flag that swaps the Rendering Hardware Interface for a null
+        # implementation — skips all graphics init entirely. Standard
+        # practice for headless UE dedicated servers.
+        #
+        # WHY DIRECT SHIPPING BINARY (not PalServer.exe launcher):
+        #
+        # The 182 KB PalServer.exe is a launcher that spawns the
+        # shipping binary. Under Wine this worked eventually (once the
+        # wineprefix was warm) but the ``-Cmd`` shipping variant is the
+        # console-subsystem build — cleaner stdout/stderr routing for a
+        # headless server. The "Pal" argument is the Unreal project
+        # name (implicit via launcher, explicit via direct binary).
         #
         # Config file path DIFFERS from native Linux:
         #   Linux:   Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
         #   Windows: Pal/Saved/Config/WindowsServer/PalWorldSettings.ini
         # _apply_palworld_passwords() auto-detects which dir exists.
-        "run": "./Pal/Binaries/Win64/PalServer-Win64-Shipping-Cmd.exe Pal -log",
+        "run": "./Pal/Binaries/Win64/PalServer-Win64-Shipping-Cmd.exe Pal -log -nullrhi -nosound -nosplash",
         "saves_rel": "Pal/Saved",
         "wine": True,
         "wine_debug": "-all,err+all,fixme-all",
         "steamcmd_platform": "windows",
+        "env": {
+            # Disable Sentry crash-reporter phone-home — the specific fix
+            # for the shared Linux+Wine world-load hang. Wine passes Linux
+            # env vars through to the Windows process (GetEnvironmentVariable).
+            "SENTRY_DSN": "",
+        },
     },
     1690800: {  # Satisfactory dedicated
         # Post-1.0 quirks (learned the hard way — see
