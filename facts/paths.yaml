@@ -1,0 +1,121 @@
+# facts/paths.yaml
+# Key filesystem paths referenced across the codebase.
+# Source: bootstrap.sh, update.sh, run_manager.sh, systemd/ unit files,
+#         .env.example, and app/config.py defaults.
+# TBD = not verified from sources above; do NOT guess.
+
+paths:
+
+  app_dir:
+    path: /opt/gamesrv
+    env_var: GAMESRV_APP_DIR
+    description: >
+      Manager checkout root. Contains app/, servers/, worlds/, logs/, .venv/,
+      run_manager.sh, bootstrap.sh, update.sh.
+    source: bootstrap.sh, .env.example, app/config.py
+
+  servers_defs_dir:
+    path: /opt/gamesrv/servers
+    env_var: GAMESRV_DEFS_DIR
+    description: >
+      Per-server YAML definition files (e.g. minecraft-smp.yml).
+      Also contains *.example.yml reference files.
+    source: .env.example, app/config.py
+
+  install_root:
+    path: /srv/gameservers
+    env_var: GAMESRV_INSTALL_ROOT
+    description: >
+      Root under which each server's install_dir lives.
+      Sub-dirs named after server `name:` field (e.g. /srv/gameservers/palworld).
+    source: bootstrap.sh, .env.example, systemd/gamesrv@.service
+
+  worlds_root:
+    path: /opt/gamesrv/worlds
+    env_var: GAMESRV_WORLDS_ROOT
+    description: >
+      Root for world save directories (usually a TrueNAS NFS bind mount).
+      Sub-dirs named after server name. Symlinked from install_dir at install time.
+    source: bootstrap.sh, .env.example, app/config.py
+
+  backup_root:
+    path: /opt/gamesrv/worlds/_backups
+    env_var: GAMESRV_BACKUP_ROOT
+    description: >
+      Root under which per-server backup archives (.tgz) are written.
+      Sub-dirs: _backups/<server-name>/<timestamp>.tgz
+    source: .env.example, app/config.py
+
+  state_dir:
+    path: /opt/gamesrv/state
+    env_var: GAMESRV_STATE_DIR
+    description: >
+      Manager-owned persistent state. Currently holds steam_profiles.json
+      (steamID64 → display name address book).
+    source: app/config.py
+
+  env_file:
+    path: /etc/gamesrv.env
+    env_var: null
+    description: >
+      Runtime environment file. Read by systemd EnvironmentFile. Contains
+      GAMESRV_TOKEN, bind address/port, path overrides, optional GitHub PAT.
+      chmod 640, root:gamesrv. Editable via the Admin tab in the dashboard.
+    source: .env.example, systemd/gamesrv-manager.service, bootstrap.sh
+
+  venv:
+    path: /opt/gamesrv/.venv
+    env_var: null
+    description: Python virtual environment. Built by bootstrap.sh.
+    source: bootstrap.sh, run_manager.sh
+
+  logs_dir:
+    path: /opt/gamesrv/logs
+    env_var: null
+    description: >
+      Manager log files. Currently: update.log (written by update.sh + tee'd
+      to the journal). Game server logs go to the systemd journal, not here.
+    source: update.sh, systemd/gamesrv-updater.service, bootstrap.sh
+
+  systemd_unit_dir:
+    path: /etc/systemd/system
+    env_var: null
+    description: >
+      Where bootstrap.sh installs the manager + template units and the polkit
+      rule. Unit file templates live in the repo at systemd/.
+    source: bootstrap.sh
+
+  sudoers_drop_in:
+    path: /etc/sudoers.d/gamesrv-ufw
+    env_var: null
+    description: >
+      Grants `gamesrv` user passwordless `sudo /usr/sbin/ufw` for the
+      firewall reconciler. Installed by bootstrap.sh.
+    source: systemd/gamesrv-manager.service comment, app/firewall.py
+
+  polkit_rule:
+    path: /etc/polkit-1/rules.d/49-gamesrv.rules
+    env_var: null
+    description: >
+      Lets the unprivileged `gamesrv` user control gamesrv@* systemd units
+      and start the gamesrv-updater oneshot. Installed by bootstrap.sh from
+      scripts/49-gamesrv.rules.
+    source: bootstrap.sh, scripts/49-gamesrv.rules
+
+  per_server_install_dir:
+    path: /srv/gameservers/<name>
+    env_var: null
+    description: >
+      Individual server install directory (e.g. /srv/gameservers/palworld).
+      Contains start.sh, stop.sh, server.env, and game binaries. WorkingDirectory
+      for the gamesrv@<name>.service unit.
+    source: systemd/gamesrv@.service, servers/*.example.yml
+
+  per_server_env:
+    path: /srv/gameservers/<name>/server.env
+    env_var: null
+    description: >
+      Optional per-server environment file loaded by EnvironmentFile in the
+      template unit. Provides server-specific overrides (e.g. RCON passwords,
+      extra vars).
+    source: systemd/gamesrv@.service

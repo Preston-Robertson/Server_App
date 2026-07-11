@@ -1,5 +1,13 @@
 # Game Server Manager
 
+> **For AI agents / contributors:**
+> Start with [`AGENTS.md`](AGENTS.md) — it's the agent entrypoint that maps the codebase,
+> lists context-budget rules for large files, and links to facts, state, runbooks, and
+> per-module summaries. Do NOT use this README for internal/agent context; it is the
+> end-user manual only. Key agent docs: `facts/` (ports, paths, systemd units),
+> `state/` (current status, next actions, binding decisions), `app/_context/` (per-module
+> summaries), `runbooks/troubleshooting/` (symptom-first playbooks).
+
 A FastAPI-based dashboard + API for hosting and managing multiple game servers
 inside a single Debian 12 unprivileged LXC on Proxmox.
 

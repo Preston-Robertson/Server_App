@@ -1,0 +1,54 @@
+# facts/ports.yaml
+# Well-known port reference table for supported game types.
+# Sources: servers/*.example.yml files, systemd/gamesrv@.service comments,
+#          docs/ADDING_SERVERS.md, app/firewall.py, app/watchdog.py.
+# All ports are defaults; operators may change game ports in their server YAML.
+# manager_port is read from .env.example (GAMESRV_PORT=8765).
+
+manager:
+  fastapi_http_tcp: 8765         # GAMESRV_PORT default; set in /etc/gamesrv.env
+
+games:
+
+  minecraft_java:
+    game_tcp: 25565              # game traffic + SLP status ping
+    rcon_tcp: 25575              # optional; disabled by default
+
+  minecraft_forge:
+    game_tcp: 25565
+    rcon_tcp: 25575              # optional; disabled by default
+
+  ark_survival_evolved:
+    game_udp: 7777
+    raw_socket_udp: 7778         # port + 1; inbound peer-to-peer
+    steam_query_udp: 27015       # FIXED — not configurable
+
+  ark_survival_ascended:
+    game_udp: 7777
+    steam_query_udp: 27015       # FIXED — not configurable
+    notes: Much heavier than ARK SE; 16–24 GB RAM idle
+
+  palworld:
+    game_udp: 8211
+    steam_query_udp: 27015       # standard Steam query port
+
+  satisfactory:
+    game_udp: 7777               # game traffic (Direct Connect)
+    server_api_tcp: 7777         # HTTPS Server API (pinned via -ServerQueryPort)
+    reliable_messaging_tcp: 8888 # FIXED — reliable messaging / world save streaming
+    notes: >
+      Without TCP 8888 forwarded on router, players get "Your connection
+      to the host has been lost" after a few seconds (reliable messaging
+      handshake timeout). Old ports 15000/15777 are no longer used (Update 8+).
+
+  enshrouded:
+    game_udp: 15636
+    steam_query_udp: 15637       # port + 1, auto-derived
+    notes: Windows-only binary; runs under Wine (bootstrap.sh --with-wine)
+
+wake_on_demand:
+  internal_port_offset: 10000
+  description: >
+    When wake_on_demand=true, the proxy owns the public `port` and the game
+    binds `port + 10000` internally. E.g. Palworld public=8211, game=18211.
+    Defined in app/wake_proxy.py::WAKE_INTERNAL_OFFSET.
