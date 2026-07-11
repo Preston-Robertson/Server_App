@@ -204,17 +204,26 @@ _APP_RECIPES: dict[int, dict] = {
         # -port={port} is embedded here (the native launcher honours it);
         # PublicPort in PalWorldSettings.ini is also set as a backstop.
         #
-        # SENTRY_DSN="" disables the Sentry crash-reporter phone-home, which
-        # can block Steam init on egress-restricted LXCs. Applies to the
-        # native build too.
+        # WHY NO env HERE (root cause of the tmux-split regression, 2026-07-11):
+        # An earlier recipe set env {"SENTRY_DSN": ""} believing an empty DSN
+        # DISABLES Palworld's compiled-in Sentry crash reporter. It does NOT —
+        # an EMPTY string is an INVALID DSN, and sentry.native.unreal chokes on
+        # it during engine init, so the main thread parks in hrtimer_nanosleep
+        # and world load never triggers (RAM stuck ~1 GB, Steam otherwise
+        # connected). This stayed HIDDEN while every game shared ONE tmux
+        # server: Palworld's process ran inside the Minecraft-owned tmux server
+        # and inherited MINECRAFT's environment (which has no SENTRY_DSN), so
+        # Sentry used its VALID compiled-in DSN, init succeeded (POSTs to
+        # sentry.io return HTTP 200) and the world loaded (6.7 GB). Splitting
+        # tmux into a private socket per server put Palworld back on its OWN
+        # env with SENTRY_DSN="" — which is exactly what "spinning up Minecraft
+        # made Palworld work" really meant. Fix: set NO env at all; let the game
+        # use its working compiled-in DSN.
         #
         # Config path (native): Pal/Saved/Config/LinuxServer/PalWorldSettings.ini
         # Binary: PalServer.sh -> Pal/Binaries/Linux/PalServer-Linux-Shipping
         "run": "./PalServer.sh -port={port} -useperfthreads -NoAsyncLoadingThread -UseMuilthreadForDS",
         "saves_rel": "Pal/Saved",
-        "env": {
-            "SENTRY_DSN": "",
-        },
     },
     1690800: {  # Satisfactory dedicated
         # Post-1.0 quirks (learned the hard way — see

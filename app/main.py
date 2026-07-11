@@ -489,6 +489,7 @@ def _check_keyctl() -> dict:
     import ctypes
     import ctypes.util
     import errno
+    import platform
 
     result: dict = {
         "keyctl_available": False,
@@ -498,46 +499,72 @@ def _check_keyctl() -> dict:
         "fix_instructions": "",
     }
 
-    # keyctl(2) syscall: long keyctl(int cmd, ...). We use KEYCTL_GET_KEYRING_ID
-    # (cmd=0) on the process keyring (id=-2, KEY_SPEC_PROCESS_KEYRING), which is
-    # a read-only lookup that either returns a key ID or fails EPERM.
+    # keyctl(2): long keyctl(int cmd, ...). We call KEYCTL_GET_KEYRING_ID
+    # (cmd=0) on the process keyring (id=-2), a read-only lookup that either
+    # returns a key ID or fails (EPERM/ENOSYS when the LXC filters it).
     KEYCTL_GET_KEYRING_ID = 0
     KEY_SPEC_PROCESS_KEYRING = -2
 
+    # glibc does NOT wrap keyctl() (it lives in libkeyutils), so `libc.keyctl`
+    # raises AttributeError on most systems — which previously made this check
+    # bail into the except below and report a misleading "could not test" that
+    # the UI rendered as BLOCKED(?). Invoke the raw syscall via syscall(2)
+    # instead; the syscall number is arch-specific.
+    _KEYCTL_NR = {
+        "x86_64": 250, "aarch64": 219, "armv7l": 311, "armv6l": 311,
+        "i686": 288, "i386": 288, "ppc64le": 271, "s390x": 280, "riscv64": 219,
+    }
+
     try:
         libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
-        # syscall number for keyctl on x86_64 = 250, on aarch64 = 219.
-        # Rather than hardcode, use libc's keyctl() wrapper if available;
-        # falls back to raw syscall.
-        libc.keyctl.restype = ctypes.c_long
-        libc.keyctl.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
-        ret = libc.keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_PROCESS_KEYRING, 0)
+        ret = None
+        if hasattr(libc, "keyctl"):
+            # Honour a real wrapper if this libc happens to export one.
+            libc.keyctl.restype = ctypes.c_long
+            libc.keyctl.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            ctypes.set_errno(0)
+            ret = libc.keyctl(KEYCTL_GET_KEYRING_ID, KEY_SPEC_PROCESS_KEYRING, 0)
+        else:
+            mach = platform.machine()
+            nr = _KEYCTL_NR.get(mach)
+            if nr is None:
+                # Unknown arch — don't cry wolf; assume usable so we never
+                # send an operator to the host on a test we couldn't run.
+                result["keyctl_available"] = True
+                result["detail"] = f"keyctl untested on arch {mach!r}; assuming available."
+                return result
+            libc.syscall.restype = ctypes.c_long
+            ctypes.set_errno(0)
+            ret = libc.syscall(
+                ctypes.c_long(nr),
+                ctypes.c_long(KEYCTL_GET_KEYRING_ID),
+                ctypes.c_long(KEY_SPEC_PROCESS_KEYRING),
+                ctypes.c_long(0),
+            )
         err = ctypes.get_errno()
-        if ret >= 0:
+        if ret is not None and ret >= 0:
             result["keyctl_available"] = True
             result["detail"] = (
-                "keyctl() syscall succeeded — SteamCMD games that use "
-                "session-keyring auth (Palworld etc.) should be able to "
-                "complete Steam init."
+                "keyctl() succeeded — session-keyring auth works; Steam init "
+                "won't hang on this syscall."
             )
         else:
             result["syscall_errno"] = err
             result["syscall_error_name"] = errno.errorcode.get(err, f"errno={err}")
-            if err == errno.EPERM:
-                result["detail"] = (
-                    "keyctl() returned EPERM — the LXC's syscall filter is "
-                    "blocking keyring operations. Palworld and other Steam-"
-                    "session-auth games will hang silently after 'Running "
-                    "<game> on :PORT' with RAM stuck ~1 GB."
-                )
-                result["fix_instructions"] = (
-                    "On the Proxmox HOST (not this LXC), edit "
-                    "/etc/pve/lxc/<CTID>.conf and add keyctl=1 to the "
-                    "features line, e.g.: features: nesting=1,keyctl=1 — "
-                    "then run: pct restart <CTID>"
-                )
-            else:
-                result["detail"] = f"keyctl() failed unexpectedly with {result['syscall_error_name']}"
+            # EPERM (seccomp filter) and ENOSYS (syscall removed by the filter)
+            # both mean Steam session-keyring auth will hang. Any non-zero
+            # errno here = keyctl is not usable in this container.
+            result["detail"] = (
+                f"keyctl() failed with {result['syscall_error_name']} — the LXC "
+                "syscall filter is blocking keyring operations. Palworld and "
+                "other Steam-session-auth games hang after 'Running <game> on "
+                ":PORT' with RAM stuck ~1 GB, no crash."
+            )
+            result["fix_instructions"] = (
+                "On the Proxmox HOST (not this LXC), edit /etc/pve/lxc/<CTID>.conf "
+                "and add keyctl=1 to the features line, e.g.: "
+                "features: nesting=1,keyctl=1 — then run: pct restart <CTID>"
+            )
     except (OSError, AttributeError) as e:
         result["detail"] = f"could not test keyctl syscall: {e}"
 
@@ -1234,15 +1261,17 @@ def api_diagnose_stuck(name: str) -> dict:
         })
 
     # 1) keyctl seccomp block — the canonical Palworld "~1 GB freeze".
-    if is_steam_game and not keyctl.get("keyctl_available", False) \
-            and keyctl.get("syscall_error_name") == "EPERM":
+    _kc_err = keyctl.get("syscall_error_name")
+    if is_steam_game and not keyctl.get("keyctl_available", False) and _kc_err:
         causes.append({
-            "cause": "keyctl() syscall blocked by the LXC seccomp filter",
+            "cause": f"keyctl() blocked by the LXC syscall filter ({_kc_err})",
             "confidence": "high",
             "why": (
                 "Steamworks session-keyring auth calls keyctl(); when the "
                 "unprivileged LXC filters it, Steam init hangs after 'Running "
                 "<game> on :PORT' with RAM frozen ~800 MB-1 GB and no crash. "
+                "The main thread idles in hrtimer_nanosleep while Steam is "
+                "otherwise connected — exactly this process's fingerprint. "
                 "Hits native, Wine, and LinuxGSM identically."
             ),
             "fix": keyctl.get("fix_instructions", ""),
