@@ -190,7 +190,26 @@ _APP_RECIPES: dict[int, dict] = {
         #   Windows: Pal/Saved/Config/WindowsServer/PalWorldSettings.ini
         # _apply_palworld_passwords() auto-detects which dir exists.
         "run": "./Pal/Binaries/Win64/PalServer-Win64-Shipping-Cmd.exe Pal -log -nullrhi -nosound -nosplash",
-        "saves_rel": "Pal/Saved",
+        # NO ``saves_rel`` — Palworld saves land on install_dir/Pal/Saved
+        # (local ext4), NOT symlinked to world_dir (NFS from TrueNAS).
+        #
+        # WHY: Palworld's Windows save code (under Wine) does an atomic
+        # write pattern — write .tmp, MoveFileExW with REPLACE_EXISTING,
+        # rotate .bak. Wine translates MoveFileExW to Linux rename(2),
+        # which fails with EXDEV when Palworld's Wine-tempdir source and
+        # the NFS-symlinked destination are on different mount points
+        # (ext4 vs nfs4). The game surfaces this as
+        # "Failed to save. Failed copy from backup." and world load
+        # aborts. Enshrouded uses the same NFS-symlink pattern and works
+        # because its save code does simple write-in-place, not
+        # rename-with-rotation.
+        #
+        # TRADE-OFF: saves are on the LXC's local disk, not the TrueNAS
+        # NAS backup. Operators wanting NFS backup should add a cron
+        # rsync from /srv/gameservers/palworld/Pal/Saved/ to their
+        # backup target. The manager could ship a periodic sync job for
+        # this if it becomes a common need.
+        "saves_rel": None,
         "wine": True,
         "wine_debug": "-all,err+all,fixme-all",
         "steamcmd_platform": "windows",
@@ -1159,56 +1178,84 @@ def _apply_post_install_config(sd, install_dir, world_dir) -> list[str]:
 
 
 def _apply_palworld_saves_dirs(install_dir, world_dir) -> list[str]:
-    """Pre-create Palworld's save-directory tree.
+    """Pre-create Palworld's save-directory tree on local ext4.
 
-    THE ERROR THIS FIXES:
+    THE ERROR THIS FIXES (verified 2026-07-11):
         "Failed to save. Failed copy from backup."
 
-    Palworld under Wine writes saves to ``Pal\\Saved\\SaveGames\\0\\<guid>\\``,
-    which we symlink to ``world_dir``. When world_dir is on a different
-    mount than install_dir (common — install is local, saves are on an
-    NFS bind mount), Wine's ``CreateDirectoryW`` implementation fails to
-    create intermediate directories that traverse the symlink boundary.
-    Palworld's save code then reports the error above and continues
-    without saving.
+    Palworld's Windows save code (under Wine) does atomic writes with
+    ``MoveFileExW(REPLACE_EXISTING)`` and rotates ``.bak`` files. When
+    the target save directory is on a different filesystem than Wine's
+    tempdir (e.g. saves symlinked from local ext4 to an NFS bind mount),
+    Wine's ``rename(2)`` fails with ``EXDEV`` (cross-device link) and
+    Palworld reports the error above. See recipe comment for the full
+    diagnosis and the ``saves_rel: None`` setting that keeps saves on
+    local ext4.
 
-    We pre-create the whole tree from Python (native Linux mkdir, no
-    Wine involvement). Palworld only needs to CREATE its own <guid>/
-    subdir inside the pre-existing SaveGames/0/, which is a single-level
-    mkdir that Wine handles reliably.
+    ``world_dir`` argument is IGNORED for Palworld now — accepted only
+    because the dispatcher passes it uniformly to all handlers.
 
-    Also pre-creates Logs/ (Unreal's -log target) and Backups/ so
-    Palworld's auto-backup loop doesn't fail on the first tick.
+    MIGRATION: if a previous Configure created a symlink at
+    ``install_dir/Pal/Saved`` -> ``world_dir``, we remove it here so the
+    subsequent mkdir creates a real ext4 directory instead. This runs
+    idempotently on every Configure/Start.
+
+    We still pre-create the deep directory tree here because Wine's
+    ``CreateDirectoryW`` for multi-level paths is slower and slightly
+    less reliable than native Linux mkdir. Doing it here keeps the
+    first-boot experience clean and shifts one class of potential
+    error out of the Wine code path.
     """
     from pathlib import Path
-    world_dir = Path(world_dir)
+    saved_root = Path(install_dir) / "Pal" / "Saved"
 
-    # These paths are relative to Pal/Saved which is our symlink to world_dir.
-    # Under the symlink, Pal/Saved/SaveGames/0 == world_dir/SaveGames/0.
+    msgs: list[str] = []
+
+    # MIGRATION: remove any leftover symlink from an earlier recipe
+    # version that used ``saves_rel: "Pal/Saved"``. Only remove if it's
+    # a symlink — a real directory here (either pre-existing or from a
+    # previous run of this helper) is exactly what we want.
+    if saved_root.is_symlink():
+        try:
+            target = saved_root.readlink()
+            saved_root.unlink()
+            msgs.append(
+                f"Palworld: removed legacy Pal/Saved symlink -> {target} "
+                "(migrating to local-ext4 saves — see recipe comment for "
+                "why NFS-symlinked saves break Palworld's atomic writes)"
+            )
+        except OSError as e:
+            msgs.append(
+                f"WARNING (Palworld): could not remove existing Pal/Saved "
+                f"symlink ({e}). Delete it manually so saves land on local ext4."
+            )
+            return msgs
+
     subdirs = [
-        world_dir / "SaveGames" / "0",             # server save slot
-        world_dir / "Logs",                        # Unreal -log output
-        world_dir / "Backups",                     # Palworld auto-backup
-        world_dir / "Config" / "WindowsServer",    # config storage (also created by _apply_palworld_passwords)
+        saved_root / "SaveGames" / "0",             # server save slot
+        saved_root / "Logs",                        # Unreal -log output
+        saved_root / "Backups",                     # Palworld auto-backup
+        saved_root / "Config" / "WindowsServer",    # config storage
     ]
     created: list[str] = []
-    msgs: list[str] = []
     for p in subdirs:
         if not p.exists():
             try:
                 p.mkdir(parents=True, exist_ok=True)
-                created.append(str(p.relative_to(world_dir)))
+                created.append(str(p.relative_to(saved_root)))
             except OSError as e:
                 msgs.append(f"WARNING (Palworld): could not pre-create {p}: {e}")
     if created:
         msgs.append(
-            "Palworld: pre-created save dirs in world_dir "
-            f"({', '.join(created)}) — avoids Wine's cross-mount "
-            "CreateDirectoryW failure that produces "
-            "'Failed to save. Failed copy from backup.'"
+            "Palworld: pre-created save dirs under install_dir/Pal/Saved "
+            f"({', '.join(created)}) — saves land on local ext4, not "
+            "symlinked to NFS world_dir (avoids the cross-mount save "
+            "failure). Add a cron rsync to world_dir if you want NAS backup."
         )
     else:
-        msgs.append("Palworld: save dirs already present in world_dir")
+        msgs.append(
+            "Palworld: save dirs already present under install_dir/Pal/Saved"
+        )
     return msgs
 
 
