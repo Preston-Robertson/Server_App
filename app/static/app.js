@@ -1827,6 +1827,7 @@ async function runDiagnose(name) {
     const ml = d.mem_limits || {};
     const mb = (x) => (x == null ? "∞" : Math.round(x / 1048576) + " MB");
     const envStr = Object.entries(d.env || {}).map(([k, val]) => `${k}=${val}`).join("   ") || "(none captured)";
+    const limitsStr = (d.limits || []).join("   ") || "(unavailable)";
     panel.innerHTML = `
       <div class="diag-verdict">
         <div class="diag-title">
@@ -1843,6 +1844,7 @@ async function runDiagnose(name) {
             <tr><td>world_dir fs</td><td><code>${escape(chk.world_dir_fstype || "-")}${chk.world_dir_networked ? " ⚠ networked" : ""}</code></td></tr>
             <tr><td>mem cap</td><td><code>High=${mb(ml.MemoryHigh)}  Max=${mb(ml.MemoryMax)}  Cur=${ml.MemoryCurrent == null ? "?" : mb(ml.MemoryCurrent)}</code></td></tr>
             <tr><td>launch env</td><td><code>${escape(envStr)}</code></td></tr>
+            <tr><td>rlimits</td><td><code>${escape(limitsStr)}</code></td></tr>
           </table>
           <pre class="diag-pre">${escape(d.status || "")}</pre>
           <pre class="diag-pre">${escape((d.thread_wchans || []).join("\n"))}</pre>

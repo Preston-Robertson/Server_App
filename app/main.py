@@ -572,20 +572,28 @@ def _check_keyctl() -> dict:
         else:
             result["syscall_errno"] = err
             result["syscall_error_name"] = errno.errorcode.get(err, f"errno={err}")
-            # EPERM (seccomp filter) and ENOSYS (syscall removed by the filter)
-            # both mean Steam session-keyring auth will hang. Any non-zero
-            # errno here = keyctl is not usable in this container.
-            result["detail"] = (
-                f"keyctl() failed with {result['syscall_error_name']} — the LXC "
-                "syscall filter is blocking keyring operations. Palworld and "
-                "other Steam-session-auth games hang after 'Running <game> on "
-                ":PORT' with RAM stuck ~1 GB, no crash."
-            )
-            result["fix_instructions"] = (
-                "On the Proxmox HOST (not this LXC), edit /etc/pve/lxc/<CTID>.conf "
-                "and add keyctl=1 to the features line, e.g.: "
-                "features: nesting=1,keyctl=1 — then run: pct restart <CTID>"
-            )
+            # ONLY EPERM/ENOSYS/EACCES mean keyctl is actually filtered. Any
+            # other errno means the syscall WORKS and simply had nothing to
+            # return — notably ENOKEY ("no process keyring created yet",
+            # because we passed create=0). Treat those as available; do NOT
+            # cry "blocked". (This check also runs in the MANAGER's process,
+            # not the game's, so its keyring state is only weakly related.)
+            if result["syscall_error_name"] in ("EPERM", "ENOSYS", "EACCES"):
+                result["detail"] = (
+                    f"keyctl() failed with {result['syscall_error_name']} — the LXC "
+                    "syscall filter is blocking keyring operations."
+                )
+                result["fix_instructions"] = (
+                    "Unprivileged LXC only: add keyctl=1 to the CT's features. "
+                    "(Not applicable to a privileged CT.)"
+                )
+            else:
+                result["keyctl_available"] = True
+                result["detail"] = (
+                    f"keyctl() returned {result['syscall_error_name']} — the syscall "
+                    "works; this only means no keyring is created yet (create=0). "
+                    "NOT a blocker."
+                )
     except (OSError, AttributeError) as e:
         result["detail"] = f"could not test keyctl syscall: {e}"
 
@@ -1200,10 +1208,10 @@ def api_diagnose_stuck(name: str) -> dict:
         "MemoryCurrent": _mem_or_none(mem_props.get("MemoryCurrent", "")),
     }
 
-    # Whitelist of launch-env vars that affect Steam/Unreal startup. We do
-    # NOT dump the whole environ (it can carry secrets); only these keys.
-    _ENV_KEYS = ("XDG_RUNTIME_DIR", "SENTRY_DSN", "HOME", "LD_LIBRARY_PATH",
-                 "STEAM_RUNTIME", "TERM", "MEMORY_MB", "GAME_PORT", "TMPDIR")
+    # Dump the FULL launch environment (secrets redacted) so a working game's
+    # env can be diffed against a hung one — the surest way to find a launch-
+    # env regression without guessing which variable.
+    _SECRET_HINTS = ("PASSWORD", "SECRET", "TOKEN", "_PW", "_KEY", "RCON", "AUTH")
     env_seen: dict = {}
     try:
         _raw = Path(f"/proc/{target_pid}/environ").read_bytes()
@@ -1211,11 +1219,29 @@ def api_diagnose_stuck(name: str) -> dict:
             if b"=" in _kv:
                 _ek, _ev = _kv.split(b"=", 1)
                 _eks = _ek.decode("utf-8", "replace")
-                if _eks in _ENV_KEYS:
-                    env_seen[_eks] = _ev.decode("utf-8", "replace")
+                _up = _eks.upper()
+                env_seen[_eks] = (
+                    "<redacted>" if any(h in _up for h in _SECRET_HINTS)
+                    else _ev.decode("utf-8", "replace")
+                )
     except OSError:
         pass
     result["env"] = env_seen
+
+    # Resource limits — RLIMIT_NOFILE especially. A very high open-file HARD
+    # limit makes some Steam runtimes iterate every possible fd on init and
+    # appear to hang; and the soft/hard values differ depending on which
+    # unit's start.sh (ulimit) launched the tmux server hosting the game.
+    limits_lines: list = []
+    try:
+        _lt = Path(f"/proc/{target_pid}/limits").read_text(encoding="ascii", errors="replace")
+        for _ll in _lt.splitlines():
+            if _ll.startswith("Limit") or _ll.startswith("Max open files") \
+                    or _ll.startswith("Max processes") or _ll.startswith("Max stack"):
+                limits_lines.append(" ".join(_ll.split()))
+    except OSError:
+        pass
+    result["limits"] = limits_lines
 
     # ---- consolidated verdict ------------------------------------------
     # Fold the raw /proc introspection together with the two host-level

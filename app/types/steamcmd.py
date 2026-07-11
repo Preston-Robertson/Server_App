@@ -74,6 +74,16 @@ ulimit -n 100000 2>/dev/null || ulimit -n 65536 2>/dev/null || true
 SESSION="gs-{name}"
 BIN="{run_cmd}"
 
+# Match the (working) Minecraft launcher's tmux invocation: a PRIVATE socket
+# AND -f /dev/null, so this game's tmux server never sources a stray
+# ~/.tmux.conf or /etc/tmux.conf that could inject env vars / hooks / a
+# default-command into the game's pane. Pin TERM too so server creation is
+# deterministic under systemd (no controlling terminal). Palworld ran fine
+# INSIDE the Minecraft-owned tmux server, which used exactly this; its own
+# server (created without these) is the one thing that changed when we split.
+export TERM="${{TERM:-screen-256color}}"
+TMUX="tmux -L $SESSION -f /dev/null"
+
 if ! command -v tmux >/dev/null; then
   echo "ERROR: tmux is required (apt install tmux)" >&2
   exit 1
@@ -106,7 +116,7 @@ fi
 # fighting over the port after switching to the private socket. Harmless once
 # migrated (the default daemon exits when its last session dies).
 tmux kill-session -t "$SESSION" 2>/dev/null || true
-tmux -L "$SESSION" kill-session -t "$SESSION" 2>/dev/null || true
+$TMUX kill-session -t "$SESSION" 2>/dev/null || true
 
 # Start tmux DETACHED, but wrap the actual game invocation so we can
 # capture its true exit code. Without this wrapper, tmux swallows the
@@ -124,7 +134,7 @@ tmux -L "$SESSION" kill-session -t "$SESSION" 2>/dev/null || true
 # want the tmux window to persist after the game dies for hands-on
 # debugging — enable by hand-editing start.sh; the manager won't
 # regenerate over it if you also set MANAGED=false at the top.
-tmux -L "$SESSION" new-session -d -s "$SESSION" -n game \\
+$TMUX new-session -d -s "$SESSION" -n game \\
   "$BIN ; ec=\\$?; printf '\\nGAMESRV_EXIT=%d\\n' \\$ec | tee -a $(pwd)/console.log >&2"
 
 # Tee the tmux pane's live output to console.log. This is the ONLY way the
@@ -138,11 +148,11 @@ tmux -L "$SESSION" new-session -d -s "$SESSION" -n game \\
 # won't see live output in the dashboard until the next Install regenerates
 # start.sh. Older tmux (<2.6) may not accept ``-t sess:window`` — retry
 # with just the session target if that happens.
-tmux -L "$SESSION" pipe-pane -t "$SESSION:game" "cat >> $(pwd)/console.log" 2>/dev/null \\
-  || tmux -L "$SESSION" pipe-pane -t "$SESSION" "cat >> $(pwd)/console.log" 2>/dev/null \\
+$TMUX pipe-pane -t "$SESSION:game" "cat >> $(pwd)/console.log" 2>/dev/null \\
+  || $TMUX pipe-pane -t "$SESSION" "cat >> $(pwd)/console.log" 2>/dev/null \\
   || echo "WARN: tmux pipe-pane failed; Console tab will fall back to systemd journal" >&2
 
-while tmux -L "$SESSION" has-session -t "$SESSION" 2>/dev/null; do
+while $TMUX has-session -t "$SESSION" 2>/dev/null; do
   sleep 1
 done
 """
