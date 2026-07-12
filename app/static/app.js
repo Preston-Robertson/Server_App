@@ -412,9 +412,21 @@ async function reconcileFirewall() {
   if (out) out.textContent = "re-applying\u2026";
   try {
     const r = await api("/api/diagnostics/network/reconcile", { method: "POST" });
-    const added = (r.results || []).reduce((n, x) => n + (x.rules_added || 0), 0);
-    if (out) out.textContent = r.ok ? `done \u2014 ${added} rule(s) applied. Re-checking\u2026` : `failed: ${r.detail || "?"}`;
-    setTimeout(loadNetworkDiagnostics, 800);
+    const results = r.results || [];
+    const added = results.reduce((n, x) => n + (x.rules_added || 0), 0);
+    const failedRules = results.reduce((n, x) => n + (x.rules_failed || 0), 0);
+    const errs = results.flatMap((x) => x.errors || []);
+    if (out) {
+      if (failedRules > 0) {
+        const first = (errs[0] || "?").replace(/</g, "&lt;");
+        out.innerHTML = `<span style="color:#e08a8a;">${failedRules} rule(s) FAILED.</span> ` +
+          `ufw said: <code>${first}</code>` +
+          (errs.length > 1 ? ` (+${errs.length - 1} more)` : "");
+      } else {
+        out.textContent = `done \u2014 ${added} rule(s) applied. Re-checking\u2026`;
+      }
+    }
+    setTimeout(loadNetworkDiagnostics, 1000);
   } catch (e) {
     if (out) out.textContent = `failed: ${e.message}`;
   } finally {

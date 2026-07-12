@@ -113,13 +113,16 @@ def _current_managed_rules() -> list[tuple[int, str]]:
     return out
 
 
-def _delete_managed_for(server_name: str) -> None:
+def _delete_managed_for(server_name: str) -> list[str]:
     """Remove every rule tagged ``gamesrv-auto:<server_name>:*``.
 
     UFW's numbered indices renumber after every delete, so we re-list
-    between deletions rather than trusting the initial numbers.
+    between deletions rather than trusting the initial numbers. Returns a
+    list of error strings (empty on success) so reconcile can surface a ufw
+    that's refusing writes.
     """
     prefix = f"{_COMMENT_PREFIX}:{server_name}:"
+    errors: list[str] = []
     # Cap iterations so a parse regression can't produce an infinite loop.
     for _ in range(64):
         managed = [
@@ -127,21 +130,30 @@ def _delete_managed_for(server_name: str) -> None:
             if c.startswith(prefix)
         ]
         if not managed:
-            return
+            return errors
         # Delete highest number first so the indices we haven't touched
         # yet remain valid.
         managed.sort(reverse=True)
         num, _c = managed[0]
         r = _run_ufw(["--force", "delete", str(num)])
         if r.returncode != 0:
-            _log(f"delete rule {num} for {server_name!r} failed: "
-                 f"{(r.stderr or r.stdout).strip()[:120]}")
-            return
+            err = (r.stderr or r.stdout).strip()
+            _log(f"delete rule {num} for {server_name!r} failed: {err[:200]}")
+            errors.append(f"delete rule {num}: {err[:200]}")
+            return errors
+    return errors
 
 
 def _add_rule(server_name: str, port: int, proto: str, source: Optional[str],
-              tag: str) -> bool:
-    """Add one allow rule. ``source=None`` means Anywhere."""
+              tag: str) -> tuple[bool, str]:
+    """Add one allow rule. ``source=None`` means Anywhere.
+
+    Returns ``(ok, error)`` — ``error`` is the ufw stderr/stdout on failure
+    (empty on success) so reconcile can tell the operator EXACTLY why a rule
+    didn't land. The classic case is ufw being unable to write iptables inside
+    an unprivileged LXC ("ERROR: Could not load logging rules" / iptables
+    permission), which silently left the port on its old rule.
+    """
     comment = f"{_COMMENT_PREFIX}:{server_name}:{tag}"
     if source is None:
         args = ["allow", f"{port}/{proto}", "comment", comment]
@@ -153,10 +165,11 @@ def _add_rule(server_name: str, port: int, proto: str, source: Optional[str],
         ]
     r = _run_ufw(args)
     if r.returncode != 0:
+        err = (r.stderr or r.stdout).strip()
         _log(f"add {source or 'Anywhere'} → {port}/{proto} for "
-             f"{server_name!r} failed: {(r.stderr or r.stdout).strip()[:120]}")
-        return False
-    return True
+             f"{server_name!r} failed: {err[:200]}")
+        return False, f"{source or 'Anywhere'}→{port}/{proto}: {err[:200]}"
+    return True, ""
 
 
 def reconcile_server(sd) -> dict:
@@ -181,7 +194,7 @@ def reconcile_server(sd) -> dict:
     extras = _extra_ports_for(sd)
 
     with _RECONCILE_LOCK:
-        _delete_managed_for(sd.name)
+        del_errors = _delete_managed_for(sd.name)
 
         # Every port the game uses — primary first, then per-game extras
         # (Satisfactory needs TCP:port + TCP:8888 in addition to UDP:port).
@@ -189,28 +202,40 @@ def reconcile_server(sd) -> dict:
         all_ports = [(port, proto, "primary")] + [(p, pr, t) for (p, pr, t) in extras]
 
         added = 0
+        failed = 0
+        errors: list[str] = list(del_errors)
         for (p, pr, t) in all_ports:
             if mode == "public":
-                if _add_rule(sd.name, p, pr, None, f"public:{t}"):
-                    added += 1
+                targets = [(None, f"public:{t}")]
             elif mode == "allowlist":
                 # LAN always included so the operator can't lock themselves out.
-                if _add_rule(sd.name, p, pr, LAN_CIDR, f"lan:{t}"):
-                    added += 1
-                for ip in allow_ips:
-                    if _add_rule(sd.name, p, pr, ip, f"allow:{t}:{ip}"):
-                        added += 1
+                targets = [(LAN_CIDR, f"lan:{t}")] + [(ip, f"allow:{t}:{ip}") for ip in allow_ips]
             else:  # "lan" — default
-                if _add_rule(sd.name, p, pr, LAN_CIDR, f"lan:{t}"):
+                targets = [(LAN_CIDR, f"lan:{t}")]
+            for (src, tag) in targets:
+                ok_add, err = _add_rule(sd.name, p, pr, src, tag)
+                if ok_add:
                     added += 1
+                else:
+                    failed += 1
+                    if err:
+                        errors.append(err)
 
     port_summary = f"{port}/{proto}"
     if extras:
         port_summary += "+" + ",".join(f"{p}/{pr}" for (p, pr, _) in extras)
+    ok = (failed == 0 and not del_errors)
+    detail = f"mode={mode} ports={port_summary} rules={added}"
+    if failed or del_errors:
+        # Surface the actual ufw error so "I set public but it stayed LAN" is
+        # explained by ufw's own message instead of a silent success.
+        detail += f" | {failed} rule(s) FAILED: " + "; ".join(errors)[:400]
     result.update(
-        ok=True,
+        ok=ok,
         rules_added=added,
-        detail=f"mode={mode} ports={port_summary} rules={added}",
+        rules_failed=failed,
+        errors=errors,
+        detail=detail,
     )
     return result
 
