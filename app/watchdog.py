@@ -347,6 +347,49 @@ def probe_satisfactory_https(host: str, port: int, admin_password: str = "",
 # copy so watchdog stays independent of the wake_proxy import graph.
 _WAKE_INTERNAL_OFFSET = 10000
 
+# Grace window before the port-bound readiness fallback (see _tick) may flip a
+# server to "ready". Some Steam dedicated servers (Palworld) never answer a
+# local A2S query — they register with Steam's master server — so the A2S probe
+# never succeeds even though the server IS accepting connections. Rather than
+# hang on "starting" forever, we treat a bound game port as ready once the unit
+# has been active this long (short enough to feel responsive, long enough not
+# to flip green during the first second of a real world-load).
+_PORT_READY_GRACE_MS = 30_000
+
+
+def _effective_game_port(sd) -> int:
+    """UDP port the game process actually binds (accounts for wake-on-demand,
+    which offsets the game to sd.port + WAKE_INTERNAL_OFFSET behind the proxy)."""
+    port = sd.port
+    if getattr(sd, "wake_on_demand", False):
+        port += _WAKE_INTERNAL_OFFSET
+    return port
+
+
+def _udp_port_bound(port: int) -> bool:
+    """True if any process has bound ``port`` on UDP (IPv4 or IPv6).
+
+    Reads /proc/net/udp{,6} directly — no external tools, works unprivileged.
+    Used as a readiness fallback for Steam games with no local A2S responder:
+    a bound game port means the server is up and accepting connections.
+    """
+    for path in ("/proc/net/udp", "/proc/net/udp6"):
+        try:
+            with open(path, encoding="ascii", errors="replace") as f:
+                lines = f.readlines()[1:]   # skip header row
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                if int(parts[1].split(":")[1], 16) == port:
+                    return True
+            except (ValueError, IndexError):
+                continue
+    return False
+
 
 def _probe_for(sd) -> Optional[ProbeResult]:
     """Dispatch to the correct probe. Returns None if the server type has
@@ -386,7 +429,16 @@ def _probe_for(sd) -> Optional[ProbeResult]:
         # A2S — remap to the internal port when wake is on.
         if getattr(sd, "wake_on_demand", False) and sd.steam_app_id in _SINGLE_PORT_STEAM_APPS:
             query_port = sd.port + _WAKE_INTERNAL_OFFSET
-        return probe_a2s(host, query_port)
+        r = probe_a2s(host, query_port)
+        if r is None:
+            # Some Steam dedicated servers answer A2S on the GAME port instead
+            # of 27015 (or expose no local A2S at all — the _tick port-bound
+            # fallback covers that case). Try the game port before giving up so
+            # we still get a real player count when the game does respond there.
+            game_port = _effective_game_port(sd)
+            if game_port != query_port:
+                r = probe_a2s(host, game_port)
+        return r
     if sd.type in ("minecraft-java", "minecraft-forge"):
         port = sd.port
         if getattr(sd, "wake_on_demand", False):
@@ -543,6 +595,23 @@ class Watchdog:
                 state.active_since_ms = now_ms
             result = _probe_for(sd)
             if result is None:
+                # A2S didn't answer on any port. Some Steam dedicated servers
+                # (Palworld) never run a local A2S responder — they register
+                # with Steam's master server — yet they ARE accepting client
+                # connections once the game's UDP port is bound (confirmed in
+                # the field: players connect while A2S stays silent). If the
+                # game port is bound and the unit has been active past the
+                # grace window, treat it as READY so the dashboard stops
+                # showing "starting" forever. players stays unknown (None) so
+                # the idle-shutdown countdown never runs off this weak signal.
+                active_ms = now_ms - state.active_since_ms if state.active_since_ms else 0
+                if active_ms >= _PORT_READY_GRACE_MS and _udp_port_bound(_effective_game_port(sd)):
+                    state.consecutive_probe_fails = 0
+                    state.last_probe_ok = True
+                    state.last_players = None
+                    if state.first_ready_ms is None:
+                        state.first_ready_ms = now_ms
+                    continue
                 state.consecutive_probe_fails += 1
                 state.last_probe_ok = False
                 # Don't shut anything down purely on probe failure — could
