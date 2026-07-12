@@ -74,14 +74,36 @@ if [[ "$_hard_nofile" == "unlimited" ]]; then
 else
   ulimit -n "$_hard_nofile" 2>/dev/null || ulimit -n 65536 2>/dev/null || true
 fi
-# NOTE: we deliberately DO NOT override XDG_RUNTIME_DIR. An earlier version set
-# it to "$(pwd)/.runtime" thinking Steam needed a writable runtime dir — but
-# that STALLED Palworld's world load at ~800 MB (confirmed: MemoryMax/High were
-# both infinity, so it wasn't a cgroup cap; the only launch-env delta vs a
-# Minecraft server that loaded fine in the SAME shared tmux daemon was this
-# override). Steam's IPC behaves worse pointed at a game-local disk dir than
-# left unset, where it falls back to /tmp — which PrivateTmp=false keeps
-# shared. Leave it unset. If a future game truly needs it, set it per-recipe.
+# --- Steam runtime dir (XDG_RUNTIME_DIR) ------------------------------------
+# Steam's networking/IPC layer — GameNetworkingSockets, the built-in A2S
+# responder on the query port, and the anonymous game-server LOGIN handshake —
+# stores its control sockets under $XDG_RUNTIME_DIR. For a NON-LOGIN systemd
+# system user (gamesrv), logind never creates /run/user/<uid>, so this var is
+# UNSET at launch and Steam's fallback is unreliable inside an unprivileged
+# LXC: the game binds its UDP port, prints "Running <game> on :PORT", then the
+# Steam layer never finishes coming up — world load parks at ~1 GB RSS and the
+# A2S query port never answers, so the manager sees "starting" forever. This is
+# a COMMON failure for every SteamCMD/EOS game here (Palworld AND Satisfactory);
+# Minecraft is unaffected because it isn't a Steam game.
+#
+# The known-good native-Linux deploy (BitsNBytes installer) sets
+#     Environment=XDG_RUNTIME_DIR=/run/user/$(id -u)
+# We do the same, but robustly. A FIXED on-disk path is WRONG — an earlier
+# version pointed it at $(pwd)/.runtime, which lives on the NFS-backed
+# world_dir; Steam IPC on a network fs stalled the world load and we (wrongly)
+# blamed the whole concept and reverted it. The fix is the right VALUE: a real
+# tmpfs we can create unprivileged. Prefer the standard /run/user/<uid>; else
+# /dev/shm; else /tmp (all tmpfs — and /tmp stays shared because the unit sets
+# PrivateTmp=false). Export BEFORE tmux so the game's tmux server, and thus the
+# game process, inherits it.
+_uid="$(id -u)"
+for _rt in "/run/user/$_uid" "/dev/shm/gamesrv-{name}" "/tmp/gamesrv-{name}-rt"; do
+  if mkdir -p "$_rt" 2>/dev/null && [[ -w "$_rt" ]]; then
+    chmod 700 "$_rt" 2>/dev/null || true
+    export XDG_RUNTIME_DIR="$_rt"
+    break
+  fi
+done
 
 SESSION="gs-{name}"
 BIN="{run_cmd}"
@@ -119,6 +141,11 @@ fi
 # the ~1 GB "Running on :PORT then silence" hang; a value in the 100k range
 # rules fd-exhaustion OUT and points diagnosis at the game log / port bind.
 echo "start.sh: RLIMIT_NOFILE soft=$(ulimit -Sn) hard=$(ulimit -Hn)" >> console.log
+# Record the Steam launch-env deltas we fixed vs the known-good deploy so a
+# stalled bring-up is diagnosable straight from console.log: XDG_RUNTIME_DIR
+# must be a tmpfs path (not <unset>, not on world_dir) and HOME must point at
+# the install dir where steamcmd wrote ~/.steam.
+echo "start.sh: XDG_RUNTIME_DIR=${{XDG_RUNTIME_DIR:-<unset>}} HOME=$HOME" >> console.log
 
 # Each server uses its OWN tmux server via a private socket (-L "$SESSION",
 # named after the session). CRITICAL: with the shared DEFAULT socket, every
@@ -1153,7 +1180,19 @@ class SteamCmdHandler(TypeHandler):
                     f"Save directory not usable after symlink to world_dir.\n{e}"
                 ) from None
 
-        env_values = {"GAME_PORT": str(game_port), "MEMORY_MB": str(self.sd.memory_mb)}
+        env_values = {
+            "GAME_PORT": str(game_port),
+            "MEMORY_MB": str(self.sd.memory_mb),
+            # Pin HOME to install_dir at RUNTIME so the game finds the Steam
+            # client state (~/.steam, ~/.local/share/Steam) that steamcmd wrote
+            # there at INSTALL time (install() also pins HOME=install_dir).
+            # Without this the systemd unit launches with HOME=/home/gamesrv —
+            # which may not exist on an unprivileged LXC and has no .steam — so
+            # Steam's game-server login can't find steamclient.so / its sdk
+            # state and the world load stalls. Recipes (e.g. Satisfactory,
+            # which sets the same value) may override; user extra_env wins.
+            "HOME": str(self.install_dir),
+        }
         # Recipe-provided env (e.g. HOME for Satisfactory) is applied before
         # user extras so the user's YAML always wins.
         for k, v in (recipe.get("env") or {}).items():
