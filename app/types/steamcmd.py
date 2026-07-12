@@ -727,18 +727,53 @@ def _apply_palworld_passwords(install_dir, port: int, server_pw: str, admin_pw: 
     else:
         target_ini = lin_ini   # will be created below from Default
 
-    if target_ini.exists():
-        text = target_ini.read_text(encoding="utf-8")
-    elif default_ini.exists():
-        target_ini.parent.mkdir(parents=True, exist_ok=True)
-        text = default_ini.read_text(encoding="utf-8")
-    else:
-        return (
-            "WARNING: Palworld DefaultPalWorldSettings.ini not found; "
-            "port + passwords NOT applied. Complete the install first, then set "
-            "them manually in Pal/Saved/Config/WindowsServer/PalWorldSettings.ini "
-            "(or LinuxServer/ if you're on the native Linux depot)."
-        )
+    text = target_ini.read_text(encoding="utf-8") if target_ini.exists() else ""
+
+    # CRITICAL (2026-07-11): the target ini can EXIST BUT BE EMPTY. Palworld
+    # creates an empty PalWorldSettings.ini on first boot when it can't find a
+    # DefaultPalWorldSettings.ini to copy, and every _set_* helper below only
+    # REPLACES existing keys — so on an empty file they ALL silently no-op and
+    # PublicPort / RESTAPIEnabled / passwords / the allowlist NEVER apply (the
+    # config just stays blank, which is exactly the "nothing works" symptom).
+    # If the file has no OptionSettings block, seed it from the shipped
+    # DefaultPalWorldSettings.ini (which carries every key).
+    bootstrapped = False
+    if "OptionSettings=" not in text:
+        if default_ini.exists():
+            text = default_ini.read_text(encoding="utf-8")
+            bootstrapped = True
+        else:
+            return (
+                "WARNING: PalWorldSettings.ini is empty/missing AND "
+                "DefaultPalWorldSettings.ini isn't present to seed from. Re-run "
+                "Install to restore the game files, then Start again."
+            )
+    target_ini.parent.mkdir(parents=True, exist_ok=True)
+
+    def _ensure_option(text: str, key: str, default_val: str) -> str:
+        """Guarantee ``key=default_val`` exists inside the OptionSettings=(...)
+        tuple. If present, leave it (a _set_* call updates the value); else
+        insert it — robust even when a trimmed template omits a newer key."""
+        if f"{key}=" in text:
+            return text
+        m = re.search(r"OptionSettings=\(", text)
+        if not m:
+            return text
+        idx = m.end()
+        sep = "" if text[idx:idx + 1] == ")" else ","
+        return text[:idx] + f"{key}={default_val}{sep}" + text[idx:]
+
+    # Make sure every field we manage is present before we try to set it, so a
+    # seeded-or-trimmed template can't make a setter silently no-op.
+    for _k, _v in (
+        ("bIsMultiplay", "False"),
+        ("PublicPort", str(int(port))),
+        ("RESTAPIEnabled", "False"),
+        ("RESTAPIPort", str(int(port) + 1)),
+        ("ServerPassword", '""'),
+        ("AdminPassword", '""'),
+    ):
+        text = _ensure_option(text, _k, _v)
 
     changed: list[str] = []
 
@@ -814,11 +849,13 @@ def _apply_palworld_passwords(install_dir, port: int, server_pw: str, admin_pw: 
             changed.append("AdminPassword")
             text = new_text
 
-    if not changed:
+    if not changed and not bootstrapped:
         return "NOTE: Palworld config file keys not found; nothing changed."
 
     target_ini.write_text(text, encoding="utf-8")
-    return f"Palworld: wrote {target_ini.name} with updated {', '.join(changed)}"
+    if bootstrapped:
+        changed.insert(0, "seeded empty config from DefaultPalWorldSettings.ini")
+    return f"Palworld: wrote {target_ini.name} ({', '.join(changed)})"
 
 
 # ---------- Enshrouded (JSON config) -----------------------------------------
