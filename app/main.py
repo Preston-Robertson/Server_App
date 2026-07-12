@@ -744,6 +744,13 @@ def api_diagnostics_network() -> dict:
             "proto": proto,
             "active": st.active,
             "ready": ready,
+            # Live query state: is the game's OWN query interface (A2S /
+            # Palworld REST / Minecraft SLP / Satisfactory HTTPS) answering
+            # right now, and how many players? Distinguishes "port bound but
+            # the game isn't actually serving" from "up and responding".
+            "probe_ok": bool(wd.get("probe_ok")),
+            "players": wd.get("players"),
+            "max_players": wd.get("max_players"),
             "starting_sec": starting_sec,
             "recv_q": recv_q,
             "port_bound": port_bound,
@@ -1360,11 +1367,20 @@ def api_diagnose_stuck(name: str) -> dict:
     _console = _game_log_path(sd)
     if _console:
         _cands.append(_console)
-    try:
-        for _lg in sorted(Path(sd.install_dir).glob("*/Saved/Logs/*.log")):
-            _cands.append(_lg)
-    except OSError:
-        pass
+    # Unreal servers write a rich engine log under <something>/Saved/Logs/.
+    # The depth varies by game: Palworld = Pal/Saved/Logs, ARK =
+    # ShooterGame/Saved/Logs, but Satisfactory (HOME pinned to install_dir)
+    # buries it at .config/Epic/FactoryGame/Saved/Logs — which a single
+    # "*/Saved/Logs" glob MISSES (that's why the extended Satisfactory log
+    # never showed in Diagnose). Check a few known depths rather than a
+    # full-tree "**" walk (the install dir can be many GB).
+    for _g in ("*/Saved/Logs/*.log", ".config/*/*/Saved/Logs/*.log",
+               "*/*/Saved/Logs/*.log"):
+        try:
+            for _lg in sorted(Path(sd.install_dir).glob(_g)):
+                _cands.append(_lg)
+        except OSError:
+            pass
     _seen: set = set()
     for _p in _cands:
         _ps = str(_p)
@@ -1813,9 +1829,17 @@ def _game_log_path(sd) -> Optional[Path]:
     """
     if sd.type in ("minecraft-java", "minecraft-forge"):
         return Path(sd.install_dir) / "logs" / "latest.log"
-    # Satisfactory (steam_app_id 1690800) — the Unreal Engine log.
+    # Satisfactory (steam_app_id 1690800) — the Unreal Engine log. With HOME
+    # pinned to install_dir the Saved tree lives under
+    # .config/Epic/FactoryGame/Saved; older/unpinned layouts used
+    # FactoryGame/Saved. Return whichever exists so the Console tab + Diagnose
+    # actually surface FactoryGame.log (SSL / EOS / HTTP-listener errors and
+    # the real startup trace live there, not in stdout/console.log).
     if sd.type == "steamcmd" and sd.steam_app_id == 1690800:
-        return Path(sd.install_dir) / "FactoryGame" / "Saved" / "Logs" / "FactoryGame.log"
+        _base = Path(sd.install_dir)
+        _cfg = _base / ".config" / "Epic" / "FactoryGame" / "Saved" / "Logs" / "FactoryGame.log"
+        _legacy = _base / "FactoryGame" / "Saved" / "Logs" / "FactoryGame.log"
+        return _cfg if _cfg.exists() or not _legacy.exists() else _legacy
     # Every manager-generated SteamCMD start.sh pipes its tmux pane to
     # install_dir/console.log (see app/types/steamcmd.py _START_TEMPLATE).
     # That's the only place the game's actual stdout lives for games like

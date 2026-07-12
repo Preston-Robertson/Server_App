@@ -302,6 +302,11 @@ async function loadNetworkDiagnostics() {
         : (s.lxc_ufw_allows === false ? "⛔ closed" : "n/a");
       const pubStr = s.lxc_public_allows === true ? "✔ anywhere"
         : (s.lxc_public_allows === false ? "🔒 LAN-only" : "n/a");
+      const qStr = s.probe_ok
+        ? (s.players != null
+            ? `✔ ${s.players}${s.max_players ? "/" + s.max_players : ""} online`
+            : "✔ responding")
+        : (s.port_bound ? "◐ no query reply" : "○ not bound");
       const v = verdictFor(s);
       return `
         <tr>
@@ -312,6 +317,7 @@ async function loadNetworkDiagnostics() {
           <td>${recvStr}</td>
           <td>${ufwStr}</td>
           <td>${pubStr}</td>
+          <td>${qStr}</td>
           <td><span class="chip ${v.cls}">${v.label}</span></td>
         </tr>`;
     }).join("");
@@ -326,6 +332,7 @@ async function loadNetworkDiagnostics() {
             <th style="text-align:left;">Recv-Q</th>
             <th style="text-align:left;">LXC ufw</th>
             <th style="text-align:left;">Public</th>
+            <th style="text-align:left;">Query</th>
             <th style="text-align:left;">Verdict</th>
           </tr>
         </thead>
