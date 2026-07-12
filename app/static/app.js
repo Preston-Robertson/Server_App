@@ -274,6 +274,7 @@ async function loadNetworkDiagnostics() {
     let upstreamCount = 0;
     let ufwBlockCount = 0;
     let lanOnlyCount = 0;
+    let mismatchCount = 0;
     const verdictFor = (s) => {
       switch (s.cause) {
         case "lxc-ufw-blocking":
@@ -294,6 +295,7 @@ async function loadNetworkDiagnostics() {
       if (s.cause === "lxc-ufw-blocking") ufwBlockCount++;
       else if (s.cause === "bound-but-no-traffic") upstreamCount++;
       if (s.public_blocked_by_lxc_ufw) lanOnlyCount++;
+      if (s.public_blocked_by_lxc_ufw && s.configured_fw_mode === "public") mismatchCount++;
       const secStr = s.starting_sec ? `${Math.floor(s.starting_sec / 60)}m ${s.starting_sec % 60}s` : "-";
       const recvStr = s.recv_q == null ? "n/a" : `${s.recv_q} B`;
       const ufwStr = s.lxc_ufw_allows === true ? "✔ allow"
@@ -342,9 +344,19 @@ async function loadNetworkDiagnostics() {
       </p>`;
     if (lanOnlyCount > 0) {
       // The port IS open in ufw but only to the LAN — public/internet clients
-      // are dropped here regardless of the router forward. Distinct from
-      // "closed" (not open at all), and NOT fixable by a plain reconcile: the
-      // server's firewall MODE must change to "public" first.
+      // are dropped here regardless of the router forward. Two sub-cases:
+      //  * mismatch: the def is ALREADY set to "public" but ufw still has the
+      //    LAN rule => the reconcile never landed; re-applying fixes it.
+      //  * plain: the def is still "lan" => set it to public first.
+      const mismatchNote = mismatchCount > 0 ? `
+          <div style="margin-top:6px;padding-top:6px;border-top:1px solid #6b4a1f;">
+            <strong>${mismatchCount} of these is already set to <code>public</code></strong> — but ufw still
+            has a LAN-only rule, so the mode change never reached ufw. Re-open that server →
+            <strong>Firewall → click “Apply firewall rules” again</strong> to reconcile (watch for
+            “✓ saved”; if it errors, the host’s ufw/sudo rejected the rule). The <strong>Public</strong>
+            column reads the LIVE ufw rule, not the saved setting — so selecting the radio without
+            applying, or a cached table, both show <code>🔒 LAN-only</code> until the rule actually changes.
+          </div>` : "";
       results.innerHTML += `
         <div class="netdiag-selffix" style="margin-top:10px;padding:10px;border:1px solid #c78a3a;border-radius:6px;">
           <strong>${lanOnlyCount} server(s) reachable on your LAN only.</strong>
@@ -352,7 +364,7 @@ async function loadNetworkDiagnostics() {
           local network (firewall mode <code>lan</code>, the default), so players on the
           public internet are dropped <em>here</em> — even with a correct router
           port-forward. To allow internet players: open that server → <strong>Firewall →
-          set mode to <code>public</code></strong>, save, then Re-apply firewall rules.
+          set mode to <code>public</code></strong>, then Apply.${mismatchNote}
         </div>`;
     }
     if (ufwBlockCount > 0) {

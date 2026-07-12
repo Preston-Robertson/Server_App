@@ -27,11 +27,14 @@ Design notes:
 """
 from __future__ import annotations
 
+import base64
 import http.client
 import json
+import re
 import socket
 import ssl
 import struct
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -71,6 +74,10 @@ class ProbeResult:
     players: Optional[int]
     max_players: int
     name: str = ""
+    # For allowlist enforcement: each connected player's raw id string from
+    # the game API (Palworld REST returns 'steam_<steamid64>'). None when the
+    # probe can't enumerate players (A2S count-only / port-bound fallback).
+    player_ids: Optional[list] = None
 
 
 def probe_a2s(host: str, port: int, timeout: float = PROBE_TIMEOUT_SEC) -> Optional[ProbeResult]:
@@ -391,6 +398,117 @@ def _udp_port_bound(port: int) -> bool:
     return False
 
 
+_PALWORLD_APPS = {2394010}   # Palworld dedicated (native Linux)
+
+
+def probe_palworld_rest(host: str, port: int, admin_password: str,
+                        timeout: float = PROBE_TIMEOUT_SEC) -> Optional[ProbeResult]:
+    """Query Palworld's REST API ``/v1/api/players`` for the live player list.
+
+    Palworld has no working local A2S responder, but its REST API (enabled
+    with ``RESTAPIEnabled=True``) exposes the player list behind HTTP Basic
+    auth: username ``admin``, password = the server's ``AdminPassword``.
+    Returns a ProbeResult carrying the player COUNT and each player's raw id
+    string (``steam_<steamid64>``) for the allowlist enforcer. Returns None on
+    any failure (API disabled, missing/wrong password, not up yet, timeout) so
+    the caller falls back to the port-bound readiness signal.
+
+    Queried on loopback only; the REST port is never opened in the firewall
+    (Pocketpair explicitly warns it must not face the internet).
+    """
+    if not admin_password:
+        return None
+    token = base64.b64encode(f"admin:{admin_password}".encode()).decode()
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.request("GET", "/v1/api/players",
+                     headers={"Authorization": f"Basic {token}",
+                              "Accept": "application/json"})
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+    except (OSError, http.client.HTTPException):
+        return None
+    if resp.status != 200:
+        return None
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    players = data.get("players") if isinstance(data, dict) else None
+    if not isinstance(players, list):
+        return None
+    ids: list = []
+    for p in players:
+        if isinstance(p, dict):
+            ids.append(str(p.get("userId") or p.get("steamId") or p.get("userid") or ""))
+    return ProbeResult(players=len(players), max_players=0, player_ids=ids)
+
+
+def _palworld_kick(host: str, port: int, admin_password: str, userid: str,
+                   message: str = "Not on the server allowlist.",
+                   timeout: float = PROBE_TIMEOUT_SEC) -> bool:
+    """POST ``/v1/api/kick`` to remove a player. ``userid`` is Palworld's own
+    id string (e.g. ``steam_7656...``). Returns True on HTTP 200."""
+    if not admin_password or not userid:
+        return False
+    token = base64.b64encode(f"admin:{admin_password}".encode()).decode()
+    payload = json.dumps({"userid": userid, "message": message})
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.request("POST", "/v1/api/kick", body=payload,
+                     headers={"Authorization": f"Basic {token}",
+                              "Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+    except (OSError, http.client.HTTPException):
+        return False
+    return resp.status == 200
+
+
+def _enforce_steamid_allowlist(sd, result) -> None:
+    """Kick connected players not on ``sd.access.allowed_steamids``.
+
+    Games with a native whitelist file (ARK) are enforced at configure() time.
+    Palworld has none, so we enforce LIVE here via the REST API. Deliberately
+    FAIL-OPEN: we only ever kick when we can positively identify a player by a
+    clean steamID64 that is NOT on a NON-EMPTY allowlist, and we kick using the
+    game's OWN id string — so a format surprise or an empty list can never lock
+    the owner out.
+    """
+    access = getattr(sd, "access", None)
+    if not access or getattr(access, "mode", "") != "steamid_allowlist":
+        return
+    if getattr(sd, "steam_app_id", None) not in _PALWORLD_APPS:
+        return  # only Palworld REST enforcement is wired up here
+    ids = getattr(result, "player_ids", None)
+    if not ids:
+        return  # no parsed roster => never kick blind
+    allowed = getattr(access, "allowed_steamids", None) or []
+    allow_set = {re.sub(r"\D", "", str(s)) for s in allowed}
+    allow_set.discard("")
+    if not allow_set:
+        return  # empty allowlist => treat as unconfigured; do NOT kick anyone
+    admin_pw = ""
+    pw_cfg = getattr(sd, "passwords", None)
+    if pw_cfg is not None:
+        admin_pw = getattr(pw_cfg, "admin_password", "") or ""
+    if not admin_pw:
+        return
+    rest_port = _effective_game_port(sd) + 1
+    for raw in ids:
+        m = re.search(r"steam_(\d{17})", str(raw))
+        if not m:
+            continue  # unrecognised id format => fail-open, never kick
+        sid = m.group(1)
+        if sid in allow_set:
+            continue
+        ok = _palworld_kick("127.0.0.1", rest_port, admin_pw, str(raw))
+        print(f"[watchdog] allowlist: kicked {sid} from {sd.name} "
+              f"({'ok' if ok else 'kick FAILED'})", file=sys.stderr, flush=True)
+
+
 def _probe_for(sd) -> Optional[ProbeResult]:
     """Dispatch to the correct probe. Returns None if the server type has
     no supported probe strategy (custom type, unknown steamcmd game)."""
@@ -409,6 +527,17 @@ def _probe_for(sd) -> Optional[ProbeResult]:
     if sd.type == "steamcmd":
         if not sd.steam_app_id:
             return None
+        if sd.steam_app_id in _PALWORLD_APPS:
+            # Palworld has no working local A2S responder — read its REST API
+            # instead (real player list + readiness). Needs RESTAPIEnabled and
+            # an AdminPassword; if either is missing this returns None and
+            # _tick's port-bound fallback still flips the server to "ready"
+            # (just without a player count).
+            admin_pw = ""
+            pw_cfg = getattr(sd, "passwords", None)
+            if pw_cfg is not None:
+                admin_pw = getattr(pw_cfg, "admin_password", "") or ""
+            return probe_palworld_rest("127.0.0.1", _effective_game_port(sd) + 1, admin_pw)
         # Satisfactory: A2S is broken (always reports 0 players). Route to
         # the HTTPS Server API instead. The API lives on TCP:port (pinned
         # by the recipe's -ServerQueryPort={port} launch flag — without
@@ -622,6 +751,10 @@ class Watchdog:
             state.last_probe_ok = True
             state.last_players = result.players
             state.last_max = result.max_players
+            # Enforce a steamID allowlist for games with no native whitelist
+            # file (Palworld) by kicking connected non-allowlisted players via
+            # the game API. Fail-open (see the function) — never risks the owner.
+            _enforce_steamid_allowlist(sd, result)
             if state.first_ready_ms is None:
                 # First successful probe since this server went active —
                 # the world has finished loading and the game is accepting

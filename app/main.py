@@ -708,6 +708,12 @@ def api_diagnostics_network() -> dict:
         # mode accepts LAN players but silently drops internet clients even with
         # a correct router forward — the "my friends can't join" case.
         ufw_public = firewall.port_public_allowed(int(sd.port), proto)
+        # What firewall mode is the def CONFIGURED for (vs what ufw actually
+        # has)? Lets the UI say "set to public but ufw still LAN-only => the
+        # change wasn't reconciled" instead of telling the operator to set a
+        # mode they already set.
+        fw_cfg = getattr(sd, "firewall", None)
+        configured_mode = (getattr(fw_cfg, "mode", None) or "lan") if fw_cfg else "lan"
 
         active_stuck = (
             st.active == "active"
@@ -743,6 +749,7 @@ def api_diagnostics_network() -> dict:
             "port_bound": port_bound,
             "lxc_ufw_allows": ufw_allows,
             "lxc_public_allows": ufw_public,
+            "configured_fw_mode": configured_mode,
             # Bound + our ufw permits the port but ONLY from the LAN (firewall
             # mode "lan", the default) => internet friends are dropped by THIS
             # container even with a correct router forward. Fixable here: set

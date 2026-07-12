@@ -786,6 +786,23 @@ def _apply_palworld_passwords(install_dir, port: int, server_pw: str, admin_pw: 
         changed.append(f"PublicPort={port}")
         text = new_text
 
+    # Enable the REST API so the manager can read the live player list (player
+    # count + a real readiness signal) and enforce a steamID allowlist by
+    # kicking — Palworld has no static allowlist file. The manager only ever
+    # calls this on loopback and never opens the REST port in the firewall
+    # (Pocketpair warns it must not face the internet). REST auth uses
+    # AdminPassword (set below), so a server with no admin password can't use
+    # these features. RESTAPIPort is pinned to the game port + 1 (matches
+    # Palworld's 8211->8212 default and stays unique per server).
+    new_text = _set_bool(text, "RESTAPIEnabled", True)
+    if new_text != text:
+        changed.append("RESTAPIEnabled=True")
+        text = new_text
+    new_text = _set_number(text, "RESTAPIPort", int(port) + 1)
+    if new_text != text:
+        changed.append(f"RESTAPIPort={int(port) + 1}")
+        text = new_text
+
     if server_pw:
         new_text = _set_quoted(text, "ServerPassword", server_pw)
         if new_text != text:
@@ -1182,6 +1199,25 @@ class SteamCmdHandler(TypeHandler):
                 if " -exclusivejoin" not in run_cmd:
                     run_cmd += " -exclusivejoin"
                 msgs.append(f"ARK: wrote PlayerExclusiveJoinList.txt ({n} entries) + enabled -exclusivejoin")
+            elif self.sd.steam_app_id == 2394010:
+                # Palworld has NO static allowlist file. The manager enforces
+                # the allowlist LIVE via the REST API: the watchdog kicks any
+                # connected player whose steamID64 isn't in allowed_steamids
+                # (within ~one poll interval of joining). Needs the REST API
+                # (enabled in _apply_palworld_passwords) AND an admin password
+                # for REST auth.
+                if not (self.sd.passwords and self.sd.passwords.admin_password):
+                    msgs.append(
+                        "WARNING: Palworld steamid_allowlist needs an ADMIN PASSWORD — the "
+                        "manager kicks non-allowlisted players via the REST API, which "
+                        "authenticates with it. Set passwords.admin_password, or the allowlist "
+                        "can't be enforced (and players can't be counted)."
+                    )
+                else:
+                    msgs.append(
+                        f"Palworld allowlist: {n} steamID(s) enforced live via REST kick "
+                        "(non-allowlisted players removed within ~15s of joining)."
+                    )
             else:
                 # Games without a native Steam ID whitelist. Warn loudly so
                 # the operator knows the setting isn't enforced by the game
