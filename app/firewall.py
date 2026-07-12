@@ -289,3 +289,53 @@ def port_allowed(port: int, proto: str) -> Optional[bool]:
             if rule_proto is None or rule_proto.lower() == proto.lower():
                 return True
     return False
+
+
+def port_public_allowed(port: int, proto: str) -> Optional[bool]:
+    """Does ufw allow ``<port>/<proto>`` inbound from ANYWHERE (public), as
+    opposed to only a restricted source (the LAN CIDR)?
+
+    This is the check that matters for "my friends can't join over the internet
+    even though I forwarded the port": a game whose LXC ufw rule is
+    ``ALLOW ... from 10.0.0.0/24`` (firewall mode ``lan`` — the DEFAULT) accepts
+    LAN players but silently DROPS every public client, regardless of the
+    router's port forward. ``port_allowed`` can't see this — it matches the port
+    without inspecting the source column — so it returns True for a LAN-only
+    rule. This one inspects the source.
+
+    Returns:
+      * ``True``  — an ALLOW rule for the port exists with source ``Anywhere``
+                    (public-reachable as far as this container's firewall goes).
+      * ``False`` — ufw is active but no ``Anywhere`` rule matches the port:
+                    either it's LAN-restricted or not allowed at all, so public
+                    clients are dropped BY THIS CONTAINER's ufw.
+      * ``None``  — can't tell: ufw not installed, unreadable, or inactive.
+    """
+    if not _ufw_available():
+        return None
+    try:
+        r = _run_ufw(["status"])
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    text = r.stdout or ""
+    if re.search(r"^Status:\s+inactive", text, re.IGNORECASE | re.MULTILINE):
+        return None
+    port_s = str(int(port))
+    for line in text.splitlines():
+        up = line.upper()
+        if "ALLOW" not in up or "DENY" in up or "REJECT" in up:
+            continue
+        left, right = up.split("ALLOW", 1)
+        m = re.search(r"(?<![\d.])" + re.escape(port_s) + r"(?:/(TCP|UDP))?(?![\d.])", left)
+        if not m:
+            continue
+        rule_proto = m.group(1)
+        if rule_proto is not None and rule_proto.lower() != proto.lower():
+            continue
+        # Source column (right of ALLOW). Public rules read "Anywhere" (v4) /
+        # "Anywhere (V6)"; LAN rules read the CIDR, e.g. 10.0.0.0/24.
+        if "ANYWHERE" in right:
+            return True
+    return False

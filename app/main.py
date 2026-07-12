@@ -703,6 +703,11 @@ def api_diagnostics_network() -> dict:
         # any host suggestion so we never send the operator host-side for a
         # block we put in place ourselves.
         ufw_allows = firewall.port_allowed(int(sd.port), proto)
+        # Beyond "is the port allowed at all", does ufw allow it from ANYWHERE
+        # (public) or only from the LAN? A server on the default "lan" firewall
+        # mode accepts LAN players but silently drops internet clients even with
+        # a correct router forward — the "my friends can't join" case.
+        ufw_public = firewall.port_public_allowed(int(sd.port), proto)
 
         active_stuck = (
             st.active == "active"
@@ -737,6 +742,12 @@ def api_diagnostics_network() -> dict:
             "recv_q": recv_q,
             "port_bound": port_bound,
             "lxc_ufw_allows": ufw_allows,
+            "lxc_public_allows": ufw_public,
+            # Bound + our ufw permits the port but ONLY from the LAN (firewall
+            # mode "lan", the default) => internet friends are dropped by THIS
+            # container even with a correct router forward. Fixable here: set
+            # the server's firewall mode to "public".
+            "public_blocked_by_lxc_ufw": bool(port_bound and ufw_allows and ufw_public is False),
             "cause": cause,
             # Host suspicion is ONLY raised once we've ruled out our own
             # firewall (ufw allows) and the socket is actually bound — never

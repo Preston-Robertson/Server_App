@@ -273,6 +273,7 @@ async function loadNetworkDiagnostics() {
     }
     let upstreamCount = 0;
     let ufwBlockCount = 0;
+    let lanOnlyCount = 0;
     const verdictFor = (s) => {
       switch (s.cause) {
         case "lxc-ufw-blocking":
@@ -292,10 +293,13 @@ async function loadNetworkDiagnostics() {
     const rows = d.servers.map((s) => {
       if (s.cause === "lxc-ufw-blocking") ufwBlockCount++;
       else if (s.cause === "bound-but-no-traffic") upstreamCount++;
+      if (s.public_blocked_by_lxc_ufw) lanOnlyCount++;
       const secStr = s.starting_sec ? `${Math.floor(s.starting_sec / 60)}m ${s.starting_sec % 60}s` : "-";
       const recvStr = s.recv_q == null ? "n/a" : `${s.recv_q} B`;
       const ufwStr = s.lxc_ufw_allows === true ? "✔ allow"
         : (s.lxc_ufw_allows === false ? "⛔ closed" : "n/a");
+      const pubStr = s.lxc_public_allows === true ? "✔ anywhere"
+        : (s.lxc_public_allows === false ? "🔒 LAN-only" : "n/a");
       const v = verdictFor(s);
       return `
         <tr>
@@ -305,6 +309,7 @@ async function loadNetworkDiagnostics() {
           <td>${secStr}</td>
           <td>${recvStr}</td>
           <td>${ufwStr}</td>
+          <td>${pubStr}</td>
           <td><span class="chip ${v.cls}">${v.label}</span></td>
         </tr>`;
     }).join("");
@@ -318,6 +323,7 @@ async function loadNetworkDiagnostics() {
             <th style="text-align:left;">Starting for</th>
             <th style="text-align:left;">Recv-Q</th>
             <th style="text-align:left;">LXC ufw</th>
+            <th style="text-align:left;">Public</th>
             <th style="text-align:left;">Verdict</th>
           </tr>
         </thead>
@@ -326,11 +332,29 @@ async function loadNetworkDiagnostics() {
       <p class="small muted" style="margin-top:8px;">
         Checks are ordered manager-first: <strong>LXC ufw</strong> shows whether this
         container's own firewall permits the port — a <code>⛔ closed</code> there IS the
-        block and is fixable right here (Re-apply firewall rules). Only when the socket is
+        block and is fixable right here (Re-apply firewall rules). <strong>Public</strong> shows
+        whether that rule allows the whole internet (<code>✔ anywhere</code>) or only your LAN
+        (<code>🔒 LAN-only</code>) — internet friends need <code>anywhere</code> (set the server's
+        firewall mode to <code>public</code>). Only when the socket is
         bound AND ufw allows it AND nothing is arriving (<strong>Recv-Q</strong> 0) is an
         upstream drop (Proxmox host bridge-nf) even possible — and a still-loading game looks
         the same from inside the LXC, so run <strong>Diagnose</strong> before touching the host.
       </p>`;
+    if (lanOnlyCount > 0) {
+      // The port IS open in ufw but only to the LAN — public/internet clients
+      // are dropped here regardless of the router forward. Distinct from
+      // "closed" (not open at all), and NOT fixable by a plain reconcile: the
+      // server's firewall MODE must change to "public" first.
+      results.innerHTML += `
+        <div class="netdiag-selffix" style="margin-top:10px;padding:10px;border:1px solid #c78a3a;border-radius:6px;">
+          <strong>${lanOnlyCount} server(s) reachable on your LAN only.</strong>
+          The game port is open in this container's firewall but restricted to the
+          local network (firewall mode <code>lan</code>, the default), so players on the
+          public internet are dropped <em>here</em> — even with a correct router
+          port-forward. To allow internet players: open that server → <strong>Firewall →
+          set mode to <code>public</code></strong>, save, then Re-apply firewall rules.
+        </div>`;
+    }
     if (ufwBlockCount > 0) {
       summaryChip.textContent = `${ufwBlockCount} blocked by LXC firewall`;
       summaryChip.className = "chip chip-err";
@@ -346,6 +370,10 @@ async function loadNetworkDiagnostics() {
           </div>
         </div>`;
       $("#netdiag-reconcile")?.addEventListener("click", reconcileFirewall);
+    } else if (lanOnlyCount > 0) {
+      summaryChip.textContent = `${lanOnlyCount} LAN-only (internet blocked)`;
+      summaryChip.className = "chip chip-warn";
+      hostFix.hidden = true;
     } else if (upstreamCount > 0) {
       summaryChip.textContent = `${upstreamCount} bound but no traffic`;
       summaryChip.className = "chip chip-warn";
